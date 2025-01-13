@@ -200,10 +200,11 @@ impl SimpleCsvTable {
 struct SimpleCsvTableFunc {}
 
 impl TableFunctionImpl for SimpleCsvTableFunc {
-    fn call(&self, exprs: &[Expr]) -> Result<Arc<dyn TableProvider>> {
+    fn call(&self, args: &[(Expr, Option<String>)]) -> Result<Arc<dyn TableProvider>> {
+        dbg!(args);
         let mut new_exprs = vec![];
         let mut filepath = String::new();
-        for expr in exprs {
+        for (expr, _) in args {
             match expr {
                 Expr::Literal(ScalarValue::Utf8(Some(ref path)), _) => {
                     filepath.clone_from(path);

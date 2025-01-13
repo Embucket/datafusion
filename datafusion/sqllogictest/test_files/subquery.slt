@@ -322,6 +322,156 @@ physical_plan
 14)------RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
 15)--------DataSourceExec: partitions=1, partition_sizes=[2]
 
+# in_subquery_in_join_on_with_equijoin
+query II rowsort
+SELECT ds.t1_id, o.t2_id
+FROM t1 ds
+LEFT JOIN t2 o
+  ON (ds.t1_id IN (SELECT t3_id FROM t3)) AND (ds.t1_id = o.t2_id);
+----
+11 11
+22 22
+33 NULL
+44 44
+
+# not_in_subquery_in_join_on_with_equijoin
+query II rowsort
+SELECT ds.t1_id, o.t2_id
+FROM t1 ds
+JOIN t2 o
+  ON (ds.t1_id NOT IN (SELECT t3_id FROM t3 WHERE t3_int = 3)) AND (ds.t1_id = o.t2_id);
+----
+22 22
+
+# explain subquery with join
+query TT
+EXPLAIN SELECT ds.t1_id, o.t2_id
+FROM t1 ds
+JOIN t2 o
+  ON (ds.t1_id NOT IN (SELECT t3_id FROM t3 WHERE t3_int = 3)) AND (ds.t1_id = o.t2_id);
+----
+logical_plan
+01)Inner Join: ds.t1_id = o.t2_id
+02)--Projection: ds.t1_id
+03)----Filter: NOT __correlated_sq_1.mark
+04)------LeftMark Join: ds.t1_id = __correlated_sq_1.t3_id
+05)--------SubqueryAlias: ds
+06)----------TableScan: t1 projection=[t1_id]
+07)--------SubqueryAlias: __correlated_sq_1
+08)----------Projection: t3.t3_id
+09)------------Filter: t3.t3_int = Int32(3)
+10)--------------TableScan: t3 projection=[t3_id, t3_int]
+11)--SubqueryAlias: o
+12)----TableScan: t2 projection=[t2_id]
+physical_plan
+01)CoalesceBatchesExec: target_batch_size=2
+02)--HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(t1_id@0, t2_id@0)]
+03)----CoalescePartitionsExec
+04)------CoalesceBatchesExec: target_batch_size=2
+05)--------FilterExec: NOT mark@1, projection=[t1_id@0]
+06)----------CoalesceBatchesExec: target_batch_size=2
+07)------------HashJoinExec: mode=CollectLeft, join_type=LeftMark, on=[(t1_id@0, t3_id@0)]
+08)--------------DataSourceExec: partitions=1, partition_sizes=[1]
+09)--------------CoalesceBatchesExec: target_batch_size=2
+10)----------------FilterExec: t3_int@1 = 3, projection=[t3_id@0]
+11)------------------RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
+12)--------------------DataSourceExec: partitions=1, partition_sizes=[1]
+13)----RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
+14)------DataSourceExec: partitions=1, partition_sizes=[1]
+
+# aggregate_case_in_subquery
+query III rowsort
+WITH distinct_source AS (
+  SELECT 1 AS namespace_id, 10 AS max_task_instance, 100 AS max_uploaded_at
+  UNION ALL
+  SELECT 2, 20, 200
+  UNION ALL
+  SELECT 2, 15, 150
+)
+SELECT
+  namespace_id AS primary_key,
+  MAX(CASE WHEN max_task_instance IN (
+        SELECT MAX(max_task_instance)
+        FROM distinct_source
+      ) THEN 1 ELSE 0 END) AS is_in_most_recent_task,
+  MAX(max_uploaded_at) AS max_timestamp
+FROM distinct_source
+GROUP BY 1;
+----
+1 0 100
+2 1 200
+
+# explain subquery with aggregate
+query TT
+EXPLAIN WITH distinct_source AS (
+  SELECT 1 AS namespace_id, 10 AS max_task_instance, 100 AS max_uploaded_at
+  UNION ALL
+  SELECT 2, 20, 200
+  UNION ALL
+  SELECT 2, 15, 150
+)
+SELECT
+  namespace_id AS primary_key,
+  MAX(CASE WHEN max_task_instance IN (
+        SELECT MAX(max_task_instance)
+        FROM distinct_source
+      ) THEN 1 ELSE 0 END) AS is_in_most_recent_task,
+  MAX(max_uploaded_at) AS max_timestamp
+FROM distinct_source
+GROUP BY 1;
+----
+logical_plan
+01)Projection: distinct_source.namespace_id AS primary_key, max(CASE WHEN IN THEN Int64(1) ELSE Int64(0) END) AS is_in_most_recent_task, max(distinct_source.max_uploaded_at) AS max_timestamp
+02)--Aggregate: groupBy=[[distinct_source.namespace_id]], aggr=[[max(CASE WHEN __correlated_sq_1.mark THEN Int64(1) ELSE Int64(0) END) AS max(CASE WHEN IN THEN Int64(1) ELSE Int64(0) END), max(distinct_source.max_uploaded_at)]]
+03)----Projection: distinct_source.namespace_id, distinct_source.max_uploaded_at, __correlated_sq_1.mark
+04)------LeftMark Join: distinct_source.max_task_instance = __correlated_sq_1.max(distinct_source.max_task_instance)
+05)--------SubqueryAlias: distinct_source
+06)----------Union
+07)------------Projection: Int64(1) AS namespace_id, Int64(10) AS max_task_instance, Int64(100) AS max_uploaded_at
+08)--------------EmptyRelation
+09)------------Projection: Int64(2) AS namespace_id, Int64(20) AS max_task_instance, Int64(200) AS max_uploaded_at
+10)--------------EmptyRelation
+11)------------Projection: Int64(2) AS namespace_id, Int64(15) AS max_task_instance, Int64(150) AS max_uploaded_at
+12)--------------EmptyRelation
+13)--------SubqueryAlias: __correlated_sq_1
+14)----------Aggregate: groupBy=[[]], aggr=[[max(distinct_source.max_task_instance)]]
+15)------------SubqueryAlias: distinct_source
+16)--------------Union
+17)----------------Projection: Int64(10) AS max_task_instance
+18)------------------EmptyRelation
+19)----------------Projection: Int64(20) AS max_task_instance
+20)------------------EmptyRelation
+21)----------------Projection: Int64(15) AS max_task_instance
+22)------------------EmptyRelation
+physical_plan
+01)ProjectionExec: expr=[namespace_id@0 as primary_key, max(CASE WHEN IN THEN Int64(1) ELSE Int64(0) END)@1 as is_in_most_recent_task, max(distinct_source.max_uploaded_at)@2 as max_timestamp]
+02)--AggregateExec: mode=FinalPartitioned, gby=[namespace_id@0 as namespace_id], aggr=[max(CASE WHEN IN THEN Int64(1) ELSE Int64(0) END), max(distinct_source.max_uploaded_at)]
+03)----CoalesceBatchesExec: target_batch_size=2
+04)------RepartitionExec: partitioning=Hash([namespace_id@0], 4), input_partitions=4
+05)--------AggregateExec: mode=Partial, gby=[namespace_id@0 as namespace_id], aggr=[max(CASE WHEN IN THEN Int64(1) ELSE Int64(0) END), max(distinct_source.max_uploaded_at)]
+06)----------RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
+07)------------CoalesceBatchesExec: target_batch_size=2
+08)--------------HashJoinExec: mode=CollectLeft, join_type=LeftMark, on=[(max_task_instance@1, max(distinct_source.max_task_instance)@0)], projection=[namespace_id@0, max_uploaded_at@2, mark@3]
+09)----------------CoalescePartitionsExec
+10)------------------UnionExec
+11)--------------------ProjectionExec: expr=[1 as namespace_id, 10 as max_task_instance, 100 as max_uploaded_at]
+12)----------------------PlaceholderRowExec
+13)--------------------ProjectionExec: expr=[2 as namespace_id, 20 as max_task_instance, 200 as max_uploaded_at]
+14)----------------------PlaceholderRowExec
+15)--------------------ProjectionExec: expr=[2 as namespace_id, 15 as max_task_instance, 150 as max_uploaded_at]
+16)----------------------PlaceholderRowExec
+17)----------------AggregateExec: mode=Final, gby=[], aggr=[max(distinct_source.max_task_instance)]
+18)------------------CoalescePartitionsExec
+19)--------------------AggregateExec: mode=Partial, gby=[], aggr=[max(distinct_source.max_task_instance)]
+20)----------------------RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=3
+21)------------------------UnionExec
+22)--------------------------ProjectionExec: expr=[10 as max_task_instance]
+23)----------------------------PlaceholderRowExec
+24)--------------------------ProjectionExec: expr=[20 as max_task_instance]
+25)----------------------------PlaceholderRowExec
+26)--------------------------ProjectionExec: expr=[15 as max_task_instance]
+27)----------------------------PlaceholderRowExec
+
 query II rowsort
 SELECT t1_id, (SELECT sum(t2_int) FROM t2 WHERE t2.t2_id = t1.t1_id having sum(t2_int) < 3) as t2_sum from t1
 ----
@@ -1480,3 +1630,32 @@ logical_plan
 
 statement count 0
 drop table person;
+
+
+# Projection IN (subquery) decorrelation
+query IB rowsort
+WITH t(a) AS (VALUES (1),(2),(3),(4),(5)),
+     u(a) AS (VALUES (2),(4),(6))
+SELECT t.a, (t.a IN (SELECT u.a FROM u)) AS flag FROM t;
+----
+1 false
+2 true
+3 false
+4 true
+5 false
+
+query TT
+EXPLAIN WITH t(a) AS (VALUES (1),(2),(3),(4),(5)),
+     u(a) AS (VALUES (2),(4),(6))
+SELECT t.a, (t.a IN (SELECT u.a FROM u)) AS flag FROM t;
+----
+logical_plan
+01)Projection: t.a, __correlated_sq_1.mark AS flag
+02)--LeftMark Join: t.a = __correlated_sq_1.a
+03)----SubqueryAlias: t
+04)------Projection: column1 AS a
+05)--------Values: (Int64(1)), (Int64(2)), (Int64(3)), (Int64(4)), (Int64(5))
+06)----SubqueryAlias: __correlated_sq_1
+07)------SubqueryAlias: u
+08)--------Projection: column1 AS a
+09)----------Values: (Int64(2)), (Int64(4)), (Int64(6))

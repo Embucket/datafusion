@@ -1866,7 +1866,7 @@ mod test {
         "
         )?;
 
-        let empty = empty_with_type(DataType::Int64);
+        let empty = empty_with_type(DataType::Float64);
         let plan = LogicalPlan::Projection(Projection::try_new(vec![expr], empty)?);
         assert_type_coercion_error(
             plan,

@@ -784,6 +784,7 @@ pub fn comparison_coercion(lhs_type: &DataType, rhs_type: &DataType) -> Option<D
         .or_else(|| binary_coercion(lhs_type, rhs_type))
         .or_else(|| struct_coercion(lhs_type, rhs_type))
         .or_else(|| map_coercion(lhs_type, rhs_type))
+        .or_else(|| boolean_coercion(lhs_type, rhs_type))
 }
 
 /// Similar to [`comparison_coercion`] but prefers numeric if compares with
@@ -1059,6 +1060,20 @@ fn map_coercion(lhs_type: &DataType, rhs_type: &DataType) -> Option<DataType> {
     }
 }
 
+/// Coercion rules for boolean types: If at least one argument is
+/// a boolean type and both arguments can be coerced into a boolean type, coerce
+/// to boolean type.
+fn boolean_coercion(lhs_type: &DataType, rhs_type: &DataType) -> Option<DataType> {
+    use arrow::datatypes::DataType::*;
+    match (lhs_type, rhs_type) {
+        (Boolean, Int8 | Int16 | Int32 | Int64 | UInt8 | UInt16 | UInt32 | UInt64)
+        | (Int8 | Int16 | Int32 | Int64 | UInt8 | UInt16 | UInt32 | UInt64, Boolean) => {
+            Some(Boolean)
+        }
+        _ => None,
+    }
+}
+
 /// Returns the output type of applying mathematics operations such as
 /// `+` to arguments of `lhs_type` and `rhs_type`.
 fn mathematics_numerical_coercion(
@@ -1204,7 +1219,17 @@ fn string_concat_coercion(lhs_type: &DataType, rhs_type: &DataType) -> Option<Da
         (Dictionary(_, lhs_value_type), Dictionary(_, rhs_value_type)) => {
             string_coercion(lhs_value_type, rhs_value_type).or(None)
         }
-        _ => None,
+        _ => {
+            if can_cast_types(lhs_type, &Utf8) && can_cast_types(rhs_type, &Utf8) {
+                Some(Utf8)
+            } else if can_cast_types(lhs_type, &LargeUtf8)
+                && can_cast_types(rhs_type, &LargeUtf8)
+            {
+                Some(LargeUtf8)
+            } else {
+                None
+            }
+        }
     })
 }
 

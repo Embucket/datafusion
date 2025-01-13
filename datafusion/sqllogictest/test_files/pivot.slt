@@ -1,0 +1,444 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+
+#   http://www.apache.org/licenses/LICENSE-2.0
+
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+#######
+# Setup test data table
+#######
+statement ok
+CREATE TABLE quarterly_sales(
+  empid INT,
+  amount INT,
+  quarter TEXT)
+  AS SELECT * FROM VALUES
+    (1, 10000, '2023_Q1'),
+    (1, 400, '2023_Q1'),
+    (2, 4500, '2023_Q1'),
+    (2, 35000, '2023_Q1'),
+    (1, 5000, '2023_Q2'),
+    (1, 3000, '2023_Q2'),
+    (2, 200, '2023_Q2'),
+    (2, 90500, '2023_Q2'),
+    (1, 6000, '2023_Q3'),
+    (1, 5000, '2023_Q3'),
+    (2, 2500, '2023_Q3'),
+    (2, 9500, '2023_Q3'),
+    (3, 2700, '2023_Q3'),
+    (1, 8000, '2023_Q4'),
+    (1, 10000, '2023_Q4'),
+    (2, 800, '2023_Q4'),
+    (2, 4500, '2023_Q4'),
+    (3, 2700, '2023_Q4'),
+    (3, 16000, '2023_Q4'),
+    (3, 10200, '2023_Q4');
+
+query IIIII
+SELECT *
+FROM quarterly_sales
+PIVOT(SUM(amount) FOR quarter IN ('2023_Q1', '2023_Q2', '2023_Q3', '2023_Q4'))
+ORDER BY empid;
+----
+1 10400 8000 11000 18000
+2 39500 90700 12000 5300
+3 NULL NULL 2700 28900
+
+# PIVOT with NULL handling
+query III
+SELECT *
+FROM quarterly_sales
+PIVOT(SUM(amount) 
+  FOR quarter IN ('2023_Q1', '2023_Q2')
+  DEFAULT ON NULL (1001))
+ORDER BY empid;
+----
+1 10400 8000
+2 39500 90700
+3 1001 1001
+
+# PIVOT with cast to pivot column type
+query TIII
+SELECT *
+FROM quarterly_sales
+PIVOT(SUM(amount) FOR empid IN (1,2,3))
+ORDER BY quarter;
+----
+2023_Q1 10400 39500 NULL
+2023_Q2 8000 90700 NULL
+2023_Q3 11000 12000 2700
+2023_Q4 18000 5300 28900
+
+
+# PIVOT with automatic detection of all distinct column values using ANY
+query TIII
+SELECT *
+FROM quarterly_sales
+PIVOT(SUM(amount) FOR empid IN (ANY ORDER BY empid))
+ORDER BY quarter;
+----
+2023_Q1 10400 39500 NULL
+2023_Q2 8000 90700 NULL
+2023_Q3 11000 12000 2700
+2023_Q4 18000 5300 28900
+
+# PIVOT with ANY that includes output column reordering
+query IIIII
+SELECT *
+FROM quarterly_sales
+PIVOT(SUM(amount) FOR quarter IN (ANY ORDER BY quarter DESC))
+ORDER BY empid;
+----
+1 18000 11000 8000 10400
+2 5300 12000 90700 39500
+3 28900 2700 NULL NULL
+
+# PIVOT with a subquery to specify the values
+query III
+SELECT *
+FROM quarterly_sales
+PIVOT(SUM(amount) 
+  FOR quarter IN (
+    SELECT DISTINCT quarter FROM quarterly_sales WHERE quarter LIKE '%Q1' OR quarter LIKE '%Q3'
+  ))
+ORDER BY empid;
+----
+1 10400 11000
+2 39500 12000
+3 NULL 2700
+
+query IIIII
+WITH sales_without_discount AS
+  (SELECT empid, amount, quarter FROM quarterly_sales)
+SELECT *
+FROM sales_without_discount
+PIVOT(SUM(amount) FOR quarter IN (ANY ORDER BY quarter))
+ORDER BY empid;
+----
+1 10400 8000 11000 18000
+2 39500 90700 12000 5300
+3 NULL NULL 2700 28900
+
+
+# Non-existent column in the FOR clause
+query error DataFusion error: Error during planning: Pivot column 'non_existent_column' does not exist in input schema
+SELECT *
+FROM quarterly_sales
+PIVOT(SUM(amount) FOR non_existent_column IN ('2023_Q1', '2023_Q2'))
+ORDER BY empid;
+
+# Non-existent column in the aggregate function
+query error DataFusion error: Schema error: No field named non_existent_column\. Valid fields are quarterly_sales\.empid, quarterly_sales\.amount, quarterly_sales\.quarter\.
+SELECT *
+FROM quarterly_sales
+PIVOT(SUM(non_existent_column) FOR quarter IN ('2023_Q1', '2023_Q2'))
+ORDER BY empid;
+
+# Trying to use non-aggregate function
+query error DataFusion error: Error during planning: Unsupported aggregate expression should always be AggregateFunction
+SELECT *
+FROM quarterly_sales
+PIVOT(ABS(amount) FOR quarter IN ('2023_Q1', '2023_Q2'))
+ORDER BY empid;
+
+# Invalid subquery in the IN list - multiple columns
+query error DataFusion error: Error during planning: Pivot subquery must return a single column
+SELECT *
+FROM quarterly_sales
+PIVOT(SUM(amount) 
+  FOR quarter IN (SELECT quarter, empid FROM quarterly_sales LIMIT 2))
+ORDER BY empid;
+
+# Invalid DEFAULT ON NULL value (dependent on pivot/aggregation columns)
+query error DataFusion error: Schema error: No field named quarterly_sales\.amount\. Valid fields are quarterly_sales\.empid, "2023_Q1", "2023_Q2"\.
+SELECT *
+FROM quarterly_sales
+PIVOT(SUM(amount) 
+  FOR quarter IN ('2023_Q1', '2023_Q2')
+  DEFAULT ON NULL (amount))
+ORDER BY empid;
+
+# PIVOT after a PIVOT
+query error DataFusion error: Schema error: No field named empid\. Valid fields are "2023_Q2", "0", "10000", "20000", "2023_Q2", "0", "10000", "20000"\.
+SELECT *
+FROM (
+  SELECT *
+  FROM quarterly_sales
+  PIVOT(SUM(amount) FOR quarter IN ('2023_Q1', '2023_Q2'))
+)
+PIVOT(AVG(empid) FOR "2023_Q1" IN (0, 10000, 20000))
+ORDER BY empid;
+
+# PIVOT with window functions in the pivot expression
+query error DataFusion error: Schema error: No field named empid\. Valid fields are "2023_Q1", "2023_Q2", "2023_Q1", "2023_Q2"\.
+SELECT *
+FROM quarterly_sales
+PIVOT(SUM(amount) OVER (PARTITION BY empid) FOR quarter IN ('2023_Q1', '2023_Q2'))
+ORDER BY empid;
+
+# PIVOT with ORDER BY in the aggregate function
+query error DataFusion error: Schema error: No field named empid\. Valid fields are "2023_Q1", "2023_Q2", "2023_Q1", "2023_Q2"\.
+SELECT *
+FROM quarterly_sales
+PIVOT(SUM(amount ORDER BY empid) FOR quarter IN ('2023_Q1', '2023_Q2'))
+ORDER BY empid;
+
+statement ok
+CREATE TABLE employees(
+  empid INT,
+  name TEXT,
+  department TEXT,
+  hire_date DATE)
+  AS SELECT * FROM VALUES
+    (1, 'Alice', 'Sales', '2020-01-15'),
+    (2, 'Bob', 'Sales', '2021-03-10'),
+    (3, 'Charlie', 'Marketing', '2022-06-22'),
+    (4, 'David', 'Engineering', '2019-11-08'),
+    (5, 'Eve', 'Marketing', '2023-02-01');
+
+statement ok
+CREATE TABLE product_sales(
+  product_id INT,
+  category TEXT,
+  sale_amount INT,
+  sale_date DATE)
+  AS SELECT * FROM VALUES
+    (101, 'Electronics', 1200, '2023-01-10'),
+    (102, 'Clothing', 500, '2023-01-15'),
+    (103, 'Home', 800, '2023-01-20'),
+    (104, 'Electronics', 1500, '2023-02-05'),
+    (105, 'Clothing', 600, '2023-02-12'),
+    (106, 'Home', 900, '2023-02-25'),
+    (107, 'Electronics', 2000, '2023-03-08'),
+    (108, 'Clothing', 700, '2023-03-15'),
+    (109, 'Home', 1100, '2023-03-22'),
+    (110, 'Electronics', 1800, '2023-04-05'),
+    (111, 'Clothing', 550, '2023-04-14'),
+    (112, 'Home', 950, '2023-04-28');
+
+query TIIIII
+SELECT e.name, s.*
+FROM employees e
+JOIN (
+  SELECT empid, "2023_Q1", "2023_Q2", "2023_Q3", "2023_Q4"
+  FROM quarterly_sales
+  PIVOT(SUM(amount) FOR quarter IN ('2023_Q1', '2023_Q2', '2023_Q3', '2023_Q4'))
+) s ON e.empid = s.empid
+ORDER BY e.empid;
+----
+Alice 1 10400 8000 11000 18000
+Bob 2 39500 90700 12000 5300
+Charlie 3 NULL NULL 2700 28900
+
+# PIVOT with filtered subquery
+query III
+SELECT *
+FROM (
+  SELECT empid, amount, quarter 
+  FROM quarterly_sales 
+  WHERE amount > 5000
+)
+PIVOT(SUM(amount) FOR quarter IN ('2023_Q1', '2023_Q4'))
+ORDER BY empid;
+----
+1 10000 18000
+2 35000 NULL
+3 NULL 26200
+
+query TII
+SELECT 
+  category,
+  "Q1",
+  "Q2" 
+FROM (
+  SELECT 
+    category,
+    CASE 
+      WHEN EXTRACT(QUARTER FROM sale_date) = 1 THEN 'Q1' 
+      WHEN EXTRACT(QUARTER FROM sale_date) = 2 THEN 'Q2'
+    END AS quarter,
+    sale_amount
+  FROM product_sales
+)
+PIVOT(
+  SUM(sale_amount) AS total
+  FOR quarter IN ('Q1' AS "Q1", 'Q2' AS "Q2")
+)
+ORDER BY category;
+----
+Clothing 1800 550
+Electronics 4700 1800
+Home 2800 950
+
+# PIVOT with arithmetic operations on the aggregated values
+query TIIIR
+SELECT 
+  e.name,
+  p."2023_Q1",
+  p."2023_Q4",
+  p."2023_Q4" - p."2023_Q1" AS q4_minus_q1,
+  CASE 
+    WHEN p."2023_Q1" = 0 THEN NULL 
+    ELSE (p."2023_Q4" - p."2023_Q1")*100.0/p."2023_Q1" 
+  END AS percent_change
+FROM employees e
+LEFT JOIN (
+  SELECT empid, "2023_Q1", "2023_Q4"
+  FROM quarterly_sales
+  PIVOT(SUM(amount) FOR quarter IN ('2023_Q1', '2023_Q4'))
+) p ON e.empid = p.empid
+ORDER BY e.name;
+----
+Alice 10400 18000 7600 73.076923076923
+Bob 39500 5300 -34200 -86.582278481013
+Charlie NULL 28900 NULL NULL
+David NULL NULL NULL NULL
+Eve NULL NULL NULL NULL
+
+# PIVOT with HAVING clause
+query TII
+WITH dept_pivot AS (
+  SELECT 
+    e.department,
+    q."2023_Q1",
+    q."2023_Q4"
+  FROM employees e
+  LEFT JOIN (
+    SELECT empid, "2023_Q1", "2023_Q4"
+    FROM quarterly_sales
+    PIVOT(SUM(amount) FOR quarter IN ('2023_Q1', '2023_Q4'))
+  ) q ON e.empid = q.empid
+)
+SELECT department, SUM("2023_Q1") as q1_total, SUM("2023_Q4") as q4_total
+FROM dept_pivot
+GROUP BY department
+HAVING SUM("2023_Q4") > 0
+ORDER BY department;
+----
+Marketing NULL 28900
+Sales 49900 23300
+
+# PIVOT with CASE expressions for custom grouping
+query III
+SELECT *
+FROM (
+  SELECT 
+    empid,
+    amount,
+    CASE
+      WHEN quarter IN ('2023_Q1', '2023_Q2') THEN 'H1'
+      WHEN quarter IN ('2023_Q3', '2023_Q4') THEN 'H2'
+    END AS half_year
+  FROM quarterly_sales
+)
+PIVOT(SUM(amount) FOR half_year IN ('H1', 'H2'))
+ORDER BY empid;
+----
+1 18400 29000
+2 130200 17300
+3 NULL 31600
+
+# PIVOT WITH UNION
+query TIRRR
+SELECT 'Average sale amount' AS aggregate, *
+  FROM quarterly_sales
+    PIVOT(AVG(amount) FOR quarter IN ('2023_Q1', '2023_Q2', '2023_Q4'))
+UNION
+SELECT 'Highest value sale' AS aggregate, *
+  FROM quarterly_sales
+    PIVOT(MAX(amount) FOR quarter IN ('2023_Q1', '2023_Q2', '2023_Q4'))
+UNION
+SELECT 'Lowest value sale' AS aggregate, *
+  FROM quarterly_sales
+    PIVOT(MIN(amount) FOR quarter IN ('2023_Q1', '2023_Q2', '2023_Q4'))
+UNION
+SELECT 'Number of sales' AS aggregate, *
+  FROM quarterly_sales
+    PIVOT(COUNT(amount) FOR quarter IN ('2023_Q1', '2023_Q2', '2023_Q4'))
+UNION
+SELECT 'Total amount' AS aggregate, *
+  FROM quarterly_sales
+    PIVOT(SUM(amount) FOR quarter IN ('2023_Q1', '2023_Q2', '2023_Q4'))
+ORDER BY aggregate, empid;
+----
+Average sale amount 1 5200 4000 9000
+Average sale amount 2 19750 45350 2650
+Average sale amount 3 NULL NULL 9633.333333333334
+Highest value sale 1 10000 5000 10000
+Highest value sale 2 35000 90500 4500
+Highest value sale 3 NULL NULL 16000
+Lowest value sale 1 400 3000 8000
+Lowest value sale 2 4500 200 800
+Lowest value sale 3 NULL NULL 2700
+Number of sales 1 2 2 2
+Number of sales 2 2 2 2
+Number of sales 3 0 0 3
+Total amount 1 10400 8000 18000
+Total amount 2 39500 90700 5300
+Total amount 3 NULL NULL 28900
+
+
+query TIIII
+WITH sales_sum AS (
+  SELECT
+    empid,
+    "2023_Q1" AS "Q1_Sales",
+    "2023_Q4" AS "Q4_Sales"
+  FROM quarterly_sales
+  PIVOT(SUM(amount) FOR quarter IN ('2023_Q1', '2023_Q4'))
+),
+sales_count AS (
+  SELECT
+    empid,
+    "2023_Q1" AS "Q1_Count",
+    "2023_Q4" AS "Q4_Count"
+  FROM quarterly_sales
+  PIVOT(COUNT(amount) FOR quarter IN ('2023_Q1', '2023_Q4'))
+),
+combined_sales AS (
+  SELECT
+    ss.empid,
+    ss."Q1_Sales",
+    ss."Q4_Sales",
+    sc."Q1_Count",
+    sc."Q4_Count"
+  FROM sales_sum ss
+  JOIN sales_count sc ON ss.empid = sc.empid
+)
+SELECT dept.*
+FROM (
+  SELECT
+  e.department,
+  s."Q1_Sales",
+  s."Q4_Sales",
+  s."Q1_Count",
+  s."Q4_Count"
+  FROM employees e JOIN combined_sales s ON e.empid = s.empid
+) dept
+WHERE dept.department IN ('Sales', 'Marketing')
+ORDER BY dept.department
+----
+Marketing NULL 28900 0 3
+Sales 39500 5300 2 2
+Sales 10400 18000 2 2
+
+# Test PIVOT subquery with projection
+query TIRRRR
+SELECT 'Average sale amount' AS aggregate, *
+ FROM quarterly_sales
+   PIVOT(AVG(amount) FOR quarter IN (ANY ORDER BY quarter)) ORDER by empid
+----
+Average sale amount 1 5200 4000 5500 9000
+Average sale amount 2 19750 45350 6000 2650
+Average sale amount 3 NULL NULL 2700 9633.333333333334

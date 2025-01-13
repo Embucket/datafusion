@@ -22,7 +22,7 @@ use std::fmt;
 
 use crate::{
     expr_vec_fmt, Aggregate, DescribeTable, Distinct, DistinctOn, DmlStatement, Expr,
-    Filter, Join, Limit, LogicalPlan, Partitioning, Projection, RecursiveQuery,
+    Filter, Join, Limit, LogicalPlan, Partitioning, Pivot, Projection, RecursiveQuery,
     Repartition, Sort, Subquery, SubqueryAlias, TableProviderFilterPushDown, TableScan,
     Unnest, Values, Window,
 };
@@ -651,6 +651,41 @@ impl<'a, 'b> PgJsonVisitor<'a, 'b> {
                     "StructColumn": expr_vec_fmt!(struct_type_columns),
                 })
             }
+            LogicalPlan::Pivot(Pivot {
+                aggregate_expr,
+                pivot_column,
+                pivot_values,
+                value_subquery,
+                default_on_null_expr,
+                ..
+            }) => {
+                let mut object = json!({
+                    "Node Type": "Pivot",
+                    "Aggregate": format!("{}", aggregate_expr),
+                    "Pivot Column": format!("{}", pivot_column),
+                });
+
+                if !pivot_values.is_empty() {
+                    object["Pivot Values"] = serde_json::Value::Array(
+                        pivot_values
+                            .iter()
+                            .map(|v| serde_json::Value::String(v.to_string()))
+                            .collect(),
+                    );
+                }
+
+                if value_subquery.is_some() {
+                    object["Value Subquery"] =
+                        serde_json::Value::String("Provided".to_string());
+                }
+
+                if default_on_null_expr.is_some() {
+                    object["Default On Null"] =
+                        serde_json::Value::String("Provided".to_string());
+                }
+
+                object
+            }
         }
     }
 }
@@ -722,8 +757,11 @@ impl<'n> TreeNodeVisitor<'n> for PgJsonVisitor<'_, '_> {
 
 #[cfg(test)]
 mod tests {
-    use arrow::datatypes::{DataType, Field};
+    use crate::EmptyRelation;
+    use arrow::datatypes::{DataType, Field, Schema};
     use insta::assert_snapshot;
+    use datafusion_common::{Column, DFSchema, ScalarValue};
+    use std::sync::Arc;
 
     use super::*;
 
@@ -741,5 +779,85 @@ mod tests {
         ]);
 
         assert_snapshot!(display_schema(&schema), @"[id:Int32, first_name:Utf8;N]");
+    }
+
+    #[test]
+    fn test_pivot_to_json_value() {
+        // Create a mock schema
+        let schema = Arc::new(DFSchema::empty().to_owned());
+
+        // Create mock pivot values
+        let pivot_values = vec![
+            ScalarValue::Utf8(Some("A".to_string())),
+            ScalarValue::Utf8(Some("B".to_string())),
+        ];
+
+        // Create a Pivot plan
+        let pivot = Pivot {
+            input: Arc::new(LogicalPlan::EmptyRelation(EmptyRelation {
+                produce_one_row: false,
+                schema: Arc::clone(&schema),
+            })),
+            aggregate_expr: Expr::Column(Column::from_name("sum_value")),
+            pivot_column: Column::from_name("category"),
+            pivot_values,
+            schema: Arc::clone(&schema),
+            value_subquery: None,
+            default_on_null_expr: None,
+        };
+
+        // Test the to_json_value function
+        let json_value = PgJsonVisitor::to_json_value(&LogicalPlan::Pivot(pivot));
+
+        // Check the JSON structure
+        assert_eq!(json_value["Node Type"], "Pivot");
+        assert_eq!(json_value["Aggregate"], "sum_value");
+        assert_eq!(json_value["Pivot Column"], "category");
+
+        // Check the pivot values
+        let pivot_values = json_value["Pivot Values"].as_array().unwrap();
+        assert_eq!(pivot_values.len(), 2);
+        assert_eq!(pivot_values[0], "A");
+        assert_eq!(pivot_values[1], "B");
+
+        // Check that Value Subquery is not present
+        assert!(json_value.get("Value Subquery").is_none());
+    }
+
+    #[test]
+    fn test_pivot_with_subquery_to_json_value() {
+        // Create a mock schema
+        let schema = Arc::new(DFSchema::empty().to_owned());
+
+        // Create a Pivot plan with a value subquery
+        let pivot = Pivot {
+            input: Arc::new(LogicalPlan::EmptyRelation(EmptyRelation {
+                produce_one_row: false,
+                schema: Arc::clone(&schema),
+            })),
+            aggregate_expr: Expr::Column(Column::from_name("sum_value")),
+            pivot_column: Column::from_name("category"),
+            pivot_values: vec![],
+            schema: Arc::clone(&schema),
+            value_subquery: Some(Arc::new(LogicalPlan::EmptyRelation(EmptyRelation {
+                produce_one_row: false,
+                schema: Arc::clone(&schema),
+            }))),
+            default_on_null_expr: None,
+        };
+
+        // Test the to_json_value function
+        let json_value = PgJsonVisitor::to_json_value(&LogicalPlan::Pivot(pivot));
+
+        // Check the JSON structure
+        assert_eq!(json_value["Node Type"], "Pivot");
+        assert_eq!(json_value["Aggregate"], "sum_value");
+        assert_eq!(json_value["Pivot Column"], "category");
+
+        // Check that pivot values are not present
+        assert!(json_value.get("Pivot Values").is_none());
+
+        // Check that Value Subquery is present
+        assert_eq!(json_value["Value Subquery"], "Provided");
     }
 }
