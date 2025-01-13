@@ -95,8 +95,8 @@ fn get_schema_name(schema_name: &SchemaName) -> String {
 /// Construct `TableConstraint`(s) for the given columns by iterating over
 /// `columns` and extracting individual inline constraint definitions.
 pub fn calc_inline_constraints_from_columns(
-    columns: &[ColumnDef
-]) -> Vec<TableConstraint> {
+    columns: &[ColumnDef],
+) -> Vec<TableConstraint> {
     let mut constraints = vec![];
     for column in columns {
         for ast::ColumnOptionDef { name, option } in &column.options {
