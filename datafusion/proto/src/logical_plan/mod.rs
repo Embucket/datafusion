@@ -59,8 +59,8 @@ use datafusion_expr::{
     Statement, WindowUDF, dml,
     logical_plan::{
         Aggregate, CreateCatalog, CreateCatalogSchema, CreateExternalTable, CreateView,
-        DdlStatement, Distinct, EmptyRelation, Extension, Join, JoinConstraint, Prepare,
-        Projection, Repartition, Sort, SubqueryAlias, TableScan, Values, Window,
+        DdlStatement, Distinct, EmptyRelation, Extension, Join, JoinConstraint, Pivot,
+        Prepare, Projection, Repartition, Sort, SubqueryAlias, TableScan, Values, Window,
         builder::project,
     },
 };
@@ -981,6 +981,60 @@ impl AsLogicalPlan for LogicalPlanNode {
                     dml_node.dml_type().into(),
                     Arc::new(into_logical_plan!(dml_node.input, ctx, extension_codec)?),
                 )))
+            LogicalPlanType::Pivot(pivot) => {
+                let aggregate_expr = pivot
+                    .aggregate_expr
+                    .as_ref()
+                    .map(|expr| from_proto::parse_expr(expr, ctx, extension_codec))
+                    .transpose()?
+                    .ok_or_else(|| {
+                        DataFusionError::Internal("aggregate_expr required".to_string())
+                    })?;
+                let pivot_column = pivot
+                    .pivot_column
+                    .as_ref()
+                    .map(|col| col.clone().into())
+                    .ok_or_else(|| {
+                        DataFusionError::Internal("pivot_column required".to_string())
+                    })?;
+                let pivot_values = pivot
+                    .pivot_values
+                    .iter()
+                    .map(|val| val.try_into())
+                    .collect::<Result<Vec<datafusion_common::ScalarValue>, _>>(
+                )?;
+                let schema = Arc::new(convert_required!(pivot.schema)?);
+                let value_subquery = if pivot.value_subquery.is_some() {
+                    Some(Arc::new(into_logical_plan!(
+                        pivot.value_subquery,
+                        ctx,
+                        extension_codec
+                    )?))
+                } else {
+                    None
+                };
+                let default_on_null_expr = if pivot.default_on_null_expr.is_some() {
+                    pivot
+                        .default_on_null_expr
+                        .as_ref()
+                        .map(|expr| from_proto::parse_expr(expr, ctx, extension_codec))
+                        .transpose()?
+                } else {
+                    None
+                };
+                Ok(LogicalPlan::Pivot(Pivot {
+                    input: Arc::new(into_logical_plan!(
+                        pivot.input,
+                        ctx,
+                        extension_codec
+                    )?),
+                    aggregate_expr,
+                    pivot_column,
+                    pivot_values,
+                    schema,
+                    value_subquery,
+                    default_on_null_expr,
+                }))
             }
         }
     }
@@ -1807,6 +1861,9 @@ impl AsLogicalPlan for LogicalPlanNode {
                     ))),
                 })
             }
+            LogicalPlan::Pivot(_) => Err(proto_error(
+                "LogicalPlan serde is not yet implemented for Statement",
+            )),
         }
     }
 }

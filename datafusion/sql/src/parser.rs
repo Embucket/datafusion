@@ -549,6 +549,12 @@ impl<'a> DFParser<'a> {
             Token::Word(w) => {
                 match w.keyword {
                     Keyword::CREATE => {
+                        if let Token::Word(w) = self.parser.peek_nth_token(2).token {
+                            // use native parser for CREATE EXTERNAL VOLUME
+                            if w.keyword == Keyword::VOLUME {
+                                return self.parse_and_handle_statement();
+                            }
+                        }
                         self.parser.next_token(); // CREATE
                         self.parse_create()
                     }
@@ -852,7 +858,11 @@ impl<'a> DFParser<'a> {
         {
             self.parse_create_external_table(true, false)
         } else {
-            Ok(Statement::Statement(Box::from(self.parser.parse_create()?)))
+            // Push back CREATE
+            self.parser.prev_token();
+            Ok(Statement::Statement(Box::from(
+                self.parser.parse_statement()?,
+            )))
         }
     }
 
@@ -1232,6 +1242,26 @@ mod tests {
         }
     }
 
+    #[test]
+    fn skip_create_stage_snowflake() -> Result<(), DataFusionError> {
+        let sql =
+            "CREATE OR REPLACE STAGE stage URL='s3://data.csv' FILE_FORMAT=(TYPE=csv)";
+        let dialect = Box::new(SnowflakeDialect);
+        let statements = DFParser::parse_sql_with_dialect(sql, dialect.as_ref())?;
+
+        assert_eq!(
+            statements.len(),
+            1,
+            "Expected to parse exactly one statement"
+        );
+        match &statements[0] {
+            Statement::Statement(stmt) => {
+                assert_eq!(stmt.to_string(), sql);
+            }
+            _ => panic!("Expected statement type"),
+        }
+        Ok(())
+    }
     #[test]
     fn create_external_table() -> Result<(), DataFusionError> {
         // positive case
@@ -1838,6 +1868,24 @@ mod tests {
         );
         if let Statement::CopyTo(_) = &statements[0] {
             panic!("Expected non COPY TO statement, but was successful: {statements:?}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn skip_external_volume() -> Result<(), DataFusionError> {
+        let sql = "CREATE OR REPLACE EXTERNAL VOLUME exvol STORAGE_LOCATIONS =
+        ((NAME = 's3' STORAGE_PROVIDER = 'S3' STORAGE_BASE_URL = 's3://my-example-bucket/' ))";
+        let dialect = Box::new(SnowflakeDialect);
+        let statements = DFParser::parse_sql_with_dialect(sql, dialect.as_ref())?;
+
+        assert_eq!(
+            statements.len(),
+            1,
+            "Expected to parse exactly one statement"
+        );
+        if let Statement::CreateExternalTable(_) = &statements[0] {
+            panic!("Expected non CREATE EXTERNAL TABLE statement, but was successful: {statements:?}");
         }
         Ok(())
     }

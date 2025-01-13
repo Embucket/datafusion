@@ -472,7 +472,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
     }
 
     /// Returns a vector of (column_name, default_expr) pairs
-    pub(super) fn build_column_defaults(
+    pub fn build_column_defaults(
         &self,
         columns: &Vec<SQLColumnDef>,
         planner_context: &mut PlannerContext,
@@ -615,7 +615,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
             })
     }
 
-    pub(crate) fn convert_data_type_to_field(
+    pub fn convert_data_type_to_field(
         &self,
         sql_type: &SQLDataType,
     ) -> Result<FieldRef> {

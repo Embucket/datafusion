@@ -106,7 +106,11 @@ unsafe extern "C" fn call_fn_wrapper(
         codec.as_ref()
     ));
 
-    let table_provider = rresult_return!(udtf_inner.call(&args));
+    let args_with_names = args
+        .into_iter()
+        .map(|expr| (expr, None))
+        .collect::<Vec<_>>();
+    let table_provider = rresult_return!(udtf_inner.call(&args_with_names));
     RResult::ROk(FFI_TableProvider::new_with_ffi_codec(
         table_provider,
         false,
@@ -208,10 +212,13 @@ impl From<FFI_TableFunction> for Arc<dyn TableFunctionImpl> {
 }
 
 impl TableFunctionImpl for ForeignTableFunction {
-    fn call(&self, args: &[Expr]) -> Result<Arc<dyn TableProvider>> {
+    fn call(&self, args: &[(Expr, Option<String>)]) -> Result<Arc<dyn TableProvider>> {
         let codec: Arc<dyn LogicalExtensionCodec> = (&self.0.logical_codec).into();
         let expr_list = LogicalExprList {
-            expr: serialize_exprs(args, codec.as_ref())?,
+            expr: serialize_exprs(
+                args.iter().map(|(expr, _)| expr).collect::<Vec<_>>(),
+                codec.as_ref(),
+            )?,
         };
         let filters_serialized = expr_list.encode_to_vec().into();
 
@@ -243,10 +250,13 @@ mod tests {
     struct TestUDTF {}
 
     impl TableFunctionImpl for TestUDTF {
-        fn call(&self, args: &[Expr]) -> Result<Arc<dyn TableProvider>> {
+        fn call(
+            &self,
+            args: &[(Expr, Option<String>)],
+        ) -> Result<Arc<dyn TableProvider>> {
             let args = args
                 .iter()
-                .map(|arg| {
+                .map(|(arg, _)| {
                     if let Expr::Literal(scalar, _) = arg {
                         Ok(scalar)
                     } else {
@@ -334,7 +344,12 @@ mod tests {
 
         let foreign_udf: Arc<dyn TableFunctionImpl> = local_udtf.into();
 
-        let table = foreign_udf.call(&[lit(6_u64), lit("one"), lit(2.0), lit(3_u64)])?;
+        let table = foreign_udf.call(&vec![
+            (lit(6_u64), None),
+            (lit("one"), None),
+            (lit(2.0), None),
+            (lit(3_u64), None),
+        ])?;
 
         let _ = ctx.register_table("test-table", table)?;
 

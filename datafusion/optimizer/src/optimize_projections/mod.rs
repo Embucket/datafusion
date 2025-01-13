@@ -425,6 +425,9 @@ fn optimize_projections(
             });
             vec![required_indices.append(&additional_necessary_child_indices)]
         }
+        LogicalPlan::Pivot(_) => {
+            return Ok(Transformed::no(plan));
+        }
     };
 
     // Required indices are currently ordered (child0, child1, ...)

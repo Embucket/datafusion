@@ -138,6 +138,9 @@ impl Visitor for RelationVisitor {
                 | Statement::ShowColumns { .. }
                 | Statement::ShowTables { .. }
                 | Statement::ShowCollation { .. }
+                | Statement::ShowSchemas { .. }
+                | Statement::ShowDatabases { .. }
+                | Statement::ShowObjects { .. }
         );
         if requires_information_schema {
             for s in INFORMATION_SCHEMA_TABLES {
@@ -212,9 +215,9 @@ fn visit_statement(statement: &DFStatement, visitor: &mut RelationVisitor) -> Re
 /// assert_eq!(ctes.len(), 0);
 /// ```
 ///
-/// ## Example with CTEs  
-///  
-/// ```  
+/// ## Example with CTEs
+///
+/// ```
 /// # use datafusion_sql::parser::DFParser;
 /// # use datafusion_sql::resolve::resolve_table_references;
 /// let query = "with my_cte as (values (1), (2)) SELECT * from my_cte;";
