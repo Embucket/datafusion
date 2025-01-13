@@ -71,7 +71,7 @@ fn ident_to_string(ident: &Ident) -> String {
     normalize_ident(ident.to_owned())
 }
 
-fn object_name_to_string(object_name: &ObjectName) -> String {
+pub fn object_name_to_string(object_name: &ObjectName) -> String {
     object_name
         .0
         .iter()
@@ -94,7 +94,9 @@ fn get_schema_name(schema_name: &SchemaName) -> String {
 
 /// Construct `TableConstraint`(s) for the given columns by iterating over
 /// `columns` and extracting individual inline constraint definitions.
-fn calc_inline_constraints_from_columns(columns: &[ColumnDef]) -> Vec<TableConstraint> {
+pub fn calc_inline_constraints_from_columns(
+    columns: &[ColumnDef],
+) -> Vec<TableConstraint> {
     let mut constraints = vec![];
     for column in columns {
         for ast::ColumnOptionDef { name, option } in &column.options {
@@ -1418,7 +1420,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
     }
 
     /// Convert each [TableConstraint] to corresponding [Constraint]
-    fn new_constraint_from_table_constraints(
+    pub fn new_constraint_from_table_constraints(
         constraints: &[TableConstraint],
         df_schema: &DFSchemaRef,
     ) -> Result<Constraints> {
@@ -2097,7 +2099,7 @@ ON p.function_name = r.routine_name
     }
 
     /// Return true if there is a table provider available for "schema.table"
-    fn has_table(&self, schema: &str, table: &str) -> bool {
+    pub fn has_table(&self, schema: &str, table: &str) -> bool {
         let tables_reference = TableReference::Partial {
             schema: schema.into(),
             table: table.into(),
