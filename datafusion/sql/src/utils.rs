@@ -230,10 +230,7 @@ pub fn window_expr_common_partition_keys(window_exprs: &[Expr]) -> Result<&[Expr
 
 /// Returns a validated `DataType` for the specified precision and
 /// scale
-pub fn make_decimal_type(
-    precision: Option<u64>,
-    scale: Option<u64>,
-) -> Result<DataType> {
+pub fn make_decimal_type(precision: Option<u64>, scale: Option<u64>) -> Result<DataType> {
     // postgres like behavior
     let (precision, scale) = match (precision, scale) {
         (Some(p), Some(s)) => (p as u8, s as i8),
