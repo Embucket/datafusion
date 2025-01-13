@@ -6108,8 +6108,7 @@ dependencies = [
 [[package]]
 name = "sqlparser_derive"
 version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "da5fc6819faabb412da764b99d3b713bb55083c11e7e0c00144d386cd6a1939c"
+source = "git+https://github.com/Embucket/datafusion-sqlparser-rs.git?rev=8d9cbc2669d7fc3d79d7d1d725ac20f1e9bfe10e#8d9cbc2669d7fc3d79d7d1d725ac20f1e9bfe10e"
 dependencies = [
  "proc-macro2",
  "quote",

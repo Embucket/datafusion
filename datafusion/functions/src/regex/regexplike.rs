@@ -70,6 +70,7 @@ Additional examples can be found [here](https://github.com/apache/datafusion/blo
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct RegexpLikeFunc {
     signature: Signature,
+    aliases: Vec<String>,
 }
 
 impl Default for RegexpLikeFunc {
@@ -95,6 +96,7 @@ impl RegexpLikeFunc {
                 ],
                 Volatility::Immutable,
             ),
+            aliases: vec![String::from("rlike")],
         }
     }
 }
@@ -121,6 +123,10 @@ impl ScalarUDFImpl for RegexpLikeFunc {
             // get here, the first argument is always a string
             _ => Boolean,
         })
+    }
+
+    fn aliases(&self) -> &[String] {
+        &self.aliases
     }
 
     fn invoke_with_args(

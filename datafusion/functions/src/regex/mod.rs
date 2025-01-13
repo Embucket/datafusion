@@ -27,6 +27,7 @@ pub mod regexpinstr;
 pub mod regexplike;
 pub mod regexpmatch;
 pub mod regexpreplace;
+pub mod regexpsubstr;
 
 // create UDFs
 make_udf_function!(regexpcount::RegexpCountFunc, regexp_count);
@@ -34,6 +35,7 @@ make_udf_function!(regexpinstr::RegexpInstrFunc, regexp_instr);
 make_udf_function!(regexpmatch::RegexpMatchFunc, regexp_match);
 make_udf_function!(regexplike::RegexpLikeFunc, regexp_like);
 make_udf_function!(regexpreplace::RegexpReplaceFunc, regexp_replace);
+make_udf_function!(regexpsubstr::RegexpSubstrFunc, regexp_substr);
 
 pub mod expr_fn {
     use datafusion_expr::Expr;
@@ -93,7 +95,34 @@ pub mod expr_fn {
         };
         super::regexp_instr().call(args)
     }
+
     /// Returns true if a regex has at least one match in a string, false otherwise.
+    /// Returns the substring that matches a regular expression within a string.
+    pub fn regexp_substr(
+        values: Expr,
+        regex: Expr,
+        start: Option<Expr>,
+        occurrence: Option<Expr>,
+        flags: Option<Expr>,
+        group_num: Option<Expr>,
+    ) -> Expr {
+        let mut args = vec![values, regex];
+        if let Some(start) = start {
+            args.push(start);
+        };
+        if let Some(occurrence) = occurrence {
+            args.push(occurrence);
+        };
+        if let Some(flags) = flags {
+            args.push(flags);
+        };
+        if let Some(group_num) = group_num {
+            args.push(group_num);
+        };
+        super::regexp_substr().call(args)
+    }
+
+    /// Returns true if a has at least one match in a string, false otherwise.
     pub fn regexp_like(values: Expr, regex: Expr, flags: Option<Expr>) -> Expr {
         let mut args = vec![values, regex];
         if let Some(flags) = flags {
@@ -125,6 +154,7 @@ pub fn functions() -> Vec<Arc<datafusion_expr::ScalarUDF>> {
         regexp_instr(),
         regexp_like(),
         regexp_replace(),
+        regexp_substr(),
     ]
 }
 

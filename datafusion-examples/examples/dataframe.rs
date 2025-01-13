@@ -69,8 +69,8 @@ async fn main() -> Result<()> {
     write_out(&ctx).await?;
     register_aggregate_test_data("t1", &ctx).await?;
     register_aggregate_test_data("t2", &ctx).await?;
-    where_scalar_subquery(&ctx).await?;
-    where_in_subquery(&ctx).await?;
+    Box::pin(where_scalar_subquery(&ctx)).await?;
+    Box::pin(where_in_subquery(&ctx)).await?;
     where_exist_subquery(&ctx).await?;
     Ok(())
 }

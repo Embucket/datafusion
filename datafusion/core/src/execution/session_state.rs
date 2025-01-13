@@ -274,7 +274,7 @@ impl Session for SessionState {
 }
 
 impl SessionState {
-    pub(crate) fn resolve_table_ref(
+    pub fn resolve_table_ref(
         &self,
         table_ref: impl Into<TableReference>,
     ) -> ResolvedTableReference {
@@ -474,7 +474,8 @@ impl SessionState {
         query.statement_to_plan(statement)
     }
 
-    fn get_parser_options(&self) -> ParserOptions {
+    /// Get the parser options
+    pub fn get_parser_options(&self) -> ParserOptions {
         let sql_parser_options = &self.config.options().sql_parser;
 
         ParserOptions {
@@ -1634,9 +1635,11 @@ impl From<SessionState> for SessionStateBuilder {
 ///
 /// This is used so the SQL planner can access the state of the session without
 /// having a direct dependency on the [`SessionState`] struct (and core crate)
-struct SessionContextProvider<'a> {
-    state: &'a SessionState,
-    tables: HashMap<ResolvedTableReference, Arc<dyn TableSource>>,
+pub struct SessionContextProvider<'a> {
+    /// The session state
+    pub state: &'a SessionState,
+    /// The tables available in the session
+    pub tables: HashMap<ResolvedTableReference, Arc<dyn TableSource>>,
 }
 
 impl ContextProvider for SessionContextProvider<'_> {
@@ -1666,20 +1669,25 @@ impl ContextProvider for SessionContextProvider<'_> {
     fn get_table_function_source(
         &self,
         name: &str,
-        args: Vec<Expr>,
+        args: Vec<(Expr, Option<String>)>,
     ) -> datafusion_common::Result<Arc<dyn TableSource>> {
+        let name = name.to_ascii_lowercase();
         let tbl_func = self
             .state
             .table_functions
-            .get(name)
+            .get(&name)
             .cloned()
             .ok_or_else(|| plan_datafusion_err!("table function '{name}' not found"))?;
         let dummy_schema = DFSchema::empty();
         let simplifier =
             ExprSimplifier::new(SessionSimplifyProvider::new(self.state, &dummy_schema));
+
         let args = args
             .into_iter()
-            .map(|arg| simplifier.simplify(arg))
+            .map(|(expr, named_param)| {
+                // simplify returns Result<Expr>, map it into Result<(Expr, Option<String>)>
+                simplifier.simplify(expr).map(|e| (e, named_param))
+            })
             .collect::<datafusion_common::Result<Vec<_>>>()?;
         let provider = tbl_func.create_table_provider(&args)?;
 

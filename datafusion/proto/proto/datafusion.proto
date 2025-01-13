@@ -62,6 +62,7 @@ message LogicalPlanNode {
     RecursiveQueryNode recursive_query = 31;
     CteWorkTableScanNode cte_work_table_scan = 32;
     DmlNode dml = 33;
+    PivotNode pivot = 34;
   }
 }
 
@@ -1364,4 +1365,15 @@ message SortMergeJoinExecNode {
   JoinFilter filter = 5;
   repeated SortExprNode sort_options = 6;
   datafusion_common.NullEquality null_equality = 7;
+}
+
+message PivotNode {
+    LogicalPlanNode input = 1;
+    LogicalExprNode aggregate_expr = 2;
+    datafusion_common.Column pivot_column = 3;
+    repeated datafusion_common.ScalarValue pivot_values = 4;
+    datafusion_common.DfSchema schema = 5;
+    LogicalPlanNode value_subquery = 6;
+    LogicalExprNode default_on_null_expr = 7;
+
 }
