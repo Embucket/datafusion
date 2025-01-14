@@ -143,7 +143,6 @@ impl ScalarUDFImpl for ToDateFunc {
         if args.len() > 1 {
             validate_data_types(args, "to_date")?;
         }
-
         match args[0].data_type() {
             Int32 | Int64 | Null | Float64 | Date32 | Date64 | Timestamp(_, _) => {
                 args[0].cast_to(&Date32, None)
@@ -443,7 +442,6 @@ mod tests {
             ScalarValue::TimestampNanosecond(Some(1736782134736782134), None),
         ];
         for scalar in test_cases {
-            #[allow(deprecated)] // TODO migrate UDF to invoke from invoke_batch
             let timestamp_to_date_result = ToDateFunc::new()
                 .invoke_batch(&[ColumnarValue::Scalar(scalar.clone())], 1);
 
