@@ -285,6 +285,8 @@ impl SessionState {
             .build()
     }
 
+    /// Resolves a [`TableReference`] to a [`ResolvedTableReference`]
+    /// using the default catalog and schema.
     pub fn resolve_table_ref(
         &self,
         table_ref: impl Into<TableReference>,
@@ -845,9 +847,9 @@ impl SessionState {
         overwrite: bool,
     ) -> Result<(), DataFusionError> {
         let ext = file_format.get_ext().to_lowercase();
-        match (self.file_formats.entry(ext.clone()), overwrite){
-            (Entry::Vacant(e), _) => {e.insert(file_format);},
-            (Entry::Occupied(mut e), true)  => {e.insert(file_format);},
+        match (self.file_formats.entry(ext.clone()), overwrite) {
+            (Entry::Vacant(e), _) => { e.insert(file_format); }
+            (Entry::Occupied(mut e), true) => { e.insert(file_format); }
             (Entry::Occupied(_), false) => return config_err!("File type already registered for extension {ext}. Set overwrite to true to replace this extension."),
         };
         Ok(())
