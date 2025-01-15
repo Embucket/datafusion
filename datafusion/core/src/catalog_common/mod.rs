@@ -156,6 +156,8 @@ pub fn resolve_table_references(
                     | Statement::ShowColumns { .. }
                     | Statement::ShowTables { .. }
                     | Statement::ShowCollation { .. }
+                    | Statement::ShowSchemas { .. }
+                    | Statement::ShowDatabases { .. }
             );
             if requires_information_schema {
                 for s in INFORMATION_SCHEMA_TABLES {
