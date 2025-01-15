@@ -285,7 +285,7 @@ impl SessionState {
             .build()
     }
 
-    pub(crate) fn resolve_table_ref(
+    pub fn resolve_table_ref(
         &self,
         table_ref: impl Into<TableReference>,
     ) -> ResolvedTableReference {
