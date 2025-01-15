@@ -1769,6 +1769,7 @@ The following regular expression functions are supported:
 - [regexp_like](#regexp_like)
 - [regexp_match](#regexp_match)
 - [regexp_replace](#regexp_replace)
+- [rlike](#rlike)
 
 ### `regexp_count`
 
@@ -1838,6 +1839,10 @@ SELECT regexp_like('aBc', '(b|d)', 'i');
 ```
 
 Additional examples can be found [here](https://github.com/apache/datafusion/blob/main/datafusion-examples/examples/regexp.rs)
+
+#### Aliases
+
+- rlike
 
 ### `regexp_match`
 
@@ -1918,6 +1923,10 @@ SELECT regexp_replace('aBc', '(b|d)', 'Ab\\1a', 'i');
 ```
 
 Additional examples can be found [here](https://github.com/apache/datafusion/blob/main/datafusion-examples/examples/regexp.rs)
+
+### `rlike`
+
+_Alias of [regexp_like](#regexp_like)._
 
 ## Time and Date Functions
 
