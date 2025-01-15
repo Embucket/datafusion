@@ -32,7 +32,7 @@ use datafusion_common::{
 };
 use sqlparser::ast::Ident;
 
-/// Various types of DDL  (CREATE / DROP) catalog manipulation
+/// Various types of DDL  (CREATE / DROP / ALTER) catalog manipulation
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Hash)]
 pub enum DdlStatement {
     /// Creates an external table.
@@ -57,6 +57,8 @@ pub enum DdlStatement {
     CreateFunction(CreateFunction),
     /// Drop function statement
     DropFunction(DropFunction),
+    /// Alter a table.
+    AlterTable(AlterTable),
 }
 
 impl DdlStatement {
@@ -78,6 +80,7 @@ impl DdlStatement {
             DdlStatement::DropCatalogSchema(DropCatalogSchema { schema, .. }) => schema,
             DdlStatement::CreateFunction(CreateFunction { schema, .. }) => schema,
             DdlStatement::DropFunction(DropFunction { schema, .. }) => schema,
+            DdlStatement::AlterTable(AlterTable { schema, .. }) => schema,
         }
     }
 
@@ -96,6 +99,7 @@ impl DdlStatement {
             DdlStatement::DropCatalogSchema(_) => "DropCatalogSchema",
             DdlStatement::CreateFunction(_) => "CreateFunction",
             DdlStatement::DropFunction(_) => "DropFunction",
+            DdlStatement::AlterTable(_) => "AlterTable",
         }
     }
 
@@ -115,6 +119,7 @@ impl DdlStatement {
             DdlStatement::DropCatalogSchema(_) => vec![],
             DdlStatement::CreateFunction(_) => vec![],
             DdlStatement::DropFunction(_) => vec![],
+            DdlStatement::AlterTable(_) => vec![],
         }
     }
 
@@ -182,6 +187,11 @@ impl DdlStatement {
                     }
                     DdlStatement::DropFunction(DropFunction { name, .. }) => {
                         write!(f, "CreateFunction: name {name:?}")
+                    }
+                    DdlStatement::AlterTable(AlterTable {
+                                                name, if_exists, ..
+                                            }) => {
+                        write!(f, "AlterTable: {name:?} if not exist:={if_exists}")
                     }
                 }
             }
@@ -601,6 +611,25 @@ impl PartialOrd for CreateIndex {
             if_not_exists: &other.if_not_exists,
         };
         comparable_self.partial_cmp(&comparable_other)
+    }
+}
+
+/// Alter a table.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct AlterTable {
+    pub name: TableReference,
+    pub if_exists: bool,
+    pub columns: Vec<Expr>,
+    pub schema: DFSchemaRef,
+}
+
+// Manual implementation needed because of `schema` field. Comparison excludes this field.
+impl PartialOrd for AlterTable {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        match self.name.partial_cmp(&other.name) {
+            Some(Ordering::Equal) => self.if_exists.partial_cmp(&other.if_exists),
+            cmp => cmp,
+        }
     }
 }
 
