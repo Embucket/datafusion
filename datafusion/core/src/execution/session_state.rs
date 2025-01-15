@@ -280,7 +280,9 @@ impl SessionState {
             .build()
     }
 
-    pub(crate) fn resolve_table_ref(
+    /// Resolves a [`TableReference`] to a [`ResolvedTableReference`]
+    /// using the default catalog and schema.
+    pub fn resolve_table_ref(
         &self,
         table_ref: impl Into<TableReference>,
     ) -> ResolvedTableReference {
