@@ -33,7 +33,13 @@ use datafusion_expr::{
 use datafusion_macros::user_doc;
 
 use std::any::Any;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+
+#[derive(Debug)]
+pub struct RegexpLikeFunc {
+    signature: Signature,
+    aliases: Vec<String>,
+}
 
 #[user_doc(
     doc_section(label = "Regular Expression Functions"),
@@ -95,6 +101,7 @@ impl RegexpLikeFunc {
                 ],
                 Volatility::Immutable,
             ),
+            aliases: vec![String::from("rlike")],
         }
     }
 }
@@ -121,6 +128,10 @@ impl ScalarUDFImpl for RegexpLikeFunc {
             // get here, the first argument is always a string
             _ => Boolean,
         })
+    }
+
+    fn aliases(&self) -> &[String] {
+        &self.aliases
     }
 
     fn invoke_with_args(
