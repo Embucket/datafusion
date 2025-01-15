@@ -189,8 +189,8 @@ impl DdlStatement {
                         write!(f, "CreateFunction: name {name:?}")
                     }
                     DdlStatement::AlterTable(AlterTable {
-                                                name, if_exists, ..
-                                            }) => {
+                        name, if_exists, ..
+                    }) => {
                         write!(f, "AlterTable: {name:?} if not exist:={if_exists}")
                     }
                 }
