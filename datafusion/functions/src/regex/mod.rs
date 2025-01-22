@@ -118,5 +118,6 @@ pub fn functions() -> Vec<Arc<datafusion_expr::ScalarUDF>> {
         regexp_match(),
         regexp_like(),
         regexp_replace(),
+        regexp_substr(),
     ]
 }

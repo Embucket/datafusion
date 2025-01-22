@@ -524,8 +524,7 @@ mod tests {
             Arc::new(position),
             Arc::new(occurrence),
             Arc::new(flags),
-        ])
-            .expect_err("unsupported flag should have failed");
+        ]).expect_err("unsupported flag should have failed");
 
         assert_eq!(re_err.strip_backtrace(), "Error during planning: regexp_substr() does not support the \"global\" option");
     }
