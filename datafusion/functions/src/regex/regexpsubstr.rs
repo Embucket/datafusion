@@ -17,10 +17,9 @@
 
 //! Regex expressions
 use arrow::array::{
-    Array, ArrayRef, AsArray, GenericStringArray, GenericStringBuilder, ListBuilder,
-    OffsetSizeTrait,
+    Array, ArrayRef, AsArray, GenericStringArray, GenericStringBuilder, OffsetSizeTrait,
 };
-use arrow::datatypes::{DataType, Int32Type};
+use arrow::datatypes::{DataType, Int64Type};
 use arrow::error::ArrowError;
 use datafusion_common::plan_err;
 use datafusion_common::ScalarValue;
@@ -47,7 +46,7 @@ impl Default for RegexpSubstrFunc {
 
 impl RegexpSubstrFunc {
     pub fn new() -> Self {
-        use DataType::*;
+        use DataType::{Int64, LargeUtf8, Utf8};
         Self {
             signature: Signature::one_of(
                 vec![
@@ -56,17 +55,17 @@ impl RegexpSubstrFunc {
                     // If that fails, it proceeds to `(LargeUtf8, Utf8)`.
                     TypeSignature::Exact(vec![Utf8, Utf8]),
                     TypeSignature::Exact(vec![LargeUtf8, LargeUtf8]),
-                    TypeSignature::Exact(vec![Utf8, Utf8, Int32]),
-                    TypeSignature::Exact(vec![LargeUtf8, LargeUtf8, Int32]),
-                    TypeSignature::Exact(vec![Utf8, Utf8, Int32, Int32]),
-                    TypeSignature::Exact(vec![LargeUtf8, LargeUtf8, Int32, Int32]),
-                    TypeSignature::Exact(vec![Utf8, Utf8, Int32, Int32, Utf8]),
+                    TypeSignature::Exact(vec![Utf8, Utf8, Int64]),
+                    TypeSignature::Exact(vec![LargeUtf8, LargeUtf8, Int64]),
+                    TypeSignature::Exact(vec![Utf8, Utf8, Int64, Int64]),
+                    TypeSignature::Exact(vec![LargeUtf8, LargeUtf8, Int64, Int64]),
+                    TypeSignature::Exact(vec![Utf8, Utf8, Int64, Int64, Utf8]),
                     TypeSignature::Exact(vec![
-                        LargeUtf8, LargeUtf8, Int32, Int32, LargeUtf8,
+                        LargeUtf8, LargeUtf8, Int64, Int64, LargeUtf8,
                     ]),
-                    TypeSignature::Exact(vec![Utf8, Utf8, Int32, Int32, Utf8, Int32]),
+                    TypeSignature::Exact(vec![Utf8, Utf8, Int64, Int64, Utf8, Int64]),
                     TypeSignature::Exact(vec![
-                        LargeUtf8, LargeUtf8, Int32, Int32, LargeUtf8, Int32,
+                        LargeUtf8, LargeUtf8, Int64, Int64, LargeUtf8, Int64,
                     ]),
                 ],
                 Volatility::Immutable,
@@ -109,7 +108,7 @@ impl ScalarUDFImpl for RegexpSubstrFunc {
             .map(|arg| arg.to_array(inferred_length))
             .collect::<Result<Vec<_>>>()?;
 
-        let result = regexp_match_func(&args);
+        let result = regexp_subst_func(&args);
         if is_scalar {
             // If all inputs are scalar, keeps output as scalar
             let result = result.and_then(|arr| ScalarValue::try_from_array(&arr, 0));
@@ -137,13 +136,13 @@ fn get_regexp_substr_doc() -> &'static Documentation {
             +---------------------------------------------------------+
             | regexp_substr(Utf8("Köln"),Utf8("[a-zA-Z]ö[a-zA-Z]{2}")) |
             +---------------------------------------------------------+
-            | [Köln]                                                  |
+            | Köln                                                    |
             +---------------------------------------------------------+
             SELECT regexp_substr('aBc', '(b|d)', 1, 1, 'i');
             +---------------------------------------------------+
             | regexp_substr(Utf8("aBc"),Utf8("(b|d)"), Int32(1), Int32(1), Utf8("i")) |
             +---------------------------------------------------+
-            | [B]                                               |
+            | B                                                 |
             +---------------------------------------------------+
 ```
 Additional examples can be found [here](https://docs.snowflake.com/en/sql-reference/functions/regexp_substr#examples)
@@ -156,8 +155,10 @@ Additional examples can be found [here](https://docs.snowflake.com/en/sql-refere
             .with_argument("flags",
                            r#"Optional regular expression flags that control the behavior of the regular expression. The following flags are supported:
   - **i**: case-insensitive: letters match both upper and lower case
+  - **c**: case-sensitive: letters match upper or lower case. Default flag
   - **m**: multi-line mode: ^ and $ match begin/end of line
   - **s**: allow . to match \n
+  - **e**: extract submatches (for Snowflake compatibility)
   - **R**: enables CRLF mode: when multi-line mode is enabled, \r\n is used
   - **U**: swap the meaning of x* and x*?"#)
             .with_argument("group_num", "Specifies which group to extract. Groups are specified by using parentheses in the regular expression.")
@@ -165,7 +166,7 @@ Additional examples can be found [here](https://docs.snowflake.com/en/sql-refere
     })
 }
 
-fn regexp_match_func(args: &[ArrayRef]) -> Result<ArrayRef> {
+fn regexp_subst_func(args: &[ArrayRef]) -> Result<ArrayRef> {
     match args[0].data_type() {
         DataType::Utf8 => regexp_substr::<i32>(args),
         DataType::LargeUtf8 => regexp_substr::<i64>(args),
@@ -176,9 +177,9 @@ fn regexp_match_func(args: &[ArrayRef]) -> Result<ArrayRef> {
 }
 pub fn regexp_substr<T: OffsetSizeTrait>(args: &[ArrayRef]) -> Result<ArrayRef> {
     let args_len = args.len();
-    let get_int_arg = |index: usize, name: &str| -> Result<Option<i32>> {
+    let get_int_arg = |index: usize, name: &str| -> Result<Option<i64>> {
         if args_len > index {
-            let arg = args[index].as_primitive::<Int32Type>();
+            let arg = args[index].as_primitive::<Int64Type>();
             if arg.is_empty() {
                 return plan_err!(
                     "regexp_substr() requires the {:?} argument to be an integer",
@@ -209,27 +210,25 @@ pub fn regexp_substr<T: OffsetSizeTrait>(args: &[ArrayRef]) -> Result<ArrayRef> 
 
     let result =
         regexp_substr_inner::<T>(values, regex, start, occurrence, flags, group_num)?;
-    Ok(Arc::new(result) as ArrayRef)
+    Ok(Arc::new(result))
 }
 
 fn regexp_substr_inner<T: OffsetSizeTrait>(
     values: &GenericStringArray<T>,
     regex: Option<&str>,
-    start: Option<i32>,
-    occurrence: Option<i32>,
+    start: Option<i64>,
+    occurrence: Option<i64>,
     flags: Option<&str>,
-    group_num: Option<i32>,
+    group_num: Option<i64>,
 ) -> Result<ArrayRef> {
     let regex = match regex {
         None | Some("") => {
-            return Ok(
-                Arc::new(GenericStringArray::<T>::new_null(values.len())) as ArrayRef
-            )
+            return Ok(Arc::new(GenericStringArray::<T>::new_null(values.len())))
         }
         Some(regex) => regex,
     };
     let regex = compile_regex(regex, flags)?;
-    let mut list_builder = ListBuilder::new(GenericStringBuilder::<T>::new());
+    let mut builder = GenericStringBuilder::<T>::new();
 
     values.iter().try_for_each(|value| {
         match value {
@@ -248,28 +247,28 @@ fn regexp_substr_inner<T: OffsetSizeTrait>(
 
                 let matches =
                     get_matches(cleaned_value.as_str(), &regex, occurrence, group_num);
-                if !matches.is_empty() {
+
+                if matches.is_empty() {
+                    builder.append_null();
+                } else {
                     // Return only first substring that matches the pattern
                     if let Some(first_match) = matches.first() {
-                        list_builder.values().append_value(first_match);
-                        list_builder.append(true);
+                        builder.append_value(first_match);
                     }
-                } else {
-                    list_builder.append(false);
                 }
             }
-            _ => list_builder.append(false),
+            _ => builder.append_null(),
         }
         Ok(())
     })?;
-    Ok(Arc::new(list_builder.finish()))
+    Ok(Arc::new(builder.finish()))
 }
 
 fn get_matches(
     value: &str,
     regex: &Regex,
-    occurrence: Option<i32>,
-    group_num: Option<i32>,
+    occurrence: Option<i64>,
+    group_num: Option<i64>,
 ) -> Vec<String> {
     let mut matches = Vec::new();
     let occurrence = occurrence.unwrap_or(1) as usize;
@@ -307,6 +306,8 @@ fn compile_regex(regex: &str, flags: Option<&str>) -> Result<Regex, ArrowError> 
                     "regexp_substr() does not support global flag".to_string(),
                 ));
             }
+            // Case-sensitive enabled by default
+            let flags = flags.replace("c", "");
             format!("(?{}){}", flags, regex)
         }
     };
@@ -322,12 +323,11 @@ fn compile_regex(regex: &str, flags: Option<&str>) -> Result<Regex, ArrowError> 
 #[cfg(test)]
 mod tests {
     use crate::regex::regexpsubstr::{regexp_substr, RegexpSubstrFunc};
-    use arrow::array::{Array, ArrayAccessor, AsArray, Int32Array, StringArray};
+    use arrow::array::{Array, ArrayRef, Int64Array, LargeStringArray, StringArray};
     use arrow::datatypes::DataType;
     use datafusion_common::ScalarValue;
     use datafusion_expr::{ScalarFunctionArgs, ScalarUDFImpl};
     use datafusion_expr_common::columnar_value::ColumnarValue;
-    use itertools::Itertools;
     use std::sync::Arc;
 
     #[test]
@@ -349,74 +349,120 @@ mod tests {
             regex.iter().enumerate().for_each(|(rpos, regex)| {
                 let expected = expected.get(rpos).unwrap().get(pos).unwrap().to_string();
 
-                // Utf8
-                let result =
-                    RegexpSubstrFunc::new().invoke_with_args(ScalarFunctionArgs {
-                        args: vec![
-                            ColumnarValue::Scalar(ScalarValue::Utf8(Some(
-                                value.to_string(),
-                            ))),
-                            ColumnarValue::Scalar(ScalarValue::Utf8(Some(
-                                regex.to_string(),
-                            ))),
-                        ],
-                        number_rows: 0,
-                        return_type: &DataType::Utf8,
-                    });
-
-                match result {
-                    Ok(ColumnarValue::Scalar(ScalarValue::List(v))) => {
-                        let res = v.value(0);
-                        if res.is_empty() {
-                            assert_eq!(
-                                "", expected,
-                                "regexp_substr scalar utf8 test failed"
-                            );
-                        } else {
-                            let value = res.as_string::<i32>().value(0);
-                            assert_eq!(
-                                value,
-                                expected.to_string(),
-                                "regexp_substr scalar utf8 test failed"
-                            );
+                // Utf8, LargeUtf8
+                for (data_type, scalar) in &[
+                    (
+                        DataType::Utf8,
+                        ScalarValue::Utf8 as fn(Option<String>) -> ScalarValue,
+                    ),
+                    (
+                        DataType::LargeUtf8,
+                        ScalarValue::LargeUtf8 as fn(Option<String>) -> ScalarValue,
+                    ),
+                ] {
+                    let result =
+                        RegexpSubstrFunc::new().invoke_with_args(ScalarFunctionArgs {
+                            args: vec![
+                                ColumnarValue::Scalar(scalar(Some(value.to_string()))),
+                                ColumnarValue::Scalar(scalar(Some(regex.to_string()))),
+                            ],
+                            number_rows: 1,
+                            return_type: data_type,
+                        });
+                    match result {
+                        Ok(ColumnarValue::Scalar(
+                            ScalarValue::Utf8(ref res) | ScalarValue::LargeUtf8(ref res),
+                        )) => {
+                            if res.is_some() {
+                                assert_eq!(
+                                    res.as_ref().unwrap(),
+                                    &expected.to_string(),
+                                    "regexp_substr scalar test failed"
+                                );
+                            } else {
+                                assert_eq!(
+                                    "", expected,
+                                    "regexp_substr scalar utf8 test failed"
+                                )
+                            }
                         }
+                        _ => panic!("Unexpected result"),
                     }
-                    _ => panic!("Unexpected utf8 result"),
                 }
+            });
+        });
 
-                // LargeUtf8
+        // Array (column)
+        regex.iter().enumerate().for_each(|(rpos, regex)| {
+            // Utf8, LargeUtf8
+            for data_type in &[DataType::Utf8, DataType::LargeUtf8] {
+                let (array_values, regex) = match data_type {
+                    DataType::Utf8 => (
+                        Arc::new(StringArray::from(
+                            values.iter().map(|v| v.to_string()).collect::<Vec<_>>(),
+                        )) as ArrayRef,
+                        ScalarValue::Utf8(Some(regex.to_string())),
+                    ),
+                    DataType::LargeUtf8 => (
+                        Arc::new(LargeStringArray::from(
+                            values.iter().map(|v| v.to_string()).collect::<Vec<_>>(),
+                        )) as ArrayRef,
+                        ScalarValue::LargeUtf8(Some(regex.to_string())),
+                    ),
+                    _ => unreachable!(),
+                };
                 let result =
                     RegexpSubstrFunc::new().invoke_with_args(ScalarFunctionArgs {
                         args: vec![
-                            ColumnarValue::Scalar(ScalarValue::LargeUtf8(Some(
-                                value.to_string(),
-                            ))),
-                            ColumnarValue::Scalar(ScalarValue::LargeUtf8(Some(
-                                regex.to_string(),
-                            ))),
+                            ColumnarValue::Array(Arc::new(array_values)),
+                            ColumnarValue::Scalar(regex),
                         ],
-                        number_rows: 0,
-                        return_type: &DataType::LargeUtf8,
+                        number_rows: 1,
+                        return_type: data_type,
                     });
-
                 match result {
-                    Ok(ColumnarValue::Scalar(ScalarValue::List(v))) => {
-                        let res = v.value(0);
-                        if res.is_empty() {
-                            assert_eq!("", expected, "regexp_substr scalar test failed");
-                        } else {
-                            let value = res.as_string::<i64>().value(0);
-                            assert_eq!(
-                                value,
-                                expected.to_string(),
-                                "regexp_substr scalar test failed"
-                            );
-                        }
+                    Ok(ColumnarValue::Array(array)) => {
+                        let expected = expected
+                            .get(rpos)
+                            .unwrap()
+                            .iter()
+                            .map(|v| {
+                                if v.is_empty() {
+                                    return None;
+                                }
+                                Some(v.to_string())
+                            })
+                            .collect::<Vec<Option<String>>>();
+
+                        assert_eq!(array.data_type(), data_type, "wrong array datatype");
+                        match data_type {
+                            DataType::Utf8 => {
+                                let array =
+                                    array.as_any().downcast_ref::<StringArray>().unwrap();
+                                let expected = StringArray::from(expected);
+                                assert_eq!(
+                                    array, &expected,
+                                    "regexp_substr array Utf8 test failed"
+                                );
+                            }
+                            DataType::LargeUtf8 => {
+                                let array = array
+                                    .as_any()
+                                    .downcast_ref::<LargeStringArray>()
+                                    .unwrap();
+                                let expected = LargeStringArray::from(expected);
+                                assert_eq!(
+                                    array, &expected,
+                                    "regexp_substr array LargeUtf8 test failed"
+                                );
+                            }
+                            _ => unreachable!(),
+                        };
                     }
                     _ => panic!("Unexpected result"),
                 }
-            });
-        })
+            }
+        });
     }
 
     #[test]
@@ -433,79 +479,55 @@ mod tests {
         let position = 1;
         let occurrence = 1;
         let flags = "i";
-        let group_num = 1;
+        let group_num = 0;
         let expected = ["", "abc", "abc", "Abc", "abC", ""];
 
         // Scalar
         values.iter().enumerate().for_each(|(pos, &value)| {
             let expected = expected.get(pos).cloned().unwrap();
-
-            // Utf8
-            let result = RegexpSubstrFunc::new().invoke_with_args(ScalarFunctionArgs {
-                args: vec![
-                    ColumnarValue::Scalar(ScalarValue::Utf8(Some(value.to_string()))),
-                    ColumnarValue::Scalar(ScalarValue::Utf8(Some(regex.to_string()))),
-                    ColumnarValue::Scalar(ScalarValue::Int32(Some(position))),
-                    ColumnarValue::Scalar(ScalarValue::Int32(Some(occurrence))),
-                    ColumnarValue::Scalar(ScalarValue::Utf8(Some(flags.to_string()))),
-                    // ColumnarValue::Scalar(ScalarValue::Int32(Some(group_num))),
-                ],
-                number_rows: 0,
-                return_type: &DataType::Utf8,
-            });
-
-            match result {
-                Ok(ColumnarValue::Scalar(ScalarValue::List(v))) => {
-                    let res = v.value(0);
-                    if res.is_empty() {
-                        assert_eq!("", expected, "regexp_substr scalar utf8 test failed");
-                    } else {
-                        let value = res.as_string::<i32>().value(0);
-                        assert_eq!(
-                            value,
-                            expected.to_string(),
-                            "regexp_substr scalar utf8 test failed"
-                        );
+            // Utf8, LargeUtf8
+            for (data_type, scalar) in &[
+                (
+                    DataType::Utf8,
+                    ScalarValue::Utf8 as fn(Option<String>) -> ScalarValue,
+                ),
+                (
+                    DataType::LargeUtf8,
+                    ScalarValue::LargeUtf8 as fn(Option<String>) -> ScalarValue,
+                ),
+            ] {
+                let result =
+                    RegexpSubstrFunc::new().invoke_with_args(ScalarFunctionArgs {
+                        args: vec![
+                            ColumnarValue::Scalar(scalar(Some(value.to_string()))),
+                            ColumnarValue::Scalar(scalar(Some(regex.to_string()))),
+                            ColumnarValue::Scalar(ScalarValue::Int64(Some(position))),
+                            ColumnarValue::Scalar(ScalarValue::Int64(Some(occurrence))),
+                            ColumnarValue::Scalar(scalar(Some(flags.to_string()))),
+                            ColumnarValue::Scalar(ScalarValue::Int64(Some(group_num))),
+                        ],
+                        number_rows: 1,
+                        return_type: data_type,
+                    });
+                match result {
+                    Ok(ColumnarValue::Scalar(
+                        ScalarValue::Utf8(ref res) | ScalarValue::LargeUtf8(ref res),
+                    )) => {
+                        if res.is_some() {
+                            assert_eq!(
+                                res.as_ref().unwrap(),
+                                &expected.to_string(),
+                                "regexp_substr scalar test failed"
+                            );
+                        } else {
+                            assert_eq!(
+                                "", expected,
+                                "regexp_substr scalar utf8 test failed"
+                            )
+                        }
                     }
+                    _ => panic!("Unexpected result"),
                 }
-                _ => panic!("Unexpected utf8 result"),
-            }
-
-            // LargeUtf8
-            let result = RegexpSubstrFunc::new().invoke_with_args(ScalarFunctionArgs {
-                args: vec![
-                    ColumnarValue::Scalar(ScalarValue::LargeUtf8(Some(
-                        value.to_string(),
-                    ))),
-                    ColumnarValue::Scalar(ScalarValue::LargeUtf8(Some(
-                        regex.to_string(),
-                    ))),
-                    ColumnarValue::Scalar(ScalarValue::Int32(Some(position))),
-                    ColumnarValue::Scalar(ScalarValue::Int32(Some(occurrence))),
-                    ColumnarValue::Scalar(ScalarValue::LargeUtf8(Some(
-                        flags.to_string(),
-                    ))),
-                    // ColumnarValue::Scalar(ScalarValue::Int32(Some(group_num))),
-                ],
-                number_rows: 0,
-                return_type: &DataType::LargeUtf8,
-            });
-
-            match result {
-                Ok(ColumnarValue::Scalar(ScalarValue::List(v))) => {
-                    let res = v.value(0);
-                    if res.is_empty() {
-                        assert_eq!("", expected, "regexp_substr scalar test failed");
-                    } else {
-                        let value = res.as_string::<i64>().value(0);
-                        assert_eq!(
-                            value,
-                            expected.to_string(),
-                            "regexp_substr scalar test failed"
-                        );
-                    }
-                }
-                _ => panic!("Unexpected result"),
             }
         });
     }
@@ -514,8 +536,8 @@ mod tests {
     fn test_unsupported_global_flag_regexp_substr() {
         let values = StringArray::from(vec!["abc"]);
         let patterns = StringArray::from(vec!["^(a)"]);
-        let position = Int32Array::from(vec![1]);
-        let occurrence = Int32Array::from(vec![1]);
+        let position = Int64Array::from(vec![1]);
+        let occurrence = Int64Array::from(vec![1]);
         let flags = StringArray::from(vec!["g"]);
 
         let re_err = regexp_substr::<i32>(&[
@@ -524,7 +546,8 @@ mod tests {
             Arc::new(position),
             Arc::new(occurrence),
             Arc::new(flags),
-        ]).expect_err("unsupported flag should have failed");
+        ])
+        .expect_err("unsupported flag should have failed");
 
         assert_eq!(re_err.strip_backtrace(), "Error during planning: regexp_substr() does not support the \"global\" option");
     }
