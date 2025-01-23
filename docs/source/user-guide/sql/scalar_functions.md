@@ -1942,8 +1942,10 @@ regexp_substr(str, regexp[, position[, occurrence[, flags[, group_num]]]])
 - **occurrence**: Specifies the first occurrence of the pattern from which to start returning matches.. Default: 1
 - **flags**: Optional regular expression flags that control the behavior of the regular expression. The following flags are supported:
   - **i**: case-insensitive: letters match both upper and lower case
+  - **c**: case-sensitive: letters match upper or lower case. Default flag
   - **m**: multi-line mode: ^ and $ match begin/end of line
   - **s**: allow . to match \n
+  - **e**: extract submatches (for Snowflake compatibility)
   - **R**: enables CRLF mode: when multi-line mode is enabled, \r\n is used
   - **U**: swap the meaning of x* and x*?
 - **group_num**: Specifies which group to extract. Groups are specified by using parentheses in the regular expression.
@@ -1955,13 +1957,13 @@ regexp_substr(str, regexp[, position[, occurrence[, flags[, group_num]]]])
             +---------------------------------------------------------+
             | regexp_substr(Utf8("Köln"),Utf8("[a-zA-Z]ö[a-zA-Z]{2}")) |
             +---------------------------------------------------------+
-            | [Köln]                                                  |
+            | Köln                                                    |
             +---------------------------------------------------------+
             SELECT regexp_substr('aBc', '(b|d)', 1, 1, 'i');
             +---------------------------------------------------+
             | regexp_substr(Utf8("aBc"),Utf8("(b|d)"), Int32(1), Int32(1), Utf8("i")) |
             +---------------------------------------------------+
-            | [B]                                               |
+            | B                                                 |
             +---------------------------------------------------+
 ```
 
