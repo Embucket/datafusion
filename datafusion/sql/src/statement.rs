@@ -1435,7 +1435,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                         .map(|u| {
                             let idx = field_names
                                 .iter()
-                                .position(|item| *item == u.value)
+                                .position(|item| *item.to_lowercase() == u.value.to_lowercase())
                                 .ok_or_else(|| {
                                     let name = name
                                         .as_ref()
@@ -1458,7 +1458,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                         .map(|pk| {
                             let idx = field_names
                                 .iter()
-                                .position(|item| *item == pk.value)
+                                .position(|item| *item.to_lowercase() == pk.value.to_lowercase())
                                 .ok_or_else(|| {
                                     DataFusionError::Execution(format!(
                                         "Column for primary key not found in schema: {}",
