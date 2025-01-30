@@ -572,6 +572,7 @@ impl SessionState {
         query.statement_to_plan(statement)
     }
 
+    /// Get the parser options
     pub fn get_parser_options(&self) -> ParserOptions {
         let sql_parser_options = &self.config.options().sql_parser;
 
@@ -1658,7 +1659,9 @@ impl From<SessionState> for SessionStateBuilder {
 /// This is used so the SQL planner can access the state of the session without
 /// having a direct dependency on the [`SessionState`] struct (and core crate)
 pub struct SessionContextProvider<'a> {
+    /// The session state
     pub state: &'a SessionState,
+    /// The tables available in the session
     pub tables: HashMap<ResolvedTableReference, Arc<dyn TableSource>>,
 }
 
