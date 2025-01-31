@@ -143,9 +143,8 @@ impl ScalarUDFImpl for ToDateFunc {
         if args.len() > 1 {
             validate_data_types(args, "to_date")?;
         }
-
         match args[0].data_type() {
-            Int32 | Int64 | Null | Float64 | Date32 | Date64 => {
+            Int32 | Int64 | Null | Float64 | Date32 | Date64 | Timestamp(_, _) => {
                 args[0].cast_to(&Date32, None)
             }
             Utf8View | LargeUtf8 | Utf8 => self.to_date(args),
@@ -162,13 +161,12 @@ impl ScalarUDFImpl for ToDateFunc {
 
 #[cfg(test)]
 mod tests {
+    use super::ToDateFunc;
     use arrow::array::{Array, Date32Array, GenericStringArray, StringViewArray};
     use arrow::{compute::kernels::cast_utils::Parser, datatypes::Date32Type};
     use datafusion_common::ScalarValue;
     use datafusion_expr::{ColumnarValue, ScalarUDFImpl};
     use std::sync::Arc;
-
-    use super::ToDateFunc;
 
     #[test]
     fn test_to_date_without_format() {
@@ -407,12 +405,12 @@ mod tests {
                     "to_date created wrong value for date with 2 format strings"
                 );
             }
-            _ => panic!("Conversion failed",),
+            _ => panic!("Conversion failed"),
         }
     }
 
     #[test]
-    fn test_to_date_from_timestamp() {
+    fn test_to_date_from_timestamp_str() {
         let test_cases = vec![
             "2020-09-08T13:42:29Z",
             "2020-09-08T13:42:29.190855-05:00",
@@ -431,6 +429,28 @@ mod tests {
                     assert_eq!(date_val, expected, "to_date created wrong value");
                 }
                 _ => panic!("Conversion of {} failed", date_str),
+            }
+        }
+    }
+
+    #[test]
+    fn test_to_date_from_timestamp() {
+        let test_cases = vec![
+            ScalarValue::TimestampSecond(Some(1736782134), None),
+            ScalarValue::TimestampMillisecond(Some(1736782134736), None),
+            ScalarValue::TimestampMicrosecond(Some(1736782134736782), None),
+            ScalarValue::TimestampNanosecond(Some(1736782134736782134), None),
+        ];
+        for scalar in test_cases {
+            let timestamp_to_date_result = ToDateFunc::new()
+                .invoke_batch(&[ColumnarValue::Scalar(scalar.clone())], 1);
+
+            match timestamp_to_date_result {
+                Ok(ColumnarValue::Scalar(ScalarValue::Date32(date_val))) => {
+                    let expected = Date32Type::parse_formatted("2025-01-13", "%Y-%m-%d");
+                    assert_eq!(date_val, expected, "to_date created wrong value");
+                }
+                _ => panic!("Conversion of {}", scalar),
             }
         }
     }

@@ -285,7 +285,9 @@ impl SessionState {
             .build()
     }
 
-    pub(crate) fn resolve_table_ref(
+    /// Resolves a [`TableReference`] to a [`ResolvedTableReference`]
+    /// using the default catalog and schema.
+    pub fn resolve_table_ref(
         &self,
         table_ref: impl Into<TableReference>,
     ) -> ResolvedTableReference {
@@ -570,7 +572,8 @@ impl SessionState {
         query.statement_to_plan(statement)
     }
 
-    fn get_parser_options(&self) -> ParserOptions {
+    /// Get the parser options
+    pub fn get_parser_options(&self) -> ParserOptions {
         let sql_parser_options = &self.config.options().sql_parser;
 
         ParserOptions {
@@ -845,9 +848,9 @@ impl SessionState {
         overwrite: bool,
     ) -> Result<(), DataFusionError> {
         let ext = file_format.get_ext().to_lowercase();
-        match (self.file_formats.entry(ext.clone()), overwrite){
-            (Entry::Vacant(e), _) => {e.insert(file_format);},
-            (Entry::Occupied(mut e), true)  => {e.insert(file_format);},
+        match (self.file_formats.entry(ext.clone()), overwrite) {
+            (Entry::Vacant(e), _) => { e.insert(file_format); }
+            (Entry::Occupied(mut e), true) => { e.insert(file_format); }
             (Entry::Occupied(_), false) => return config_err!("File type already registered for extension {ext}. Set overwrite to true to replace this extension."),
         };
         Ok(())
@@ -1655,9 +1658,11 @@ impl From<SessionState> for SessionStateBuilder {
 ///
 /// This is used so the SQL planner can access the state of the session without
 /// having a direct dependency on the [`SessionState`] struct (and core crate)
-struct SessionContextProvider<'a> {
-    state: &'a SessionState,
-    tables: HashMap<ResolvedTableReference, Arc<dyn TableSource>>,
+pub struct SessionContextProvider<'a> {
+    /// The session state
+    pub state: &'a SessionState,
+    /// The tables available in the session
+    pub tables: HashMap<ResolvedTableReference, Arc<dyn TableSource>>,
 }
 
 impl ContextProvider for SessionContextProvider<'_> {
