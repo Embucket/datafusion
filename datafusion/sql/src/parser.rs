@@ -557,6 +557,7 @@ impl<'a> DFParser<'a> {
             self.parser.expect_keyword(Keyword::EXTERNAL)?;
             self.parse_create_external_table(true)
         } else {
+            // Push back CREATE
             self.parser.prev_token();
             Ok(Statement::Statement(Box::from(self.parser.parse_statement()?)))
         }
