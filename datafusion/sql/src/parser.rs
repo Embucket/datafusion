@@ -557,7 +557,8 @@ impl<'a> DFParser<'a> {
             self.parser.expect_keyword(Keyword::EXTERNAL)?;
             self.parse_create_external_table(true)
         } else {
-            Ok(Statement::Statement(Box::from(self.parser.parse_create()?)))
+            self.parser.prev_token();
+            Ok(Statement::Statement(Box::from(self.parser.parse_statement()?)))
         }
     }
 
@@ -930,6 +931,22 @@ mod tests {
         }
     }
 
+
+    #[test]
+    fn skip_create_stage_snowflake() -> Result<(), ParserError> {
+        let sql = "CREATE OR REPLACE STAGE stage URL='s3://data.csv' FILE_FORMAT=(TYPE=csv)";
+        let dialect = Box::new(SnowflakeDialect);
+        let statements = DFParser::parse_sql_with_dialect(sql, dialect.as_ref())?;
+
+        assert_eq!(statements.len(), 1, "Expected to parse exactly one statement");
+        match &statements[0] {
+            Statement::Statement(stmt) => {
+                assert_eq!(stmt.to_string(), sql);
+            }
+            _ => panic!("Expected statement type"),
+        }
+        Ok(())
+    }
     #[test]
     fn create_external_table() -> Result<(), ParserError> {
         // positive case
@@ -1411,18 +1428,19 @@ mod tests {
         assert_eq!(verified_stmt(sql), expected);
         Ok(())
     }
-    
+
     #[test]
     fn skip_copy_into_snowflake() -> Result<(), ParserError> {
-        let sql = "COPY INTO foo FROM @~/staged FILE_FORMAT = (FORMAT_NAME = 'mycsv');";
+        let sql = "COPY INTO foo FROM @~/staged FILE_FORMAT=(FORMAT_NAME='mycsv')";
         let dialect = Box::new(SnowflakeDialect);
         let statements = DFParser::parse_sql_with_dialect(sql, dialect.as_ref())?;
-       
-        assert_eq!( statements.len(), 1, "Expected to parse exactly one statement");
-        if let Statement::CopyTo(_) = &statements[0] {
-            panic!(
-                "Expected non COPY TO statement, but was successful: {statements:?}"
-            );
+
+        assert_eq!(statements.len(), 1, "Expected to parse exactly one statement");
+        match &statements[0] {
+            Statement::Statement(stmt) => {
+                assert_eq!(stmt.to_string(), sql);
+            }
+            _ => panic!("Expected statement type"),
         }
         Ok(())
     }
