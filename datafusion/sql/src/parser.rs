@@ -889,7 +889,7 @@ mod tests {
     use super::*;
     use sqlparser::ast::Expr::Identifier;
     use sqlparser::ast::{BinaryOperator, DataType, Expr, Ident};
-    use sqlparser::dialect::{SnowflakeDialect};
+    use sqlparser::dialect::SnowflakeDialect;
     use sqlparser::tokenizer::Span;
 
     fn expect_parse_ok(sql: &str, expected: Statement) -> Result<(), ParserError> {
