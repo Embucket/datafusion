@@ -275,6 +275,12 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 with_aggregation_policy,
                 with_row_access_policy,
                 with_tags,
+                iceberg,
+                external_volume,
+                base_location,
+                catalog,
+                catalog_sync,
+                storage_serialization_policy,
             }) if table_properties.is_empty() && with_options.is_empty() => {
                 if temporary {
                     return not_impl_err!("Temporary tables not supported")?;
@@ -394,6 +400,24 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 }
                 if with_tags.is_some() {
                     return not_impl_err!("With tags not supported")?;
+                }
+                if iceberg {
+                    return not_impl_err!("Iceberg not supported")?;
+                }
+                if external_volume.is_some() {
+                    return not_impl_err!("External volume not supported")?;
+                }
+                if base_location.is_some() {
+                    return not_impl_err!("Base location not supported")?;
+                }
+                if catalog.is_some() {
+                    return not_impl_err!("Catalog not supported")?;
+                }
+                if catalog_sync.is_some() {
+                    return not_impl_err!("Catalog sync not supported")?;
+                }
+                if storage_serialization_policy.is_some() {
+                    return not_impl_err!("Storage serialization policy not supported")?;
                 }
 
                 // Merge inline constraints and existing constraints
