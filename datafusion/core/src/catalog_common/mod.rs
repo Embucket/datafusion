@@ -18,19 +18,11 @@
 //! Interfaces and default implementations of catalogs and schemas.
 //!
 //! Implementations
-//! * Simple memory based catalog: [`MemoryCatalogProviderList`], [`MemoryCatalogProvider`], [`MemorySchemaProvider`]
-//! * Information schema: [`information_schema`]
 //! * Listing schema: [`listing_schema`]
 
-pub mod information_schema;
 pub mod listing_schema;
-pub mod memory;
 
 pub use crate::catalog::{CatalogProvider, CatalogProviderList, SchemaProvider};
-pub use memory::{
-    MemoryCatalogProvider, MemoryCatalogProviderList, MemorySchemaProvider,
-};
-
 pub use datafusion_sql::{ResolvedTableReference, TableReference};
 
 use std::collections::BTreeSet;
@@ -75,11 +67,11 @@ pub fn resolve_table_references(
     enable_ident_normalization: bool,
 ) -> datafusion_common::Result<(Vec<TableReference>, Vec<TableReference>)> {
     use crate::sql::planner::object_name_to_table_reference;
+    use datafusion_catalog::information_schema::INFORMATION_SCHEMA;
+    use datafusion_catalog::information_schema::INFORMATION_SCHEMA_TABLES;
     use datafusion_sql::parser::{
         CopyToSource, CopyToStatement, Statement as DFStatement,
     };
-    use information_schema::INFORMATION_SCHEMA;
-    use information_schema::INFORMATION_SCHEMA_TABLES;
     use sqlparser::ast::*;
 
     struct RelationVisitor {
