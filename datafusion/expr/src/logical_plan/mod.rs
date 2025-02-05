@@ -31,7 +31,7 @@ pub use builder::{
     LogicalPlanBuilder, LogicalTableSource, UNNAMED_TABLE,
 };
 pub use ddl::{
-    CreateCatalog, CreateCatalogSchema, CreateExternalTable, CreateFunction,
+    AlterTable, CreateCatalog, CreateCatalogSchema, CreateExternalTable, CreateFunction,
     CreateFunctionBody, CreateIndex, CreateMemoryTable, CreateView, DdlStatement,
     DropCatalogSchema, DropFunction, DropTable, DropView, OperateFunctionArg,
 };
