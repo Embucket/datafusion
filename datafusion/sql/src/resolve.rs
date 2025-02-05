@@ -106,31 +106,32 @@ impl Visitor for RelationVisitor {
             self.insert_relation(obj_name)
         }
 
-            // SHOW statements will later be rewritten into a SELECT from the information_schema
-            let requires_information_schema = matches!(
-                statement,
-                Statement::ShowFunctions { .. }
-                    | Statement::ShowVariable { .. }
-                    | Statement::ShowStatus { .. }
-                    | Statement::ShowVariables { .. }
-                    | Statement::ShowCreate { .. }
-                    | Statement::ShowColumns { .. }
-                    | Statement::ShowTables { .. }
-                    | Statement::ShowCollation { .. }
-                    | Statement::ShowSchemas { .. }
-                    | Statement::ShowDatabases { .. }
-            );
-            if requires_information_schema {
-                for s in INFORMATION_SCHEMA_TABLES {
-                    self.relations.insert(ObjectName::from(vec![
-                        Ident::new(INFORMATION_SCHEMA),
-                        Ident::new(*s),
-                    ]));
-                }
+        // SHOW statements will later be rewritten into a SELECT from the information_schema
+        let requires_information_schema = matches!(
+            statement,
+            Statement::ShowFunctions { .. }
+                | Statement::ShowVariable { .. }
+                | Statement::ShowStatus { .. }
+                | Statement::ShowVariables { .. }
+                | Statement::ShowCreate { .. }
+                | Statement::ShowColumns { .. }
+                | Statement::ShowTables { .. }
+                | Statement::ShowCollation { .. }
+                | Statement::ShowSchemas { .. }
+                | Statement::ShowDatabases { .. }
+                | Statement::ShowObjects { .. }
+        );
+        if requires_information_schema {
+            for s in INFORMATION_SCHEMA_TABLES {
+                self.relations.insert(ObjectName::from(vec![
+                    Ident::new(INFORMATION_SCHEMA),
+                    Ident::new(*s),
+                ]));
             }
-            ControlFlow::Continue(())
         }
+        ControlFlow::Continue(())
     }
+}
 
 fn visit_statement(statement: &DFStatement, visitor: &mut RelationVisitor) {
     match statement {
@@ -174,17 +175,17 @@ fn visit_statement(statement: &DFStatement, visitor: &mut RelationVisitor) {
 /// assert_eq!(ctes.len(), 0);
 /// ```
 ///
-/// ## Example with CTEs  
-///  
-/// ```  
-/// # use datafusion_sql::parser::DFParser;  
+/// ## Example with CTEs
+///
+/// ```
+/// # use datafusion_sql::parser::DFParser;
 /// # use datafusion_sql::resolve::resolve_table_references;
-/// let query = "with my_cte as (values (1), (2)) SELECT * from my_cte;";  
-/// let statement = DFParser::parse_sql(query).unwrap().pop_back().unwrap();  
-/// let (table_refs, ctes) = resolve_table_references(&statement, true).unwrap();  
+/// let query = "with my_cte as (values (1), (2)) SELECT * from my_cte;";
+/// let statement = DFParser::parse_sql(query).unwrap().pop_back().unwrap();
+/// let (table_refs, ctes) = resolve_table_references(&statement, true).unwrap();
 /// assert_eq!(table_refs.len(), 0);
-/// assert_eq!(ctes.len(), 1);  
-/// assert_eq!(ctes[0].to_string(), "my_cte");  
+/// assert_eq!(ctes.len(), 1);
+/// assert_eq!(ctes[0].to_string(), "my_cte");
 /// ```
 pub fn resolve_table_references(
     statement: &crate::parser::Statement,
