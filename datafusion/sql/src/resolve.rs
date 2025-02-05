@@ -106,31 +106,32 @@ impl Visitor for RelationVisitor {
             self.insert_relation(obj_name)
         }
 
-            // SHOW statements will later be rewritten into a SELECT from the information_schema
-            let requires_information_schema = matches!(
-                statement,
-                Statement::ShowFunctions { .. }
-                    | Statement::ShowVariable { .. }
-                    | Statement::ShowStatus { .. }
-                    | Statement::ShowVariables { .. }
-                    | Statement::ShowCreate { .. }
-                    | Statement::ShowColumns { .. }
-                    | Statement::ShowTables { .. }
-                    | Statement::ShowCollation { .. }
-                    | Statement::ShowSchemas { .. }
-                    | Statement::ShowDatabases { .. }
-            );
-            if requires_information_schema {
-                for s in INFORMATION_SCHEMA_TABLES {
-                    self.relations.insert(ObjectName(vec![
-                        Ident::new(INFORMATION_SCHEMA),
-                        Ident::new(*s),
-                    ]));
-                }
+        // SHOW statements will later be rewritten into a SELECT from the information_schema
+        let requires_information_schema = matches!(
+            statement,
+            Statement::ShowFunctions { .. }
+                | Statement::ShowVariable { .. }
+                | Statement::ShowStatus { .. }
+                | Statement::ShowVariables { .. }
+                | Statement::ShowCreate { .. }
+                | Statement::ShowColumns { .. }
+                | Statement::ShowTables { .. }
+                | Statement::ShowCollation { .. }
+                | Statement::ShowSchemas { .. }
+                | Statement::ShowDatabases { .. }
+                | Statement::ShowObjects { .. }
+        );
+        if requires_information_schema {
+            for s in INFORMATION_SCHEMA_TABLES {
+                self.relations.insert(ObjectName(vec![
+                    Ident::new(INFORMATION_SCHEMA),
+                    Ident::new(*s),
+                ]));
             }
-            ControlFlow::Continue(())
         }
+        ControlFlow::Continue(())
     }
+}
 
 fn visit_statement(statement: &DFStatement, visitor: &mut RelationVisitor) {
     match statement {
