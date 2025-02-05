@@ -117,6 +117,9 @@ impl Visitor for RelationVisitor {
                 | Statement::ShowColumns { .. }
                 | Statement::ShowTables { .. }
                 | Statement::ShowCollation { .. }
+                | Statement::ShowSchemas { .. }
+                | Statement::ShowDatabases { .. }
+                | Statement::ShowObjects { .. }
         );
         if requires_information_schema {
             for s in INFORMATION_SCHEMA_TABLES {
