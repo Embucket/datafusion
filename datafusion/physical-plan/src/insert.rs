@@ -32,7 +32,7 @@ use crate::ExecutionPlanProperties;
 
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
-use arrow_array::{ArrayRef, UInt64Array};
+use arrow_array::{ArrayRef, Int64Array};
 use arrow_schema::{DataType, Field, Schema};
 use datafusion_common::{internal_err, Result};
 use datafusion_execution::TaskContext;
@@ -261,7 +261,7 @@ impl ExecutionPlan for DataSinkExec {
 /// +-------+,
 /// ```
 fn make_count_batch(count: u64) -> RecordBatch {
-    let array = Arc::new(UInt64Array::from(vec![count])) as ArrayRef;
+    let array = Arc::new(Int64Array::from(vec![count as i64])) as ArrayRef;
 
     RecordBatch::try_from_iter_with_nullable(vec![("count", array, false)]).unwrap()
 }
@@ -270,7 +270,7 @@ fn make_count_schema() -> SchemaRef {
     // Define a schema.
     Arc::new(Schema::new(vec![Field::new(
         "count",
-        DataType::UInt64,
+        DataType::Int64, // should return signed int for snowflake
         false,
     )]))
 }
