@@ -229,7 +229,7 @@ fn regexp_substr_inner<T: OffsetSizeTrait>(
     };
 
     // Check for 'e' flag and set group_num to 1 if not provided
-    let group_num = if flags.map_or(false, |f| f.contains('e')) {
+    let group_num = if flags.is_some_and(|f| f.contains('e')) {
         group_num.or(Some(1))
     } else {
         group_num
