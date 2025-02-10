@@ -281,7 +281,6 @@ fn get_matches(
     let occurrence = occurrence.unwrap_or(1) as usize;
 
     for caps in regex.captures_iter(value) {
-        println!("{value}  caps {:?}", caps);
         match group_num {
             Some(group_num) => {
                 if let Some(m) = caps.get(group_num as usize) {
