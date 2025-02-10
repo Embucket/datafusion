@@ -493,7 +493,7 @@ mod tests {
             ["", "abc", "abc", "Abc", "abC", "aBc"],
             ["", "abca", "abca", "Abca", "abCa", "aBcv"],
             ["", "abc", "abc", "bca", "abc", "abc"],
-            ["", "vff", "vff", "", "VfF", ""]
+            ["", "vff", "vff", "", "VfF", ""],
         ];
 
         // Scalar
@@ -518,16 +518,20 @@ mod tests {
                                 ColumnarValue::Scalar(scalar(Some(regex.to_string()))),
                                 ColumnarValue::Scalar(ScalarValue::Int64(Some(1))),
                                 ColumnarValue::Scalar(ScalarValue::Int64(Some(1))),
-                                ColumnarValue::Scalar(scalar(Some(flags[spos].to_string()))),
-                                ColumnarValue::Scalar(ScalarValue::Int64(Some(group_num[spos]))),
+                                ColumnarValue::Scalar(scalar(Some(
+                                    flags[spos].to_string(),
+                                ))),
+                                ColumnarValue::Scalar(ScalarValue::Int64(Some(
+                                    group_num[spos],
+                                ))),
                             ],
                             number_rows: 1,
                             return_type: data_type,
                         });
                     match result {
                         Ok(ColumnarValue::Scalar(
-                               ScalarValue::Utf8(ref res) | ScalarValue::LargeUtf8(ref res),
-                           )) => {
+                            ScalarValue::Utf8(ref res) | ScalarValue::LargeUtf8(ref res),
+                        )) => {
                             if res.is_some() {
                                 assert_eq!(
                                     res.as_ref().unwrap(),
