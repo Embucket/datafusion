@@ -184,7 +184,7 @@ impl ExecutionPlan for TestInsertExec {
 fn make_count_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![Field::new(
         "count",
-        DataType::UInt64,
+        DataType::Int64, // should return signed int for snowflake
         false,
     )]))
 }
