@@ -272,7 +272,6 @@ impl ExecutionPlan for DataSinkExec {
 /// ```
 fn make_count_batch(count: u64) -> RecordBatch {
     let array = Arc::new(Int64Array::from(vec![count as i64])) as ArrayRef;
-    println!("array: {array:?}");
     RecordBatch::try_from_iter_with_nullable(vec![("count", array, false)]).unwrap()
 }
 
