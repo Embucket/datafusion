@@ -224,16 +224,8 @@ impl ExecutionPlan for DataSinkExec {
         if partition != 0 {
             return internal_err!("DataSinkExec can only be called on partition 0!");
         }
-        let input = Arc::clone(&self.input);
-        // get statistics (that is cheap according to docs) for the RecordBatch as can't use
-        // async stream returned by execute_input_stream as it can be consumed only once
-        let num_rows = match input.statistics() {
-            Ok(stats) => *stats.num_rows.get_value().unwrap_or(&0),
-            Err(err) => return Err(err),
-        };
-
         let data = execute_input_stream(
-            input,
+            Arc::clone(&self.input),
             Arc::clone(self.sink.schema()),
             0,
             Arc::clone(&context),
@@ -243,9 +235,7 @@ impl ExecutionPlan for DataSinkExec {
         let sink = Arc::clone(&self.sink);
 
         let stream = futures::stream::once(async move {
-            sink.write_all(data, &context)
-                .await
-                .map(|_| make_count_batch(num_rows as u64))
+            sink.write_all(data, &context).await.map(make_count_batch)
         })
         .boxed();
 
