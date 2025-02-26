@@ -236,8 +236,7 @@ impl Display for InsertOp {
 
 fn make_count_schema() -> DFSchemaRef {
     Arc::new(
-        // should return signed int for snowflake
-        Schema::new(vec![Field::new("count", DataType::Int64, false)])
+        Schema::new(vec![Field::new("count", DataType::UInt64, false)])
             .try_into()
             .unwrap(),
     )
