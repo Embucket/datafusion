@@ -383,6 +383,8 @@ fn optimize_projections(
                 dependency_indices.clone(),
             )]
         }
+        LogicalPlan::Pivot(_) => todo!("Pivot optimization"),
+
     };
 
     // Required indices are currently ordered (child0, child1, ...)

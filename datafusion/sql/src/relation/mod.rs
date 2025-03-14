@@ -153,6 +153,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     "UNNEST table factor with offset is not supported yet"
                 );
             }
+            TableFactor::Pivot { .. } => todo!("pivot table factor"),
             // @todo Support TableFactory::TableFunction?
             _ => {
                 return not_impl_err!(

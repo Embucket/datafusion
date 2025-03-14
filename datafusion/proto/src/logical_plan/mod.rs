@@ -65,7 +65,7 @@ use datafusion_expr::{
         builder::project, Aggregate, CreateCatalog, CreateCatalogSchema,
         CreateExternalTable, CreateView, DdlStatement, Distinct, EmptyRelation,
         Extension, Join, JoinConstraint, Prepare, Projection, Repartition, Sort,
-        SubqueryAlias, TableScan, Values, Window,
+        SubqueryAlias, TableScan, Values, Window, Pivot
     },
     DistinctOn, DropView, Expr, LogicalPlan, LogicalPlanBuilder, ScalarUDF, SortExpr,
     Statement, WindowUDF,
@@ -1772,6 +1772,21 @@ impl AsLogicalPlan for LogicalPlanNode {
                             static_term: Some(Box::new(static_term)),
                             recursive_term: Some(Box::new(recursive_term)),
                             is_distinct: recursive.is_distinct,
+                        },
+                    ))),
+                })
+            }
+            LogicalPlan::Pivot(pivot) => {
+                let input =
+                    LogicalPlanNode::try_from_logical_plan(pivot.input.as_ref(), extension_codec)?;
+                Ok(LogicalPlanNode {
+                    logical_plan_type: Some(LogicalPlanType::Pivot(Box::new(
+                        protobuf::PivotNode {
+                            input: Some(Box::new(input)),
+                            aggregate_expr: serialize_exprs(pivot.aggregate_expr.clone(), extension_codec?)
+                            pivot_column: pivot.pivot_column.clone(),
+                            pivot_values: pivot.pivot_values.clone(),
+                            schema:  convert_required!(*pivot.schema)?,
                         },
                     ))),
                 })

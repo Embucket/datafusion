@@ -20,6 +20,7 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::{self, Debug, Display, Formatter};
+use std::fs::metadata;
 use std::hash::{Hash, Hasher};
 use std::str::FromStr;
 use std::sync::{Arc, LazyLock};
@@ -287,6 +288,9 @@ pub enum LogicalPlan {
     Unnest(Unnest),
     /// A variadic query (e.g. "Recursive CTEs")
     RecursiveQuery(RecursiveQuery),
+    /// Pivot
+    Pivot(Pivot),
+
 }
 
 impl Default for LogicalPlan {
@@ -351,6 +355,7 @@ impl LogicalPlan {
                 // we take the schema of the static term as the schema of the entire recursive query
                 static_term.schema()
             }
+            LogicalPlan::Pivot(Pivot { schema, .. }) => schema,
         }
     }
 
@@ -467,7 +472,8 @@ impl LogicalPlan {
             LogicalPlan::Dml(write) => vec![&write.input],
             LogicalPlan::Copy(copy) => vec![&copy.input],
             LogicalPlan::Ddl(ddl) => ddl.inputs(),
-            LogicalPlan::Unnest(Unnest { input, .. }) => vec![input],
+            LogicalPlan::Unnest(Unnest { input, .. })
+            | LogicalPlan::Pivot(Pivot { input, .. }) => vec![input],
             LogicalPlan::RecursiveQuery(RecursiveQuery {
                 static_term,
                 recursive_term,
@@ -589,7 +595,8 @@ impl LogicalPlan {
             | LogicalPlan::Copy(_)
             | LogicalPlan::Ddl(_)
             | LogicalPlan::DescribeTable(_)
-            | LogicalPlan::Unnest(_) => Ok(None),
+            | LogicalPlan::Unnest(_)
+            | LogicalPlan::Pivot(_) => Ok(None),
         }
     }
 
@@ -748,6 +755,27 @@ impl LogicalPlan {
             }) => {
                 // Update schema with unnested column type.
                 unnest_with_options(Arc::unwrap_or_clone(input), exec_columns, options)
+            },
+            LogicalPlan::Pivot(Pivot {
+                input,
+                aggregate_expr,
+                pivot_column,
+                pivot_values,
+                ..
+            }) => {
+                let schema = pivot_schema(
+                    &input.schema().clone(),
+                    &aggregate_expr.clone(),
+                    &pivot_column,
+                    &*pivot_values,
+                )?;
+                Ok(LogicalPlan::Pivot(Pivot {
+                    input: input.clone(),
+                    aggregate_expr: aggregate_expr.clone(),
+                    pivot_column: pivot_column.clone(),
+                    pivot_values: pivot_values.clone(),
+                    schema: Arc::new(schema),
+                }))
             }
         }
     }
@@ -1141,6 +1169,22 @@ impl LogicalPlan {
                     unnest_with_options(input, columns.clone(), options.clone())?;
                 Ok(new_plan)
             }
+            LogicalPlan::Pivot(Pivot {
+                aggregate_expr,
+                pivot_column,
+                pivot_values,
+                ..
+            }) => {
+                let input = self.only_input(inputs)?;
+                let new_aggregate_expr = self.only_expr(expr)?;
+                Pivot::try_new(
+                    Arc::new(input),
+                    new_aggregate_expr,
+                    pivot_column.clone(),
+                    pivot_values.clone(),
+                )
+                .map(LogicalPlan::Pivot)
+            }
         }
     }
 
@@ -1373,7 +1417,8 @@ impl LogicalPlan {
             | LogicalPlan::Copy(_)
             | LogicalPlan::DescribeTable(_)
             | LogicalPlan::Statement(_)
-            | LogicalPlan::Extension(_) => None,
+            | LogicalPlan::Extension(_)
+            | LogicalPlan::Pivot(_) => None,
         }
     }
 
@@ -2018,6 +2063,20 @@ impl LogicalPlan {
                         expr_vec_fmt!(list_type_columns),
                         expr_vec_fmt!(struct_type_columns))
                     }
+                    LogicalPlan::Pivot(Pivot {
+                        aggregate_expr,
+                        pivot_column,
+                        pivot_values,
+                        ..
+                    }) => {
+                        write!(
+                            f,
+                            "Pivot: {} FOR {} IN ({})",
+                            aggregate_expr,
+                            pivot_column,
+                            pivot_values.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(", ")
+                        )
+                    }
                 }
             }
         }
@@ -2191,6 +2250,95 @@ pub fn projection_schema(input: &LogicalPlan, exprs: &[Expr]) -> Result<Arc<DFSc
             )?)?;
 
     Ok(Arc::new(schema))
+}
+
+/// Pivot operator for transforming rows into columns.
+/// This is used for queries that contain `PIVOT` clauses.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Pivot {
+    /// Input logical plan
+    pub input: Arc<LogicalPlan>,
+    /// Aggregate expression (e.g., SUM(amount))
+    pub aggregate_expr: Expr,
+    /// Column whose values become new columns
+    pub pivot_column: Column,
+    /// List of pivot values (distinct values from pivot column)
+    pub pivot_values: Vec<ScalarValue>,
+    /// Output schema after pivot
+    pub schema: DFSchemaRef,
+}
+
+impl PartialOrd for Pivot {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        let self_tuple = (
+            &self.input,
+            &self.aggregate_expr,
+            &self.pivot_column,
+            &self.pivot_values,
+        );
+        let other_tuple = (
+            &other.input,
+            &other.aggregate_expr,
+            &other.pivot_column,
+            &other.pivot_values,
+        );
+        self_tuple.partial_cmp(&other_tuple)
+    }
+}
+
+impl Pivot {
+    pub fn try_new(
+        input: Arc<LogicalPlan>,
+        aggregate_expr: Expr,
+        pivot_column: Column,
+        pivot_values: Vec<ScalarValue>,
+    ) -> Result<Self> {
+        let schema = pivot_schema(
+            input.schema(),
+            &aggregate_expr,
+            &pivot_column,
+            &pivot_values,
+        )?;
+
+        Ok(Self {
+            input,
+            aggregate_expr,
+            pivot_column,
+            pivot_values,
+            schema: Arc::new(schema),
+        })
+    }
+}
+
+
+fn pivot_schema(
+    input_schema: &DFSchemaRef,
+    aggregate_expr: &Expr,
+    pivot_column: &Column,
+    pivot_values: &[ScalarValue],
+) -> Result<DFSchema> {
+    let mut fields = vec![];
+
+    // Include all fields except pivot and value columns
+    for field in input_schema.fields() {
+        if field.name() != pivot_column.name() && !aggregate_expr.column_refs().contains(&Column::from_name(field.name())) {
+            fields.push(field.clone());
+        }
+    }
+
+    // Add new fields for each pivot value
+    for pivot_value in pivot_values {
+        let field_name = format!("{}_{}", pivot_value, aggregate_expr.schema_name());
+        let data_type = aggregate_expr.get_type(input_schema)?;
+        fields.push(Arc::new(Field::new(field_name, data_type, true)));
+    }
+
+    let fields_with_table_ref: Vec<(Option<TableReference>, Arc<Field>)> = fields
+        .into_iter()
+        .map(|field| (None, field))
+        .collect();
+
+    DFSchema::new_with_metadata(fields_with_table_ref, input_schema.metadata().clone())
 }
 
 /// Aliased subquery
@@ -4910,3 +5058,4 @@ digraph {
         Ok(())
     }
 }
+

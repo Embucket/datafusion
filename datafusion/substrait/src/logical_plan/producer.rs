@@ -22,7 +22,7 @@ use datafusion::arrow::datatypes::{Field, IntervalUnit};
 use datafusion::logical_expr::{
     Aggregate, Distinct, EmptyRelation, Extension, Filter, Join, Like, Limit,
     Partitioning, Projection, Repartition, Sort, SortExpr, SubqueryAlias, TableScan,
-    TryCast, Union, Values, Window, WindowFrameUnits,
+    TryCast, Union, Values, Window, WindowFrameUnits, Pivot
 };
 use datafusion::{
     arrow::datatypes::{DataType, TimeUnit},
@@ -531,6 +531,7 @@ pub fn to_substrait_rel(
         LogicalPlan::RecursiveQuery(plan) => {
             not_impl_err!("Unsupported plan type: {plan:?}")?
         }
+        LogicalPlan::Pivot(plan) => not_impl_err!("Unsupported plan type: {plan:?}")?,
     }
 }
 

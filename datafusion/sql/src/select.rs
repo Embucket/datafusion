@@ -43,10 +43,7 @@ use datafusion_expr::{
 };
 
 use indexmap::IndexMap;
-use sqlparser::ast::{
-    Distinct, Expr as SQLExpr, GroupByExpr, NamedWindowExpr, OrderByExpr,
-    WildcardAdditionalOptions, WindowType,
-};
+use sqlparser::ast::{Distinct, Expr as SQLExpr, ExprWithAlias, GroupByExpr, NamedWindowExpr, OrderByExpr, TableFactor, WildcardAdditionalOptions, WindowType};
 use sqlparser::ast::{NamedWindowDefinition, Select, SelectItem, TableWithJoins};
 
 impl<S: ContextProvider> SqlToRel<'_, S> {
@@ -367,6 +364,8 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             .build()
     }
 
+
+
     fn try_process_aggregate_unnest(&self, input: LogicalPlan) -> Result<LogicalPlan> {
         match input {
             LogicalPlan::Aggregate(agg) => {
@@ -491,6 +490,20 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
 
         Ok((intermediate_plan, intermediate_select_exprs))
     }
+
+    /*fn try_process_pivot(
+        &self,
+        input: LogicalPlan,
+        table: Box<TableFactor>,
+        aggregate_functions : Vec<ExprWithAlias>,
+        value_column: Vec<Ident>,
+        value_source : ,
+        default_on_null,
+        alias
+    ) -> Result<LogicalPlan> {
+
+    }*/
+
 
     fn plan_selection(
         &self,

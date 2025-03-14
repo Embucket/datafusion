@@ -5,7 +5,7 @@
 pub struct LogicalPlanNode {
     #[prost(
         oneof = "logical_plan_node::LogicalPlanType",
-        tags = "1, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33"
+        tags = "1, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34"
     )]
     pub logical_plan_type: ::core::option::Option<logical_plan_node::LogicalPlanType>,
 }
@@ -77,6 +77,8 @@ pub mod logical_plan_node {
         CteWorkTableScan(super::CteWorkTableScanNode),
         #[prost(message, tag = "33")]
         Dml(::prost::alloc::boxed::Box<super::DmlNode>),
+        #[prost(message, tag = "34")]
+        Pivot(::prost::alloc::boxed::Box<super::PivotNode>),
     }
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1922,6 +1924,19 @@ pub struct CteWorkTableScanNode {
     pub name: ::prost::alloc::string::String,
     #[prost(message, optional, tag = "2")]
     pub schema: ::core::option::Option<super::datafusion_common::Schema>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PivotNode {
+    #[prost(message, optional, boxed, tag = "1")]
+    pub input: ::core::option::Option<::prost::alloc::boxed::Box<LogicalPlanNode>>,
+    #[prost(message, repeated, tag = "2")]
+    pub aggregate_expr: ::prost::alloc::vec::Vec<LogicalExprNode>,
+    #[prost(message, optional, tag = "3")]
+    pub pivot_column: ::core::option::Option<super::datafusion_common::Column>,
+    #[prost(message, repeated, tag = "4")]
+    pub pivot_values: ::prost::alloc::vec::Vec<super::datafusion_common::ScalarValue>,
+    #[prost(message, optional, tag = "5")]
+    pub schema: ::core::option::Option<super::datafusion_common::DfSchema>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
