@@ -62,3 +62,6 @@ mod values;
 )]
 pub use datafusion_common::{ResolvedTableReference, TableReference};
 pub use sqlparser;
+
+// Re-export the transform_pivot_to_aggregate function
+pub use relation::transform_pivot_to_aggregate;

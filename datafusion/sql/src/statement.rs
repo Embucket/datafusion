@@ -476,6 +476,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                                 .project(project_exprs)?
                                 .build()?
                         } else {
+                            println!("logical_plan: {:?}", plan);
                             plan
                         };
 
