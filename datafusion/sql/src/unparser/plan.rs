@@ -118,6 +118,7 @@ impl Unparser<'_> {
             LogicalPlan::Extension(extension) => {
                 self.extension_to_statement(extension.node.as_ref())
             }
+            LogicalPlan::Pivot(_) => not_impl_err!("Unsupported plan Pivot: {plan:?}"),
             LogicalPlan::Explain(_)
             | LogicalPlan::Analyze(_)
             | LogicalPlan::Ddl(_)

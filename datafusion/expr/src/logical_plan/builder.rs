@@ -34,7 +34,7 @@ use crate::logical_plan::{
     Aggregate, Analyze, Distinct, DistinctOn, EmptyRelation, Explain, Filter, Join,
     JoinConstraint, JoinType, Limit, LogicalPlan, Partitioning, PlanType, Prepare,
     Projection, Repartition, Sort, SubqueryAlias, TableScan, Union, Unnest, Values,
-    Window,
+    Window, Pivot,
 };
 use crate::utils::{
     can_hash, columnize_expr, compare_sort_expr, expr_to_columns,
@@ -46,7 +46,7 @@ use crate::{
 };
 
 use super::dml::InsertOp;
-use super::plan::ColumnUnnestList;
+use super::plan::{ColumnUnnestList};
 use arrow::compute::can_cast_types;
 use arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef};
 use datafusion_common::display::ToStringifiedPlan;
@@ -1305,6 +1305,21 @@ impl LogicalPlanBuilder {
     ) -> Result<Self> {
         unnest_with_options(Arc::unwrap_or_clone(self.plan), columns, options)
             .map(Self::new)
+    }
+
+    pub fn pivot(
+        self,
+        aggregate_expr: Expr,
+        pivot_column: Column,
+        pivot_values: Vec<ScalarValue>,
+    ) -> Result<Self> {
+        let pivot_plan = Pivot::try_new(
+            self.plan,
+            aggregate_expr,
+            pivot_column,
+            pivot_values,
+        )?;
+        Ok(Self::new(LogicalPlan::Pivot(pivot_plan)))
     }
 }
 

@@ -887,6 +887,7 @@ impl DefaultPhysicalPlanner {
                     options.clone(),
                 ))
             }
+            LogicalPlan::Pivot(_) => todo!(),
 
             // 2 Children
             LogicalPlan::Join(Join {
