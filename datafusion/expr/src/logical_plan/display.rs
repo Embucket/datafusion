@@ -24,7 +24,7 @@ use crate::{
     expr_vec_fmt, Aggregate, DescribeTable, Distinct, DistinctOn, DmlStatement, Expr,
     Filter, Join, Limit, LogicalPlan, Partitioning, Projection, RecursiveQuery,
     Repartition, Sort, Subquery, SubqueryAlias, TableProviderFilterPushDown, TableScan,
-    Unnest, Values, Window,
+    Unnest, Values, Window, Pivot,
 };
 
 use crate::dml::CopyTo;
@@ -650,6 +650,7 @@ impl<'a, 'b> PgJsonVisitor<'a, 'b> {
                     "StructColumn": expr_vec_fmt!(struct_type_columns),
                 })
             }
+            LogicalPlan::Pivot(_) => todo!(),
         }
     }
 }

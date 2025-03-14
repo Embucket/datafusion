@@ -22,11 +22,14 @@ use crate::planner::{ContextProvider, PlannerContext, SqlToRel};
 use datafusion_common::tree_node::{Transformed, TreeNode};
 use datafusion_common::{
     not_impl_err, plan_err, DFSchema, Diagnostic, Result, Span, Spans, TableReference,
+    Column, DFSchemaRef, ScalarValue,
 };
 use datafusion_expr::builder::subquery_alias;
-use datafusion_expr::{expr::Unnest, Expr, LogicalPlan, LogicalPlanBuilder};
-use datafusion_expr::{Subquery, SubqueryAlias};
+use datafusion_expr::{expr::Unnest, Expr, LogicalPlan, LogicalPlanBuilder, Sort};
+use datafusion_expr::expr::{AggregateFunction, BinaryExpr, Alias, AggregateFunctionParams};
+use datafusion_expr::{Subquery, SubqueryAlias, Operator};
 use sqlparser::ast::{FunctionArg, FunctionArgExpr, Spanned, TableFactor};
+use arrow::datatypes::Field;
 
 mod join;
 
@@ -169,7 +172,152 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     "UNNEST table factor with offset is not supported yet"
                 );
             }
-            // @todo Support TableFactory::TableFunction?
+            TableFactor::Pivot { 
+                table,
+                aggregate_functions,
+                value_column,
+                value_source,
+                default_on_null,
+                alias,
+            } => {
+                let input_plan = self.create_relation(*table, planner_context)?;
+                
+                if aggregate_functions.len() != 1 {
+                    return plan_err!("PIVOT requires exactly one aggregate function");
+                }
+                
+                let agg_expr = self.sql_expr_to_logical_expr(
+                    aggregate_functions[0].expr.clone(),
+                    input_plan.schema(),
+                    planner_context,
+                )?;
+                
+                if value_column.is_empty() {
+                    return plan_err!("PIVOT value column is required");
+                }
+                
+                let column_name = value_column.last().unwrap().value.clone();
+                let pivot_column = Column::new(None::<&str>, column_name);
+
+                match value_source {
+                    sqlparser::ast::PivotValueSource::List(exprs) => {
+                        let pivot_values = exprs.iter()
+                            .map(|expr| {
+                                let logical_expr = self.sql_expr_to_logical_expr(
+                                    expr.expr.clone(),
+                                    input_plan.schema(),
+                                    planner_context,
+                                )?;
+                                
+                                // Convert the expression to a scalar value
+                                match logical_expr {
+                                    Expr::Literal(scalar) => Ok(scalar),
+                                    _ => plan_err!("PIVOT values must be literals"),
+                                }
+                            })
+                            .collect::<Result<Vec<_>>>()?;
+                            
+                        let input_arc = Arc::new(input_plan);
+                        let schema = derive_pivot_schema(
+                            input_arc.schema(),
+                            &agg_expr,
+                            &pivot_column,
+                            &pivot_values
+                        )?;
+                        
+                        let pivot_plan = LogicalPlan::Pivot(datafusion_expr::Pivot {
+                            input: input_arc,
+                            aggregate_expr: agg_expr,
+                            pivot_column,
+                            pivot_values,
+                            schema: Arc::new(schema),
+                            value_subquery: None,
+                        });
+                        
+                        (pivot_plan, alias)
+                    },
+                    sqlparser::ast::PivotValueSource::Any(order_by) => {
+                        let pivot_values = Vec::new(); 
+
+                        let input_arc = Arc::new(input_plan);
+
+                        let mut subquery_builder = LogicalPlanBuilder::from(input_arc.as_ref().clone())
+                            .project(vec![Expr::Column(pivot_column.clone())])? // Select only the pivot column
+                            .distinct()?; // Get distinct values
+                        
+                        if !order_by.is_empty() {
+                            let sort_exprs = order_by
+                                .iter()
+                                .map(|item| {
+                                    let input_schema = subquery_builder.schema();
+                                    
+                                    let expr = self.sql_expr_to_logical_expr(
+                                        item.expr.clone(),
+                                        input_schema,
+                                        planner_context,
+                                    );
+                                    
+                                    expr.map(|e| {
+                                        // Create a Sort expression
+                                        e.sort(
+                                            item.asc.unwrap_or(true),
+                                            item.nulls_first.unwrap_or(false)
+                                        )
+                                    })
+                                })
+                                .collect::<Result<Vec<_>>>()?;
+                            
+                            subquery_builder = subquery_builder.sort(sort_exprs)?;
+                        }
+                        
+                        let subquery_plan = subquery_builder.build()?;
+
+                        let schema = derive_pivot_schema(
+                            input_arc.schema(),
+                            &agg_expr,
+                            &pivot_column,
+                            &pivot_values
+                        )?;
+
+                        let pivot_plan = LogicalPlan::Pivot(datafusion_expr::Pivot {
+                            input: input_arc,
+                            aggregate_expr: agg_expr,
+                            pivot_column,
+                            pivot_values,
+                            schema: Arc::new(schema),
+                            value_subquery: Some(Arc::new(subquery_plan)), // Pass the subquery with sorting
+                        });
+
+                        (pivot_plan, alias)
+                    },
+                    sqlparser::ast::PivotValueSource::Subquery(subquery) => {
+                        let subquery_plan = self.query_to_plan(*subquery.clone(), planner_context)?;
+                        
+                        let input_arc = Arc::new(input_plan);
+                        
+                        let pivot_values = Vec::new();
+                        
+                        let schema = derive_pivot_schema(
+                            input_arc.schema(),
+                            &agg_expr,
+                            &pivot_column,
+                            &pivot_values
+                        )?;
+                        
+                        let pivot_plan = LogicalPlan::Pivot(
+                            datafusion_expr::Pivot::try_new_with_subquery(
+                                input_arc,
+                                agg_expr,
+                                pivot_column,
+                                Arc::new(subquery_plan),
+                            )?
+                        );
+                        
+                        (pivot_plan, alias)
+                    },
+                }
+            }
+
             _ => {
                 return not_impl_err!(
                     "Unsupported ast node {relation:?} in create_relation"
@@ -266,4 +414,150 @@ fn optimize_subquery_sort(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>>
         }
     });
     new_plan
+}
+
+/// Derive the schema for a pivot operation
+/// This creates a schema including:
+/// 1. All the original columns from the input (excluding pivot column and aggregate columns)
+/// 2. New columns for each pivot value provided
+///
+/// When executing with ANY or SUBQUERY value sources, additional columns would be 
+/// added dynamically during execution.
+pub fn derive_pivot_schema(
+    input_schema: &DFSchemaRef,
+    agg_expr: &Expr,
+    pivot_column: &Column,
+    pivot_values: &[ScalarValue],
+) -> Result<DFSchema> {
+    use datafusion_expr::ExprSchemable;
+    
+    let field_type = agg_expr.get_type(input_schema.as_ref())?;
+    
+    let mut new_fields = Vec::<(Option<TableReference>, Arc<Field>)>::new();
+
+    for field in input_schema.fields().iter() {
+        if field.name() != pivot_column.name() && 
+           !agg_expr.column_refs().iter().any(|col| col.name() == field.name()) {
+            new_fields.push((None, field.clone()));
+        }
+    }
+    
+    for value in pivot_values {
+        let field_name = value.to_string().trim_matches('\'').to_string();
+        
+        let field = Field::new(field_name, field_type.clone(), true);
+        new_fields.push((None, Arc::new(field)));
+    }
+    
+    // Create the new schema with all fields
+    DFSchema::new_with_metadata(new_fields, input_schema.metadata().clone())
+}
+
+/// Transform a PIVOT operation into a more standard Aggregate + Projection plan
+///
+/// This follows the DuckDB approach of using filter conditions with aggregates.
+/// The general pattern is:
+/// 1. For known pivot values, we create a projection that includes "IS NOT DISTINCT FROM" conditions
+/// 2. For ANY, we do a first pass to collect the distinct values from the pivot column
+/// 3. We then create a hash group by with filtered aggregates for each pivot value
+///
+/// For example, for SUM(amount) PIVOT(quarter FOR quarter in ('2023_Q1', '2023_Q2')), we create:
+/// - SUM(amount) FILTER (WHERE quarter IS NOT DISTINCT FROM '2023_Q1') AS "2023_Q1"
+/// - SUM(amount) FILTER (WHERE quarter IS NOT DISTINCT FROM '2023_Q2') AS "2023_Q2"
+///
+/// For ANY, there are two potential approaches in DataFusion:
+/// 1. At planning time, convert this to a logical plan that:
+///    a. First extracts distinct values from the pivot column 
+///    b. Then uses those values to create filter conditions
+///    c. Finally creates the aggregate plan
+/// 2. Create a dedicated PIVOT logical plan node that is transformed during planning
+///    into the appropriate physical operator at execution time
+///
+/// The current implementation follows option 1, but has limitations. A more complete 
+/// implementation would use option 2, which would require changes to both the logical 
+/// and physical planner.
+pub fn transform_pivot_to_aggregate(
+    input: Arc<LogicalPlan>,
+    aggregate_expr: &Expr,
+    pivot_column: &Column,
+    pivot_values: Option<Vec<ScalarValue>>,
+    value_subquery: Option<Arc<LogicalPlan>>,
+) -> Result<LogicalPlan> {
+    let df_schema = input.schema();
+    
+    let all_columns: Vec<Column> = df_schema.columns();
+    
+    // Filter to include only columns we want for GROUP BY 
+    // (exclude pivot column and aggregate expression columns)
+    let group_by_columns: Vec<Expr> = all_columns
+        .into_iter()
+        .filter(|col| {
+            col.name != pivot_column.name
+            && !aggregate_expr.column_refs().iter().any(|agg_col| agg_col.name == col.name)
+        })
+        .map(|col| Expr::Column(col))
+        .collect();
+    
+    let mut builder = LogicalPlanBuilder::from(Arc::unwrap_or_clone(input.clone()));
+
+    let pivot_values = match pivot_values {
+        Some(values) => {
+            if values.is_empty() {
+                return plan_err!("PIVOT requires at least one value");
+            }
+            values
+        },
+        None => {
+            // With dynamic pivot values (ANY or SUBQUERY), we should not transform to aggregate yet
+            // Instead, return a special PIVOT node that will be handled during physical planning
+            return Ok(LogicalPlan::Pivot(datafusion_expr::Pivot {
+                input: input.clone(),
+                aggregate_expr: aggregate_expr.clone(),
+                pivot_column: pivot_column.clone(),
+                pivot_values: vec![],
+                schema: df_schema.clone(),
+                value_subquery: value_subquery,
+            }));
+        }
+    };
+    
+    let mut aggregate_exprs = Vec::new();
+    
+    for value in &pivot_values {
+        let filter_condition = Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(Expr::Column(pivot_column.clone())),
+            Operator::IsNotDistinctFrom,
+            Box::new(Expr::Literal(value.clone()))
+        ));
+        
+        let filtered_agg = match aggregate_expr {
+            Expr::AggregateFunction(agg) => {
+                let mut new_params = agg.params.clone();
+                new_params.filter = Some(Box::new(filter_condition));
+                Expr::AggregateFunction(AggregateFunction {
+                    func: agg.func.clone(),
+                    params: new_params,
+                })
+            },
+            _ => {
+                return plan_err!("Unsupported aggregate expression should always be AggregateFunction");
+            }
+        };
+        
+        // Use the pivot value as the column name
+        let field_name = value.to_string().trim_matches('\'').to_string();
+        let aliased_agg = Expr::Alias(Alias {
+            expr: Box::new(filtered_agg),
+            relation: None,
+            name: field_name,
+            metadata: None,
+        });
+        
+        aggregate_exprs.push(aliased_agg);
+    }
+    
+    // Create the aggregate plan with GROUP BY and filtered aggregates
+    let aggregate_plan = builder.aggregate(group_by_columns, aggregate_exprs)?.build()?;
+    
+    Ok(aggregate_plan)
 }

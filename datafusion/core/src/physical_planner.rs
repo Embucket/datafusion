@@ -64,11 +64,11 @@ use arrow::datatypes::{Schema, SchemaRef};
 use datafusion_common::display::ToStringifiedPlan;
 use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion, TreeNodeVisitor};
 use datafusion_common::{
-    exec_err, internal_datafusion_err, internal_err, not_impl_err, plan_err, DFSchema,
-    ScalarValue,
+    exec_err, internal_datafusion_err, internal_err, not_impl_err, plan_err, DFSchema, DFSchemaRef,
+    ScalarValue, Column, TableReference,
 };
 use datafusion_datasource::memory::MemorySourceConfig;
-use datafusion_expr::dml::{CopyTo, InsertOp};
+use datafusion_expr::dml::{CopyTo, InsertOp, DmlStatement, WriteOp};
 use datafusion_expr::expr::{
     physical_name, AggregateFunction, AggregateFunctionParams, Alias, GroupingSet,
     WindowFunction, WindowFunctionParams,
@@ -76,10 +76,11 @@ use datafusion_expr::expr::{
 use datafusion_expr::expr_rewriter::unnormalize_cols;
 use datafusion_expr::logical_plan::builder::wrap_projection_for_join_if_necessary;
 use datafusion_expr::{
-    Analyze, DescribeTable, DmlStatement, Explain, ExplainFormat, Extension, FetchType,
-    Filter, JoinType, RecursiveQuery, SkipType, StringifiedPlan, WindowFrame,
-    WindowFrameBound, WriteOp,
+    Analyze, DescribeTable, DmlStatement,Explain, ExplainFormat, Extension, FetchType,
+    Filter, JoinType, RecursiveQuery, SkipType, SortExpr, StringifiedPlan, WindowFrame,
+    WindowFrameBound, WriteOp, SubqueryAlias,
 };
+use datafusion_execution::FunctionRegistry;
 use datafusion_physical_expr::aggregate::{AggregateExprBuilder, AggregateFunctionExpr};
 use datafusion_physical_expr::expressions::{Column, Literal};
 use datafusion_physical_expr::LexOrdering;
@@ -96,6 +97,10 @@ use itertools::{multiunzip, Itertools};
 use log::{debug, trace};
 use sqlparser::ast::NullTreatment;
 use tokio::sync::Mutex;
+
+use datafusion_sql::transform_pivot_to_aggregate;
+
+use datafusion_physical_plan::collect;
 
 /// Physical query planner that converts a `LogicalPlan` to an
 /// `ExecutionPlan` suitable for execution.
@@ -887,7 +892,53 @@ impl DefaultPhysicalPlanner {
                     options.clone(),
                 ))
             }
+            LogicalPlan::Pivot(pivot) => {
+                let pivot_values = if let Some(subquery) = &pivot.value_subquery {
+                    let optimized_subquery = session_state.optimize(subquery.as_ref())?;
 
+                    let subquery_physical_plan = self.create_physical_plan(
+                        &optimized_subquery,
+                        session_state
+                    ).await?;
+
+                    let subquery_results = collect(subquery_physical_plan.clone(), session_state.task_ctx()).await?;
+
+                    let mut pivot_values = Vec::new();
+                    for batch in subquery_results.iter() {
+                        if batch.num_columns() != 1 {
+                            return plan_err!("Pivot subquery must return a single column");
+                        }
+
+                        let column = batch.column(0);
+                        for row_idx in 0..batch.num_rows() {
+                            if !column.is_null(row_idx) {
+                                pivot_values.push(
+                                    ScalarValue::try_from_array(column, row_idx)?
+                                );
+                            }
+                        }
+                    }
+                    pivot_values
+                } else {
+                    pivot.pivot_values.clone()
+                };
+
+                if !pivot_values.is_empty() {
+                    // Transform Pivot into Aggregate plan with the resolved pivot values
+                    let agg_plan = transform_pivot_to_aggregate(
+                        Arc::new(pivot.input.as_ref().clone()),
+                        &pivot.aggregate_expr,
+                        &pivot.pivot_column,
+                        Some(pivot_values),
+                        None,
+                    )?;
+
+                    // The schema information is already preserved in the agg_plan
+                    return self.create_physical_plan(&agg_plan, session_state).await;
+                } else {
+                    return plan_err!("PIVOT operation requires at least one value to pivot on");
+                }
+            }
             // 2 Children
             LogicalPlan::Join(Join {
                 left,
@@ -2043,6 +2094,44 @@ impl DefaultPhysicalPlanner {
                 tuple_err((final_physical_expr, physical_name))
             })
             .collect::<Result<Vec<_>>>()?;
+
+        // Check if input plan was transformed from a PIVOT operation
+        // The original logical plan will be a LogicalPlan::Pivot that has been transformed to an Aggregate
+        match input.as_ref() {
+            // Direct PIVOT
+            LogicalPlan::Pivot(_) => {
+                // When we detect a PIVOT-derived plan, ensure all generated columns are preserved
+                if input_exec.as_any().downcast_ref::<AggregateExec>().is_some() {
+                    let agg_exec = input_exec.as_any().downcast_ref::<AggregateExec>().unwrap();
+                    let schema = input_exec.schema();
+                    let group_by_len = agg_exec.group_expr().expr().len();
+
+                    // If we have aggregate expressions that correspond to pivot columns
+                    if group_by_len < schema.fields().len() {
+                        // This is a pivot result - we need to include all columns from the aggregate
+                        let mut all_exprs = physical_exprs.clone();
+
+                        // Add any missing pivot columns (which are all columns after the group_by columns)
+                        for (i, field) in schema.fields().iter().enumerate().skip(group_by_len) {
+                            // Check if this column is already included in the projection
+                            if !physical_exprs.iter().any(|(_, name)| name == field.name()) {
+                                // Add this pivot column to the projection
+                                all_exprs.push((
+                                    Arc::new(crate::physical_plan::expressions::Column::new(field.name(), i)) as Arc<dyn PhysicalExpr>,
+                                    field.name().clone(),
+                                ));
+                            }
+                        }
+
+                        return Ok(Arc::new(ProjectionExec::try_new(
+                            all_exprs,
+                            input_exec,
+                        )?));
+                    }
+                }
+            },
+           _ => {}
+        }
 
         Ok(Arc::new(ProjectionExec::try_new(
             physical_exprs,
