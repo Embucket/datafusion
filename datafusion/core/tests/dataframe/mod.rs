@@ -868,6 +868,10 @@ async fn window_using_aggregates() -> Result<()> {
             "last_val",
         ),
         (
+            datafusion_functions_aggregate::any_value::any_value_udaf(),
+            "any_value",
+        ),
+        (
             datafusion_functions_aggregate::approx_distinct::approx_distinct_udaf(),
             "approx_distinct",
         ),

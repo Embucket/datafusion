@@ -40,6 +40,7 @@ use datafusion_expr::{
 use datafusion_functions_aggregate::count::count_udaf;
 use datafusion_functions_aggregate::min_max::{max_udaf, min_udaf};
 use datafusion_functions_aggregate::sum::sum_udaf;
+use datafusion_functions_window::any_value::any_value_udwf;
 use datafusion_functions_window::lead_lag::{lag_udwf, lead_udwf};
 use datafusion_functions_window::nth_value::{
     first_value_udwf, last_value_udwf, nth_value_udwf,
@@ -426,6 +427,13 @@ fn get_random_function(
         "last_value",
         (
             WindowFunctionDefinition::WindowUDF(last_value_udwf()),
+            vec![arg.clone()],
+        ),
+    );
+    window_fn_map.insert(
+        "any_value",
+        (
+            WindowFunctionDefinition::WindowUDF(any_value_udwf()),
             vec![arg.clone()],
         ),
     );
