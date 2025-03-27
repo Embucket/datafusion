@@ -2321,14 +2321,14 @@ fn pivot_schema(
 
     // Include all fields except pivot and value columns
     for field in input_schema.fields() {
-        if field.name() != pivot_column.name() && !aggregate_expr.column_refs().contains(&Column::from_name(field.name())) {
+        if !aggregate_expr.column_refs().contains(&Column::from_name(field.name())) {
             fields.push(field.clone());
         }
     }
 
     // Add new fields for each pivot value
     for pivot_value in pivot_values {
-        let field_name = format!("{}_{}", pivot_value, aggregate_expr.schema_name());
+        let field_name = format!("{}", pivot_value);
         let data_type = aggregate_expr.get_type(input_schema)?;
         fields.push(Arc::new(Field::new(field_name, data_type, true)));
     }

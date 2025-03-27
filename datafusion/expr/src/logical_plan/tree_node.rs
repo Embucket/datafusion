@@ -328,7 +328,21 @@ impl TreeNode for LogicalPlan {
                     options,
                 })
             }),
-            LogicalPlan::Pivot(_) => todo!(),
+            LogicalPlan::Pivot(Pivot {
+                input,
+                aggregate_expr,
+                pivot_column,
+                pivot_values,
+                schema,
+            }) => input.map_elements(f)?.update_data(|input| {
+                LogicalPlan::Pivot(Pivot {
+                    input,
+                    aggregate_expr,
+                    pivot_column,
+                    pivot_values,
+                    schema,
+                })
+            }),
             LogicalPlan::RecursiveQuery(RecursiveQuery {
                 name,
                 static_term,
@@ -468,7 +482,7 @@ impl LogicalPlan {
                 }
                 _ => Ok(TreeNodeRecursion::Continue),
             },
-            LogicalPlan::Pivot(_) => todo!(),
+            LogicalPlan::Pivot(Pivot { aggregate_expr, .. }) => f(aggregate_expr),
             // plans without expressions
             LogicalPlan::EmptyRelation(_)
             | LogicalPlan::RecursiveQuery(_)
@@ -646,7 +660,21 @@ impl LogicalPlan {
                     LogicalPlan::Limit(Limit { skip, fetch, input })
                 })
             }
-            LogicalPlan::Pivot(_) => todo!(),
+            LogicalPlan::Pivot(Pivot {
+                input,
+                aggregate_expr,
+                pivot_column,
+                pivot_values,
+                schema,
+            }) => f(aggregate_expr)?.update_data(|aggregate_expr| {
+                LogicalPlan::Pivot(Pivot {
+                    input,
+                    aggregate_expr,
+                    pivot_column,
+                    pivot_values,
+                    schema,
+                })
+            }),
             LogicalPlan::Statement(stmt) => match stmt {
                 Statement::Execute(e) => {
                     e.parameters.map_elements(f)?.update_data(|parameters| {

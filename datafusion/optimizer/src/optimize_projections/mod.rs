@@ -383,7 +383,24 @@ fn optimize_projections(
                 dependency_indices.clone(),
             )]
         }
-        LogicalPlan::Pivot(_) => todo!("Pivot optimization"),
+        LogicalPlan::Pivot(pivot) => {
+            return Ok(Transformed::no(plan)); // TODO: Implement this
+            /*
+            // For PIVOT operations, we need columns from the aggregate expression and the pivot column
+            let mut pivot_indices = Vec::new();
+            
+            // Add required indices for the pivot column
+            if let Ok(idx) = pivot.input.schema().index_of_column(&pivot.pivot_column) {
+                pivot_indices.push(idx);
+            }
+            
+            // Create RequiredIndices with these indices and add dependency from aggregate expression
+            let required = RequiredIndices::new_from_indices(pivot_indices)
+                .with_exprs(pivot.input.schema(), std::iter::once(&pivot.aggregate_expr))
+                .with_projection_beneficial();
+                
+            vec![required]*/
+        },
 
     };
 

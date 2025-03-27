@@ -995,6 +995,33 @@ impl AsLogicalPlan for LogicalPlanNode {
                     Arc::new(into_logical_plan!(dml_node.input, ctx, extension_codec)?),
                 ),
             )),
+            LogicalPlanType::Pivot(pivot) => {
+                let aggregate_expr = pivot.aggregate_expr
+                    .as_ref()
+                    .map(|expr| from_proto::parse_expr(expr, ctx, extension_codec))
+                    .transpose()?
+                    .ok_or_else(|| DataFusionError::Internal("aggregate_expr required".to_string()))?;
+                let pivot_column = pivot.pivot_column
+                    .as_ref()
+                    .map(|col| col.clone().into())
+                    .ok_or_else(|| DataFusionError::Internal("pivot_column required".to_string()))?;
+                let pivot_values = pivot.pivot_values
+    .iter()
+    .map(|val| val.try_into())
+    .collect::<Result<Vec<datafusion_common::ScalarValue>, _>>()?;
+                let schema = Arc::new(convert_required!(pivot.schema)?);
+
+                Ok(LogicalPlan::Pivot(
+                    Pivot {
+                        input: Arc::new(into_logical_plan!(pivot.input, ctx, extension_codec)?),
+                        aggregate_expr,
+                        pivot_column,
+                        pivot_values,
+                        schema,
+                    }
+                ))
+            }
+        
         }
     }
 
@@ -1776,20 +1803,23 @@ impl AsLogicalPlan for LogicalPlanNode {
                     ))),
                 })
             }
-            LogicalPlan::Pivot(pivot) => {
-                let input =
+            LogicalPlan::Pivot(_) => {
+                /*let input =
                     LogicalPlanNode::try_from_logical_plan(pivot.input.as_ref(), extension_codec)?;
                 Ok(LogicalPlanNode {
                     logical_plan_type: Some(LogicalPlanType::Pivot(Box::new(
                         protobuf::PivotNode {
                             input: Some(Box::new(input)),
-                            aggregate_expr: serialize_exprs(pivot.aggregate_expr.clone(), extension_codec?)
+                            aggregate_expr: pivot.aggregate_expr.clone(),
                             pivot_column: pivot.pivot_column.clone(),
                             pivot_values: pivot.pivot_values.clone(),
                             schema:  convert_required!(*pivot.schema)?,
                         },
                     ))),
-                })
+                })*/
+                Err(proto_error(
+                    "LogicalPlan serde is not yet implemented for Statement",
+                ))
             }
         }
     }

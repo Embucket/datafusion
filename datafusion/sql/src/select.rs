@@ -491,19 +491,6 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         Ok((intermediate_plan, intermediate_select_exprs))
     }
 
-    /*fn try_process_pivot(
-        &self,
-        input: LogicalPlan,
-        table: Box<TableFactor>,
-        aggregate_functions : Vec<ExprWithAlias>,
-        value_column: Vec<Ident>,
-        value_source : ,
-        default_on_null,
-        alias
-    ) -> Result<LogicalPlan> {
-
-    }*/
-
 
     fn plan_selection(
         &self,

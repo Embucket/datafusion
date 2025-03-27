@@ -97,6 +97,8 @@ use log::{debug, trace};
 use sqlparser::ast::NullTreatment;
 use tokio::sync::Mutex;
 
+use datafusion_physical_plan::pivot::PivotExec;
+
 /// Physical query planner that converts a `LogicalPlan` to an
 /// `ExecutionPlan` suitable for execution.
 #[async_trait]
@@ -887,7 +889,18 @@ impl DefaultPhysicalPlanner {
                     options.clone(),
                 ))
             }
-            LogicalPlan::Pivot(_) => todo!(),
+            LogicalPlan::Pivot(pivot) => {
+                let input = children.one()?;
+                let schema = SchemaRef::new(pivot.schema.as_ref().to_owned().into());
+                
+                Arc::new(PivotExec::new(
+                    input,
+                    pivot.aggregate_expr.clone(),
+                    Expr::Column(pivot.pivot_column.clone()),
+                    pivot.pivot_values.clone(),
+                    schema,
+                ))
+            }
 
             // 2 Children
             LogicalPlan::Join(Join {

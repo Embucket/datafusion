@@ -1929,8 +1929,8 @@ pub struct CteWorkTableScanNode {
 pub struct PivotNode {
     #[prost(message, optional, boxed, tag = "1")]
     pub input: ::core::option::Option<::prost::alloc::boxed::Box<LogicalPlanNode>>,
-    #[prost(message, repeated, tag = "2")]
-    pub aggregate_expr: ::prost::alloc::vec::Vec<LogicalExprNode>,
+    #[prost(message, optional, tag = "2")]
+    pub aggregate_expr: ::core::option::Option<::prost::alloc::boxed::Box<LogicalExprNode>>,
     #[prost(message, optional, tag = "3")]
     pub pivot_column: ::core::option::Option<super::datafusion_common::Column>,
     #[prost(message, repeated, tag = "4")]
