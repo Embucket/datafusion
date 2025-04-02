@@ -2318,10 +2318,11 @@ fn pivot_schema(
     pivot_values: &[ScalarValue],
 ) -> Result<DFSchema> {
     let mut fields = vec![];
-
+    println!("aggregate_expr_column_refsPIVOT398: {:?}", aggregate_expr.column_refs());
     // Include all fields except pivot and value columns
     for field in input_schema.fields() {
-        if !aggregate_expr.column_refs().contains(&Column::from_name(field.name())) {
+        println!("field.name(): {}", field.name());
+        if !aggregate_expr.column_refs().iter().any(|col| col.name() == field.name()) && field.name() != pivot_column.name() {
             fields.push(field.clone());
         }
     }

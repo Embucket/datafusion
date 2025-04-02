@@ -364,7 +364,7 @@ pub fn derive_pivot_schema(
     // Keep the pivot column but filter out aggregate columns
     for field in input_schema.fields().iter() {
         // Keep all columns except those referenced in the aggregate function
-        if !agg_expr.column_refs().contains(&Column::from_name(field.name())) {
+        if !agg_expr.column_refs().iter().any(|col| col.name() == field.name()) && field.name() != pivot_column.name() {
             new_fields.push((None, field.clone()));
         }
     }
