@@ -1010,7 +1010,11 @@ impl AsLogicalPlan for LogicalPlanNode {
     .map(|val| val.try_into())
     .collect::<Result<Vec<datafusion_common::ScalarValue>, _>>()?;
                 let schema = Arc::new(convert_required!(pivot.schema)?);
-
+                let value_subquery = if pivot.value_subquery.is_some() {
+                    Some(Arc::new(into_logical_plan!(pivot.value_subquery, ctx, extension_codec)?))
+                } else {
+                    None
+                };
                 Ok(LogicalPlan::Pivot(
                     Pivot {
                         input: Arc::new(into_logical_plan!(pivot.input, ctx, extension_codec)?),
@@ -1018,6 +1022,7 @@ impl AsLogicalPlan for LogicalPlanNode {
                         pivot_column,
                         pivot_values,
                         schema,
+                        value_subquery: value_subquery
                     }
                 ))
             }

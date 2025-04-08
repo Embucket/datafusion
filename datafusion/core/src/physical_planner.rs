@@ -65,11 +65,11 @@ use arrow::datatypes::{Schema, SchemaRef};
 use datafusion_common::display::ToStringifiedPlan;
 use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion, TreeNodeVisitor};
 use datafusion_common::{
-    exec_err, internal_datafusion_err, internal_err, not_impl_err, plan_err, DFSchema,
-    ScalarValue,
+    exec_err, internal_datafusion_err, internal_err, not_impl_err, plan_err, DFSchema, DFSchemaRef,
+    ScalarValue, Column, TableReference,
 };
 use datafusion_datasource::memory::MemorySourceConfig;
-use datafusion_expr::dml::{CopyTo, InsertOp};
+use datafusion_expr::dml::{CopyTo, InsertOp, DmlStatement, WriteOp};
 use datafusion_expr::expr::{
     physical_name, AggregateFunction, AggregateFunctionParams, Alias, GroupingSet,
     WindowFunction, WindowFunctionParams,
@@ -77,10 +77,11 @@ use datafusion_expr::expr::{
 use datafusion_expr::expr_rewriter::unnormalize_cols;
 use datafusion_expr::logical_plan::builder::wrap_projection_for_join_if_necessary;
 use datafusion_expr::{
-    Analyze, DescribeTable, DmlStatement, Explain, ExplainFormat, Extension, FetchType,
+    Analyze, DescribeTable, Explain, ExplainFormat, Extension, FetchType,
     Filter, JoinType, RecursiveQuery, SkipType, SortExpr, StringifiedPlan, WindowFrame,
-    WindowFrameBound, WriteOp,
+    WindowFrameBound, SubqueryAlias,
 };
+use datafusion_execution::FunctionRegistry;
 use datafusion_physical_expr::aggregate::{AggregateExprBuilder, AggregateFunctionExpr};
 use datafusion_physical_expr::expressions::Literal;
 use datafusion_physical_expr::LexOrdering;
@@ -98,6 +99,9 @@ use sqlparser::ast::NullTreatment;
 use tokio::sync::Mutex;
 
 use datafusion_physical_plan::pivot::PivotExec;
+use datafusion_sql::transform_pivot_to_aggregate;
+
+use datafusion_physical_plan::collect;
 
 /// Physical query planner that converts a `LogicalPlan` to an
 /// `ExecutionPlan` suitable for execution.
@@ -306,8 +310,10 @@ impl DefaultPhysicalPlanner {
                 }
                 1 => NodeState::ZeroOrOneChild,
                 _ => {
+
                     let ready_children = Vec::with_capacity(node.inputs().len());
                     let ready_children = Mutex::new(ready_children);
+
                     NodeState::TwoOrMoreChildren(ready_children)
                 }
             };
@@ -893,13 +899,68 @@ impl DefaultPhysicalPlanner {
                 let input = children.one()?;
                 let schema = SchemaRef::new(pivot.schema.as_ref().to_owned().into());
                 
-                Arc::new(PivotExec::new(
-                    input,
-                    pivot.aggregate_expr.clone(),
-                    Expr::Column(pivot.pivot_column.clone()),
-                    pivot.pivot_values.clone(),
-                    schema,
-                ))
+                // Check if we have a subquery for pivot values
+                let pivot_values = if let Some(subquery) = &pivot.value_subquery {
+                    // Optimize the subquery before executing it
+                    debug!("Optimizing and executing pivot subquery to determine pivot values");
+                    let optimized_subquery = session_state.optimize(subquery.as_ref())?;
+                    
+                    // Create a physical plan for the optimized subquery
+                    let subquery_physical_plan = self.create_physical_plan(
+                        &optimized_subquery,
+                        session_state
+                    ).await?;
+                    
+                    // Collect all results from the subquery (it should return a single column of values)
+                    let subquery_results = collect(subquery_physical_plan.clone(), session_state.task_ctx()).await?;
+                    
+                    // Convert the results to ScalarValues
+                    let mut pivot_values = Vec::new();
+                    for batch in subquery_results.iter() {
+                        if batch.num_columns() != 1 {
+                            return plan_err!("Pivot subquery must return a single column");
+                        }
+                        
+                        let column = batch.column(0);
+                        for row_idx in 0..batch.num_rows() {
+                            if !column.is_null(row_idx) {
+                                pivot_values.push(
+                                    ScalarValue::try_from_array(column, row_idx)?
+                                );
+                            }
+                        }
+                    }
+                    debug!("Found {} distinct pivot values from subquery", pivot_values.len());
+                    
+                    pivot_values
+                } else {
+                    pivot.pivot_values.clone()
+                };
+                
+                // Now that we have the pivot values (either explicit or from subquery),
+                // use transform_pivot_to_aggregate to create an aggregate plan
+                if !pivot_values.is_empty() {
+                    // Transform Pivot into Aggregate plan with the resolved pivot values
+                    let agg_plan = transform_pivot_to_aggregate(
+                        Arc::new(pivot.input.as_ref().clone()),
+                        &pivot.aggregate_expr,
+                        &pivot.pivot_column,
+                        Some(pivot_values),
+                        None, // No need for subquery anymore as we've extracted the values
+                    )?;
+                    
+                    // Plan the transformed aggregate 
+                    return self.create_physical_plan(&agg_plan, session_state).await;
+                } else {
+                    // Fallback to PivotExec if we couldn't get any values (unlikely)
+                    Arc::new(PivotExec::new(
+                        input,
+                        pivot.aggregate_expr.clone(),
+                        Expr::Column(pivot.pivot_column.clone()),
+                        pivot_values,
+                        schema,
+                    ))
+                }
             }
 
             // 2 Children

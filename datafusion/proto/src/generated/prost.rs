@@ -1937,6 +1937,8 @@ pub struct PivotNode {
     pub pivot_values: ::prost::alloc::vec::Vec<super::datafusion_common::ScalarValue>,
     #[prost(message, optional, tag = "5")]
     pub schema: ::core::option::Option<super::datafusion_common::DfSchema>,
+    #[prost(message, optional, tag = "6")]
+    pub value_subquery: ::core::option::Option<::prost::alloc::boxed::Box<LogicalPlanNode>>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
