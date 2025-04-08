@@ -25,7 +25,7 @@ use datafusion_common::{
     Column, DFSchemaRef, ScalarValue,
 };
 use datafusion_expr::builder::subquery_alias;
-use datafusion_expr::{expr::Unnest, Expr, LogicalPlan, LogicalPlanBuilder};
+use datafusion_expr::{expr::Unnest, Expr, LogicalPlan, LogicalPlanBuilder, Sort};
 use datafusion_expr::expr::{AggregateFunction, BinaryExpr, Alias, AggregateFunctionParams};
 use datafusion_expr::{Subquery, SubqueryAlias, Operator};
 use sqlparser::ast::{FunctionArg, FunctionArgExpr, Spanned, TableFactor};
@@ -228,29 +228,70 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                         
                         (pivot_plan, alias)
                     },
-                    sqlparser::ast::PivotValueSource::Any(_) => {
-                        // For ANY pivot source, we'll use an empty vector for now
-                        // The actual values will be determined at execution time
-                        let pivot_values = Vec::new();
-                        
+                    sqlparser::ast::PivotValueSource::Any(order_by) => {
+                        // For ANY pivot source, create a subquery to find distinct values
+                        // SELECT DISTINCT pivot_column FROM input_table [ORDER BY pivot_column]
+                        let pivot_values = Vec::new(); // Will be populated dynamically
+
                         // Create a custom PIVOT logical plan node
                         let input_arc = Arc::new(input_plan);
+
+                        // Build the subquery plan: SELECT DISTINCT pivot_column FROM input
+                        let mut subquery_builder = LogicalPlanBuilder::from(input_arc.as_ref().clone())
+                            .project(vec![Expr::Column(pivot_column.clone())])? // Select only the pivot column
+                            .distinct()?; // Get distinct values
+                        
+                        // Handle ORDER BY if present
+                        if !order_by.is_empty() {
+                            // Convert each ORDER BY expression to a logical sort expression
+                            let sort_exprs = order_by
+                                .iter()
+                                .map(|item| {
+                                    // The schema of our subquery has only one column now (the pivot column)
+                                    let input_schema = subquery_builder.schema();
+                                    
+                                    // Convert the SQL sort expression to a logical sort expression
+                                    let expr = self.sql_expr_to_logical_expr(
+                                        item.expr.clone(),
+                                        input_schema,
+                                        planner_context,
+                                    );
+                                    
+                                    expr.map(|e| {
+                                        // Create a Sort expression
+                                        e.sort(
+                                            item.asc.unwrap_or(true),
+                                            item.nulls_first.unwrap_or(false)
+                                        )
+                                    })
+                                })
+                                .collect::<Result<Vec<_>>>()?;
+                            
+                            // Add the ORDER BY to the subquery plan
+                            subquery_builder = subquery_builder.sort(sort_exprs)?;
+                        }
+                        
+                        // Build the final subquery plan
+                        let subquery_plan = subquery_builder.build()?;
+
+                        // Create a schema for the output (initially without dynamic columns)
+                        // The physical planner will adjust this later based on subquery results
                         let schema = derive_pivot_schema(
                             input_arc.schema(),
                             &agg_expr,
                             &pivot_column,
                             &pivot_values
                         )?;
-                        
+
                         let pivot_plan = LogicalPlan::Pivot(datafusion_expr::Pivot {
                             input: input_arc,
                             aggregate_expr: agg_expr,
                             pivot_column,
                             pivot_values,
                             schema: Arc::new(schema),
-                            value_subquery: None,
-                });
-                        
+                            value_subquery: Some(Arc::new(subquery_plan)), // Pass the subquery with sorting
+                        });
+
                         (pivot_plan, alias)
                     },
                     sqlparser::ast::PivotValueSource::Subquery(subquery) => {
@@ -494,7 +535,7 @@ pub fn transform_pivot_to_aggregate(
         },
         None => {
             // With dynamic pivot values (ANY or SUBQUERY), we should not transform to aggregate yet
-            // Instead, return a special Pivot node that will be handled during physical planning
+            // Instead, return a special PIVOT node that will be handled during physical planning
             return Ok(LogicalPlan::Pivot(datafusion_expr::Pivot {
                 input: input.clone(),
                 aggregate_expr: aggregate_expr.clone(),
