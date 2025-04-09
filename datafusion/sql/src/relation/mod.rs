@@ -164,34 +164,27 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 default_on_null,
                 alias,
             } => {
-                // Process the inner table first
                 let input_plan = self.create_relation(*table, planner_context)?;
                 
-                // Process the aggregate function
                 if aggregate_functions.len() != 1 {
                     return plan_err!("PIVOT requires exactly one aggregate function");
                 }
                 
-                // Get the aggregate function expression
                 let agg_expr = self.sql_expr_to_logical_expr(
                     aggregate_functions[0].expr.clone(),
                     input_plan.schema(),
                     planner_context,
                 )?;
                 
-                // Process the pivot column (value_column contains identifier parts)
                 if value_column.is_empty() {
                     return plan_err!("PIVOT value column is required");
                 }
                 
-                // Convert the identifier vector to a column reference
                 let column_name = value_column.last().unwrap().value.clone();
                 let pivot_column = Column::new(None::<&str>, column_name);
 
-                // Process based on the value source
                 match value_source {
                     sqlparser::ast::PivotValueSource::List(exprs) => {
-                        // Process each pivot value expression
                         let pivot_values = exprs.iter()
                             .map(|expr| {
                                 let logical_expr = self.sql_expr_to_logical_expr(
@@ -208,7 +201,6 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                             })
                             .collect::<Result<Vec<_>>>()?;
                             
-                        // Create a custom PIVOT logical plan node
                         let input_arc = Arc::new(input_plan);
                         let schema = derive_pivot_schema(
                             input_arc.schema(),
@@ -229,28 +221,20 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                         (pivot_plan, alias)
                     },
                     sqlparser::ast::PivotValueSource::Any(order_by) => {
-                        // For ANY pivot source, create a subquery to find distinct values
-                        // SELECT DISTINCT pivot_column FROM input_table [ORDER BY pivot_column]
-                        let pivot_values = Vec::new(); // Will be populated dynamically
+                        let pivot_values = Vec::new(); 
 
-                        // Create a custom PIVOT logical plan node
                         let input_arc = Arc::new(input_plan);
 
-                        // Build the subquery plan: SELECT DISTINCT pivot_column FROM input
                         let mut subquery_builder = LogicalPlanBuilder::from(input_arc.as_ref().clone())
                             .project(vec![Expr::Column(pivot_column.clone())])? // Select only the pivot column
                             .distinct()?; // Get distinct values
                         
-                        // Handle ORDER BY if present
                         if !order_by.is_empty() {
-                            // Convert each ORDER BY expression to a logical sort expression
                             let sort_exprs = order_by
                                 .iter()
                                 .map(|item| {
-                                    // The schema of our subquery has only one column now (the pivot column)
                                     let input_schema = subquery_builder.schema();
                                     
-                                    // Convert the SQL sort expression to a logical sort expression
                                     let expr = self.sql_expr_to_logical_expr(
                                         item.expr.clone(),
                                         input_schema,
@@ -267,15 +251,11 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                                 })
                                 .collect::<Result<Vec<_>>>()?;
                             
-                            // Add the ORDER BY to the subquery plan
                             subquery_builder = subquery_builder.sort(sort_exprs)?;
                         }
                         
-                        // Build the final subquery plan
                         let subquery_plan = subquery_builder.build()?;
 
-                        // Create a schema for the output (initially without dynamic columns)
-                        // The physical planner will adjust this later based on subquery results
                         let schema = derive_pivot_schema(
                             input_arc.schema(),
                             &agg_expr,
@@ -295,17 +275,12 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                         (pivot_plan, alias)
                     },
                     sqlparser::ast::PivotValueSource::Subquery(subquery) => {
-                        println!("PIVOT_VALUE_SOURSE387: {:?}", subquery);
-                        // Create a logical plan for the subquery
                         let subquery_plan = self.query_to_plan(*subquery.clone(), planner_context)?;
                         
-                        // Create a PIVOT logical plan with the subquery
                         let input_arc = Arc::new(input_plan);
                         
-                        // Empty vector for now - values will be extracted from subquery at execution time
                         let pivot_values = Vec::new();
                         
-                        // Create a schema for the output
                         let schema = derive_pivot_schema(
                             input_arc.schema(),
                             &agg_expr,
@@ -313,7 +288,6 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                             &pivot_values
                         )?;
                         
-                        // Create the plan with try_new_with_subquery
                         let pivot_plan = LogicalPlan::Pivot(
                             datafusion_expr::Pivot::try_new_with_subquery(
                                 input_arc,
@@ -327,7 +301,6 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     },
                 }
             }
-           // @todo Support TableFactory::TableFunction?
 
             _ => {
                 return not_impl_err!(
@@ -442,30 +415,20 @@ pub fn derive_pivot_schema(
 ) -> Result<DFSchema> {
     use datafusion_expr::ExprSchemable;
     
-    // First, get the expected field type from the aggregate expression
     let field_type = agg_expr.get_type(input_schema.as_ref())?;
     
-    // Create a vector for our schema fields, starting with existing fields
     let mut new_fields = Vec::<(Option<TableReference>, Arc<Field>)>::new();
 
-
-    // Add existing fields with their table references
-    // Exclude pivot column and aggregate columns from the output
     for field in input_schema.fields().iter() {
-        // Skip the pivot column and the aggregate column
         if field.name() != pivot_column.name() && 
            !agg_expr.column_refs().iter().any(|col| col.name() == field.name()) {
             new_fields.push((None, field.clone()));
         }
     }
     
-    // For each explicit pivot value, create a new field
     for value in pivot_values {
-        // Format column name as '{value}' to match Snowflake's style
-        // We could also use {agg_func_name}_{value} to be more explicit
         let field_name = value.to_string().trim_matches('\'').to_string();
         
-        // Create a new column in the schema
         let field = Field::new(field_name, field_type.clone(), true);
         new_fields.push((None, Arc::new(field)));
     }
@@ -504,10 +467,8 @@ pub fn transform_pivot_to_aggregate(
     pivot_values: Option<Vec<ScalarValue>>,
     value_subquery: Option<Arc<LogicalPlan>>,
 ) -> Result<LogicalPlan> {
-    // Get the schema from the input plan
     let df_schema = input.schema();
     
-    // Extract all column names from the schema
     let all_columns: Vec<Column> = df_schema.columns();
     
     // Filter to include only columns we want for GROUP BY 
@@ -521,13 +482,10 @@ pub fn transform_pivot_to_aggregate(
         .map(|col| Expr::Column(col))
         .collect();
     
-    // Create builder for our logical plan
     let mut builder = LogicalPlanBuilder::from(Arc::unwrap_or_clone(input.clone()));
 
-    // Handle pivot values - for explicitly specified, ANY, or subquery
     let pivot_values = match pivot_values {
         Some(values) => {
-            // Use the explicitly provided values
             if values.is_empty() {
                 return plan_err!("PIVOT requires at least one value");
             }
@@ -547,21 +505,17 @@ pub fn transform_pivot_to_aggregate(
         }
     };
     
-    // Create filtered aggregate expressions for each pivot value
     let mut aggregate_exprs = Vec::new();
     
     for value in &pivot_values {
-        // Create the filter condition: pivot_column IS NOT DISTINCT FROM value
         let filter_condition = Expr::BinaryExpr(BinaryExpr::new(
             Box::new(Expr::Column(pivot_column.clone())),
             Operator::IsNotDistinctFrom,
             Box::new(Expr::Literal(value.clone()))
         ));
         
-        // Create the aggregate function with filter
         let filtered_agg = match aggregate_expr {
             Expr::AggregateFunction(agg) => {
-                // Clone the aggregate function but add our filter
                 let mut new_params = agg.params.clone();
                 new_params.filter = Some(Box::new(filter_condition));
                 Expr::AggregateFunction(AggregateFunction {

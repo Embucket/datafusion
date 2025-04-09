@@ -98,7 +98,6 @@ use log::{debug, trace};
 use sqlparser::ast::NullTreatment;
 use tokio::sync::Mutex;
 
-use datafusion_physical_plan::pivot::PivotExec;
 use datafusion_sql::transform_pivot_to_aggregate;
 
 use datafusion_physical_plan::collect;
@@ -896,25 +895,16 @@ impl DefaultPhysicalPlanner {
                 ))
             }
             LogicalPlan::Pivot(pivot) => {
-                let input = children.one()?;
-                let schema = SchemaRef::new(pivot.schema.as_ref().to_owned().into());
-                
-                // Check if we have a subquery for pivot values
                 let pivot_values = if let Some(subquery) = &pivot.value_subquery {
-                    // Optimize the subquery before executing it
-                    debug!("Optimizing and executing pivot subquery to determine pivot values");
                     let optimized_subquery = session_state.optimize(subquery.as_ref())?;
                     
-                    // Create a physical plan for the optimized subquery
                     let subquery_physical_plan = self.create_physical_plan(
                         &optimized_subquery,
                         session_state
                     ).await?;
                     
-                    // Collect all results from the subquery (it should return a single column of values)
                     let subquery_results = collect(subquery_physical_plan.clone(), session_state.task_ctx()).await?;
                     
-                    // Convert the results to ScalarValues
                     let mut pivot_values = Vec::new();
                     for batch in subquery_results.iter() {
                         if batch.num_columns() != 1 {
@@ -930,15 +920,11 @@ impl DefaultPhysicalPlanner {
                             }
                         }
                     }
-                    debug!("Found {} distinct pivot values from subquery", pivot_values.len());
-                    
                     pivot_values
                 } else {
                     pivot.pivot_values.clone()
                 };
                 
-                // Now that we have the pivot values (either explicit or from subquery),
-                // use transform_pivot_to_aggregate to create an aggregate plan
                 if !pivot_values.is_empty() {
                     // Transform Pivot into Aggregate plan with the resolved pivot values
                     let agg_plan = transform_pivot_to_aggregate(
@@ -946,23 +932,14 @@ impl DefaultPhysicalPlanner {
                         &pivot.aggregate_expr,
                         &pivot.pivot_column,
                         Some(pivot_values),
-                        None, // No need for subquery anymore as we've extracted the values
+                        None, 
                     )?;
                     
-                    // Plan the transformed aggregate 
                     return self.create_physical_plan(&agg_plan, session_state).await;
                 } else {
-                    // Fallback to PivotExec if we couldn't get any values (unlikely)
-                    Arc::new(PivotExec::new(
-                        input,
-                        pivot.aggregate_expr.clone(),
-                        Expr::Column(pivot.pivot_column.clone()),
-                        pivot_values,
-                        schema,
-                    ))
+                    todo!("Add some error handling if we don't find any values");
                 }
             }
-
             // 2 Children
             LogicalPlan::Join(Join {
                 left,
