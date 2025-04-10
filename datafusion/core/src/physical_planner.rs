@@ -935,9 +935,10 @@ impl DefaultPhysicalPlanner {
                         None, 
                     )?;
                     
+                    // The schema information is already preserved in the agg_plan
                     return self.create_physical_plan(&agg_plan, session_state).await;
                 } else {
-                    todo!("Add some error handling if we don't find any values");
+                    return plan_err!("PIVOT operation requires at least one value to pivot on");
                 }
             }
             // 2 Children
@@ -2119,6 +2120,44 @@ impl DefaultPhysicalPlanner {
             })
             .collect::<Result<Vec<_>>>()?;
 
+        // Check if input plan was transformed from a PIVOT operation
+        // The original logical plan will be a LogicalPlan::Pivot that has been transformed to an Aggregate
+        match input.as_ref() {
+            // Direct PIVOT
+            LogicalPlan::Pivot(_) => {
+                // When we detect a PIVOT-derived plan, ensure all generated columns are preserved
+                if input_exec.as_any().downcast_ref::<AggregateExec>().is_some() {
+                    let agg_exec = input_exec.as_any().downcast_ref::<AggregateExec>().unwrap();
+                    let schema = input_exec.schema();
+                    let group_by_len = agg_exec.group_expr().expr().len();
+
+                    // If we have aggregate expressions that correspond to pivot columns
+                    if group_by_len < schema.fields().len() {
+                        // This is a pivot result - we need to include all columns from the aggregate
+                        let mut all_exprs = physical_exprs.clone();
+
+                        // Add any missing pivot columns (which are all columns after the group_by columns)
+                        for (i, field) in schema.fields().iter().enumerate().skip(group_by_len) {
+                            // Check if this column is already included in the projection
+                            if !physical_exprs.iter().any(|(_, name)| name == field.name()) {
+                                // Add this pivot column to the projection
+                                all_exprs.push((
+                                    Arc::new(crate::physical_plan::expressions::Column::new(field.name(), i)) as Arc<dyn PhysicalExpr>,
+                                    field.name().clone(),
+                                ));
+                            }
+                        }
+
+                        return Ok(Arc::new(ProjectionExec::try_new(
+                            all_exprs,
+                            input_exec,
+                        )?));
+                    }
+                }
+            },
+           _ => {}
+        }
+        
         Ok(Arc::new(ProjectionExec::try_new(
             physical_exprs,
             input_exec,
