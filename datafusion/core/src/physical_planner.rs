@@ -18,7 +18,7 @@
 //! Planner for [`LogicalPlan`] to [`ExecutionPlan`]
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::datasource::file_format::file_type_to_format;
@@ -895,7 +895,19 @@ impl DefaultPhysicalPlanner {
                 ))
             }
             LogicalPlan::Pivot(pivot) => {
-                let pivot_values = if let Some(subquery) = &pivot.value_subquery {
+                if !pivot.pivot_values.is_empty() {
+                    // If pivot values are already defined, transform to aggregate
+                    let transformed_plan = transform_pivot_to_aggregate(
+                        pivot.input.clone(),
+                        &pivot.aggregate_expr,
+                        &pivot.pivot_column,
+                        Some(pivot.pivot_values.clone()),
+                        None,
+                    )?;
+                    self.create_initial_plan(&transformed_plan, session_state).await?
+                } else if let Some(subquery) = &pivot.value_subquery {
+                    // For ANY or SUBQUERY, we need to resolve the values at physical planning time
+                    // First optimize and execute the subquery
                     let optimized_subquery = session_state.optimize(subquery.as_ref())?;
                     
                     let subquery_physical_plan = self.create_physical_plan(
@@ -903,7 +915,7 @@ impl DefaultPhysicalPlanner {
                         session_state
                     ).await?;
                     
-                    let subquery_results = collect(subquery_physical_plan.clone(), session_state.task_ctx()).await?;
+                    let subquery_results = collect(subquery_physical_plan, session_state.task_ctx()).await?;
                     
                     let mut pivot_values = Vec::new();
                     for batch in subquery_results.iter() {
@@ -920,25 +932,22 @@ impl DefaultPhysicalPlanner {
                             }
                         }
                     }
-                    pivot_values
-                } else {
-                    pivot.pivot_values.clone()
-                };
-                
-                if !pivot_values.is_empty() {
-                    // Transform Pivot into Aggregate plan with the resolved pivot values
-                    let agg_plan = transform_pivot_to_aggregate(
-                        Arc::new(pivot.input.as_ref().clone()),
+                    
+                    if pivot_values.is_empty() {
+                        return plan_err!("PIVOT operation requires at least one value to pivot on");
+                    }
+                    
+                    // Now transform with the resolved values
+                    let transformed_plan = transform_pivot_to_aggregate(
+                        pivot.input.clone(),
                         &pivot.aggregate_expr,
                         &pivot.pivot_column,
                         Some(pivot_values),
-                        None, 
+                        None,
                     )?;
-                    
-                    // The schema information is already preserved in the agg_plan
-                    return self.create_physical_plan(&agg_plan, session_state).await;
+                    self.create_initial_plan(&transformed_plan, session_state).await?
                 } else {
-                    return plan_err!("PIVOT operation requires at least one value to pivot on");
+                    return plan_err!("PIVOT operation requires values to pivot on");
                 }
             }
             // 2 Children
@@ -1365,6 +1374,82 @@ impl DefaultPhysicalPlanner {
                     .collect::<Result<Vec<_>>>()?,
             ))
         }
+    }
+
+    pub fn create_project_physical_exec(
+        &self,
+        session_state: &SessionState,
+        input_exec: Arc<dyn ExecutionPlan>,
+        input: &Arc<LogicalPlan>,
+        expr: &[Expr],
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let input_dfschema = input.as_ref().schema();
+        let input_physical_schema = input_exec.schema();
+        
+        let mut physical_exprs = expr
+            .iter()
+            .map(|e| {
+                let physical_name = if let Expr::Column(col) = e {
+                    match input_dfschema.index_of_column(col) {
+                        Ok(idx) => Ok(input_physical_schema.field(idx).name().to_string()),
+                        Err(_) => physical_name(e),
+                    }
+                } else {
+                    physical_name(e)
+                };
+
+                tuple_err((
+                    self.create_physical_expr(e, input_dfschema, session_state),
+                    physical_name,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        // Check if input is derived from PIVOT operation using metadata or heuristic
+        let input_is_pivot_derived = 
+            input_dfschema.metadata().contains_key("is_pivot_derived") ||
+            (input_exec.as_any().downcast_ref::<AggregateExec>().map_or(false, |agg_exec| {
+               agg_exec.group_expr().expr().len() < input_physical_schema.fields().len()
+           }));
+
+        if input_is_pivot_derived {
+            // Keep track of columns already included by the user's projection
+            let mut included_column_names: HashSet<String> = physical_exprs.iter()
+                .map(|(_, name)| name.clone())
+                .collect();
+            
+            // Add any missing pivot columns
+            for (i, field) in input_physical_schema.fields().iter().enumerate() {
+                if !included_column_names.contains(field.name()) {
+                    // Add this pivot column to the physical expressions
+                    physical_exprs.push((
+                        Arc::new(crate::physical_plan::expressions::Column::new(field.name(), i)) as Arc<dyn PhysicalExpr>,
+                        field.name().clone(),
+                    ));
+                    included_column_names.insert(field.name().clone()); // Mark as included
+                }
+            }
+        }
+        
+        // Create the final projection
+        let projection = ProjectionExec::try_new(physical_exprs, input_exec)?;
+
+        // Preserve the PIVOT metadata marker if necessary
+        if input_is_pivot_derived && !projection.schema().metadata().contains_key("is_pivot_derived") {
+            let mut metadata = projection.schema().metadata().clone();
+            metadata.insert("is_pivot_derived".to_string(), "true".to_string());
+            let new_schema = Arc::new(Schema::new_with_metadata(
+                projection.schema().fields().clone(), 
+                metadata
+            ));
+            // Need to create a new ProjectionExec if we want to attach metadata,
+            // but the current API doesn't directly support setting schema metadata easily.
+            // For now, rely on downstream checks using the heuristic or the original input's metadata.
+            // TODO: Enhance ProjectionExec to allow setting metadata or recreate with new schema easily.
+            // We return the projection as is, downstream checks will handle it.
+        }
+        
+        Ok(Arc::new(projection))
     }
 }
 
@@ -2072,96 +2157,6 @@ impl DefaultPhysicalPlanner {
         let projection = None;
         let mem_exec = MemorySourceConfig::try_new_exec(&partitions, schema, projection)?;
         Ok(mem_exec)
-    }
-
-    fn create_project_physical_exec(
-        &self,
-        session_state: &SessionState,
-        input_exec: Arc<dyn ExecutionPlan>,
-        input: &Arc<LogicalPlan>,
-        expr: &[Expr],
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        let input_schema = input.as_ref().schema();
-        let physical_exprs = expr
-            .iter()
-            .map(|e| {
-                // For projections, SQL planner and logical plan builder may convert user
-                // provided expressions into logical Column expressions if their results
-                // are already provided from the input plans. Because we work with
-                // qualified columns in logical plane, derived columns involve operators or
-                // functions will contain qualifiers as well. This will result in logical
-                // columns with names like `SUM(t1.c1)`, `t1.c1 + t1.c2`, etc.
-                //
-                // If we run these logical columns through physical_name function, we will
-                // get physical names with column qualifiers, which violates DataFusion's
-                // field name semantics. To account for this, we need to derive the
-                // physical name from physical input instead.
-                //
-                // This depends on the invariant that logical schema field index MUST match
-                // with physical schema field index.
-                let physical_name = if let Expr::Column(col) = e {
-                    match input_schema.index_of_column(col) {
-                        Ok(idx) => {
-                            // index physical field using logical field index
-                            Ok(input_exec.schema().field(idx).name().to_string())
-                        }
-                        // logical column is not a derived column, safe to pass along to
-                        // physical_name
-                        Err(_) => physical_name(e),
-                    }
-                } else {
-                    physical_name(e)
-                };
-
-                tuple_err((
-                    self.create_physical_expr(e, input_schema, session_state),
-                    physical_name,
-                ))
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        // Check if input plan was transformed from a PIVOT operation
-        // The original logical plan will be a LogicalPlan::Pivot that has been transformed to an Aggregate
-        match input.as_ref() {
-            // Direct PIVOT
-            LogicalPlan::Pivot(_) => {
-                // When we detect a PIVOT-derived plan, ensure all generated columns are preserved
-                if input_exec.as_any().downcast_ref::<AggregateExec>().is_some() {
-                    let agg_exec = input_exec.as_any().downcast_ref::<AggregateExec>().unwrap();
-                    let schema = input_exec.schema();
-                    let group_by_len = agg_exec.group_expr().expr().len();
-
-                    // If we have aggregate expressions that correspond to pivot columns
-                    if group_by_len < schema.fields().len() {
-                        // This is a pivot result - we need to include all columns from the aggregate
-                        let mut all_exprs = physical_exprs.clone();
-
-                        // Add any missing pivot columns (which are all columns after the group_by columns)
-                        for (i, field) in schema.fields().iter().enumerate().skip(group_by_len) {
-                            // Check if this column is already included in the projection
-                            if !physical_exprs.iter().any(|(_, name)| name == field.name()) {
-                                // Add this pivot column to the projection
-                                all_exprs.push((
-                                    Arc::new(crate::physical_plan::expressions::Column::new(field.name(), i)) as Arc<dyn PhysicalExpr>,
-                                    field.name().clone(),
-                                ));
-                            }
-                        }
-
-                        return Ok(Arc::new(ProjectionExec::try_new(
-                            all_exprs,
-                            input_exec,
-                        )?));
-                    }
-                }
-            },
-           _ => {}
-        }
-        
-        Ok(Arc::new(ProjectionExec::try_new(
-            physical_exprs,
-            input_exec,
-        )?))
     }
 }
 
