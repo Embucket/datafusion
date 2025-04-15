@@ -22,6 +22,7 @@
 
 use std::any::Any;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -35,6 +36,7 @@ use super::{
 use crate::execution_plan::CardinalityEffect;
 use crate::joins::utils::{ColumnIndex, JoinFilter};
 use crate::{ColumnStatistics, DisplayFormatType, ExecutionPlan, PhysicalExpr};
+use crate::aggregates::AggregateExec;
 
 use arrow::datatypes::{Field, Schema, SchemaRef};
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
@@ -76,6 +78,7 @@ impl ProjectionExec {
     ) -> Result<Self> {
         let input_schema = input.schema();
 
+        // Build the output schema fields
         let fields: Result<Vec<Field>> = expr
             .iter()
             .map(|(e, name)| {
@@ -97,6 +100,16 @@ impl ProjectionExec {
             input_schema.metadata().clone(),
         ));
 
+        Self::try_new_with_schema(expr, input, schema)
+    }
+
+    /// Create a projection on an input with an explicit output schema.
+    pub fn try_new_with_schema(
+        expr: Vec<(Arc<dyn PhysicalExpr>, String)>,
+        input: Arc<dyn ExecutionPlan>,
+        schema: SchemaRef,
+    ) -> Result<Self> {
+        let input_schema = input.schema();
         // Construct a map from the input expressions to the output expression of the Projection
         let projection_mapping = ProjectionMapping::try_new(&expr, &input_schema)?;
         let cache =
@@ -222,6 +235,16 @@ impl ExecutionPlan for ProjectionExec {
             .all(|(e, _)| e.as_any().is::<Column>() || e.as_any().is::<Literal>());
         // If expressions are all either column_expr or Literal, then all computations in this projection are reorder or rename,
         // and projection would not benefit from the repartition, benefits_from_input_partitioning will return false.
+        
+        // Also, if this is a projection over a PIVOT-derived aggregate, we should return false to prevent
+        // projection pushdown from attempting to push this projection down and causing schema mismatches
+        if let Some(agg_exec) = self.input.as_any().downcast_ref::<AggregateExec>() {
+            if agg_exec.group_expr().expr().len() < self.input.schema().fields().len() {
+                // This is a PIVOT-derived aggregate
+                return vec![false];
+            }
+        }
+        
         vec![!all_simple_exprs]
     }
 
@@ -259,16 +282,25 @@ impl ExecutionPlan for ProjectionExec {
         CardinalityEffect::Equal
     }
 
+    /// Tries to push `projection` down through `union`. If possible, performs the
+    /// pushdown and returns a new [`UnionExec`] as the top plan which has projections
+    /// as its children. Otherwise, returns `None`.
     fn try_swapping_with_projection(
         &self,
         projection: &ProjectionExec,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+        // Don't push projections through PIVOT-derived aggregates
+        if is_projection_on_pivot_aggregate(self.input().as_ref()) {
+            return Ok(None);
+        }
+
         let maybe_unified = try_unifying_projections(projection, self)?;
         if let Some(new_plan) = maybe_unified {
             // To unify 3 or more sequential projections:
             remove_unnecessary_projections(new_plan).data().map(Some)
         } else {
-            Ok(Some(Arc::new(projection.clone())))
+            // If unification failed, it means the swap is not possible
+            Ok(None)
         }
     }
 }
@@ -409,6 +441,7 @@ pub fn try_embed_projection<Exec: EmbeddedProjection + 'static>(
     {
         return Ok(None);
     }
+    return Ok(None);
 
     let new_execution_plan =
         Arc::new(execution_plan.with_projection(Some(projection_index.to_vec()))?);
@@ -918,7 +951,7 @@ fn collect_column_indices(exprs: &[(Arc<dyn PhysicalExpr>, String)]) -> Vec<usiz
         .iter()
         .flat_map(|(expr, _)| collect_columns(expr))
         .map(|x| x.index())
-        .collect::<std::collections::HashSet<_>>()
+        .collect::<HashSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
     indices.sort();
@@ -1006,6 +1039,26 @@ fn new_columns_for_join_on(
 fn is_expr_trivial(expr: &Arc<dyn PhysicalExpr>) -> bool {
     expr.as_any().downcast_ref::<Column>().is_some()
         || expr.as_any().downcast_ref::<Literal>().is_some()
+}
+
+/// Checks if the given plan is a projection on a PIVOT-derived aggregate.
+/// This function checks if the plan itself is an aggregate derived from a PIVOT,
+/// or if it's a projection and its input is an aggregate derived from a PIVOT.
+fn is_projection_on_pivot_aggregate<T: ExecutionPlan + ?Sized>(plan: &T) -> bool {
+    // Check if the schema has the PIVOT marker
+    if plan.schema().metadata().contains_key("is_pivot_derived") {
+        return true;
+    }
+    
+    if let Some(agg_exec) = plan.as_any().downcast_ref::<AggregateExec>() {
+        // This is an AggregateExec that might be a PIVOT-derived aggregate
+        agg_exec.group_expr().expr().len() < plan.schema().fields().len()
+    } else if let Some(proj_exec) = plan.as_any().downcast_ref::<ProjectionExec>() {
+        // Check if the projection's input is a PIVOT-derived aggregate
+        is_projection_on_pivot_aggregate(proj_exec.input().as_ref())
+    } else {
+        false
+    }
 }
 
 #[cfg(test)]

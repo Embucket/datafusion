@@ -33,6 +33,7 @@ use arrow::datatypes::Field;
 
 mod join;
 
+
 impl<S: ContextProvider> SqlToRel<'_, S> {
     /// Create a `LogicalPlan` that scans the named relation
     fn create_relation(
@@ -169,7 +170,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 if aggregate_functions.len() != 1 {
                     return plan_err!("PIVOT requires exactly one aggregate function");
                 }
-                
+
                 let agg_expr = self.sql_expr_to_logical_expr(
                     aggregate_functions[0].expr.clone(),
                     input_plan.schema(),
@@ -221,10 +222,9 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                         (pivot_plan, alias)
                     },
                     sqlparser::ast::PivotValueSource::Any(order_by) => {
-                        let pivot_values = Vec::new(); 
-
+                        let pivot_values = Vec::new();
                         let input_arc = Arc::new(input_plan);
-
+                        
                         let mut subquery_builder = LogicalPlanBuilder::from(input_arc.as_ref().clone())
                             .project(vec![Expr::Column(pivot_column.clone())])? // Select only the pivot column
                             .distinct()?; // Get distinct values
@@ -262,23 +262,22 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                             &pivot_column,
                             &pivot_values
                         )?;
-
+                        
                         let pivot_plan = LogicalPlan::Pivot(datafusion_expr::Pivot {
                             input: input_arc,
                             aggregate_expr: agg_expr,
                             pivot_column,
-                            pivot_values,
+                            pivot_values: Vec::new(),
                             schema: Arc::new(schema),
                             value_subquery: Some(Arc::new(subquery_plan)), // Pass the subquery with sorting
                         });
-
+                        
                         (pivot_plan, alias)
                     },
                     sqlparser::ast::PivotValueSource::Subquery(subquery) => {
-                        let subquery_plan = self.query_to_plan(*subquery.clone(), planner_context)?;
-                        
                         let input_arc = Arc::new(input_plan);
-                        
+                        let subquery_plan = self.query_to_plan(*subquery.clone(), planner_context)?;
+
                         let pivot_values = Vec::new();
                         
                         let schema = derive_pivot_schema(
@@ -482,7 +481,7 @@ pub fn transform_pivot_to_aggregate(
         .map(|col| Expr::Column(col))
         .collect();
     
-    let mut builder = LogicalPlanBuilder::from(Arc::unwrap_or_clone(input.clone()));
+    let builder = LogicalPlanBuilder::from(Arc::unwrap_or_clone(input.clone()));
 
     let pivot_values = match pivot_values {
         Some(values) => {
@@ -494,12 +493,21 @@ pub fn transform_pivot_to_aggregate(
         None => {
             // With dynamic pivot values (ANY or SUBQUERY), we should not transform to aggregate yet
             // Instead, return a special PIVOT node that will be handled during physical planning
+            let mut meta = df_schema.metadata().clone();
+            meta.insert("is_pivot_derived".to_string(), "true".to_string());
+            
+            // Create a new schema with the metadata
+            let fields = df_schema.fields().iter()
+                .map(|f| (None as Option<TableReference>, f.clone()))
+                .collect::<Vec<_>>();
+            let new_schema = DFSchema::new_with_metadata(fields, meta)?;
+            
             return Ok(LogicalPlan::Pivot(datafusion_expr::Pivot {
                 input: input.clone(),
                 aggregate_expr: aggregate_expr.clone(),
                 pivot_column: pivot_column.clone(),
                 pivot_values: vec![],
-                schema: df_schema.clone(),
+                schema: Arc::new(new_schema),
                 value_subquery: value_subquery,
             }));
         }
@@ -541,7 +549,50 @@ pub fn transform_pivot_to_aggregate(
     }
     
     // Create the aggregate plan with GROUP BY and filtered aggregates
-    let aggregate_plan = builder.aggregate(group_by_columns, aggregate_exprs)?.build()?;
+    let mut aggregate_plan = builder.aggregate(group_by_columns.clone(), aggregate_exprs)?.build()?;
+
+    // Add metadata marking this as a PIVOT-derived aggregation
+    if let LogicalPlan::Aggregate(aggr) = &aggregate_plan {
+        let mut meta = aggr.schema.as_ref().metadata().clone();
+        meta.insert("is_pivot_derived".to_string(), "true".to_string());
+        
+        // Create a new schema with the metadata
+        let fields = aggr.schema.fields().iter()
+            .map(|f| (None as Option<TableReference>, f.clone()))
+            .collect::<Vec<_>>();
+        let new_schema = DFSchema::new_with_metadata(fields, meta)?;
+        
+        aggregate_plan = LogicalPlan::Aggregate(datafusion_expr::Aggregate::try_new_with_schema(
+            aggr.input.clone(),
+            aggr.group_expr.clone(),
+            aggr.aggr_expr.clone(),
+            Arc::new(new_schema),
+        )?);
+    }
+   // Ok(aggregate_plan)
     
-    Ok(aggregate_plan)
+    // Add an explicit projection that includes all columns from the aggregate output
+    // This ensures that the schema is fully defined for subsequent operations
+    let mut projection_exprs = Vec::new();
+    
+    // Add all group by columns first
+    for col in &group_by_columns {
+        if let Expr::Column(column) = col {
+            projection_exprs.push(Expr::Column(column.clone()));
+        }
+    }
+    
+    // Add all pivot value columns
+    for value in &pivot_values {
+        let field_name = value.to_string().trim_matches('\'').to_string();
+        projection_exprs.push(Expr::Column(Column::new(None::<&str>, field_name)));
+    }
+    
+    // Build the final projection
+    let projection_plan = LogicalPlanBuilder::from(aggregate_plan)
+        .project(projection_exprs)?
+        .build()?;
+
+    Ok(projection_plan)
+
 }

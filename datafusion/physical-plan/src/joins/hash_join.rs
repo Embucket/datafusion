@@ -375,7 +375,9 @@ impl HashJoinExec {
         null_equals_null: bool,
     ) -> Result<Self> {
         let left_schema = left.schema();
+        println!("LEFT SCHEMA HASHJOIN415: {:?}", left_schema);
         let right_schema = right.schema();
+        println!("RIGH SCHEMA HASHJOIN416: {:?}", right_schema);
         if on.is_empty() {
             return plan_err!("On constraints in HashJoinExec should be non-empty");
         }
@@ -401,6 +403,8 @@ impl HashJoinExec {
             partition_mode,
             projection.as_ref(),
         )?;
+
+        println!("JOINSCHEMA418: {:?}", join_schema);
 
         Ok(HashJoinExec {
             left,

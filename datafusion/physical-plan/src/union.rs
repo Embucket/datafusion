@@ -38,6 +38,7 @@ use crate::execution_plan::{
 use crate::metrics::BaselineMetrics;
 use crate::projection::{make_with_child, ProjectionExec};
 use crate::stream::ObservedStream;
+use crate::aggregates::AggregateExec;
 
 use arrow::datatypes::{Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
@@ -290,6 +291,11 @@ impl ExecutionPlan for UnionExec {
             return Ok(None);
         }
 
+        // Don't push projections through PIVOT-derived aggregates
+        if is_projection_on_pivot_aggregate(self) {
+            return Ok(None);
+        }
+
         let new_children = self
             .children()
             .into_iter()
@@ -486,6 +492,37 @@ impl ExecutionPlan for InterleaveExec {
     fn benefits_from_input_partitioning(&self) -> Vec<bool> {
         vec![false; self.children().len()]
     }
+    
+    /// Tries to push `projection` down through `interleave`. If possible, performs the
+    /// pushdown and returns a new [`InterleaveExec`] as the top plan which has projections
+    /// as its children. Otherwise, returns `None`.
+    fn try_swapping_with_projection(
+        &self,
+        projection: &ProjectionExec,
+    ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+        // If the projection doesn't narrow the schema, we shouldn't try to push it down.
+        if projection.expr().len() >= projection.input().schema().fields().len() {
+            return Ok(None);
+        }
+
+        // Don't push projections through PIVOT-derived aggregates
+        if is_projection_on_pivot_aggregate(self) {
+            return Ok(None);
+        }
+
+        let new_children = self
+            .children()
+            .into_iter()
+            .map(|child| make_with_child(projection, child))
+            .collect::<Result<Vec<_>>>()?;
+
+        // Only create a new InterleaveExec if all the children are still interleavable
+        if !can_interleave(new_children.iter()) {
+            return Ok(None);
+        }
+
+        Ok(Some(Arc::new(InterleaveExec::try_new(new_children)?)))
+    }
 }
 
 /// If all the input partitions have the same Hash partition spec with the first_input_partition
@@ -636,6 +673,26 @@ fn stats_union(mut left: Statistics, right: Statistics) -> Statistics {
         .map(|(a, b)| col_stats_union(a, b))
         .collect::<Vec<_>>();
     left
+}
+
+/// Checks if the given plan is a projection on a PIVOT-derived aggregate.
+/// This function checks if the plan itself is an aggregate derived from a PIVOT,
+/// or if it's a projection and its input is an aggregate derived from a PIVOT.
+fn is_projection_on_pivot_aggregate<T: ExecutionPlan + ?Sized>(plan: &T) -> bool {
+    // Check if the schema has the PIVOT marker
+    if plan.schema().metadata().contains_key("is_pivot_derived") {
+        return true;
+    }
+    
+    if let Some(agg_exec) = plan.as_any().downcast_ref::<AggregateExec>() {
+        // This is an AggregateExec that might be a PIVOT-derived aggregate
+        agg_exec.group_expr().expr().len() < plan.schema().fields().len()
+    } else if let Some(proj_exec) = plan.as_any().downcast_ref::<ProjectionExec>() {
+        // Check if the projection's input is a PIVOT-derived aggregate
+        is_projection_on_pivot_aggregate(proj_exec.input().as_ref())
+    } else {
+        false
+    }
 }
 
 #[cfg(test)]
