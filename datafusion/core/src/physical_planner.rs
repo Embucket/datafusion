@@ -2078,108 +2078,86 @@ impl DefaultPhysicalPlanner {
         &self,
         session_state: &SessionState,
         input_exec: Arc<dyn ExecutionPlan>,
-        input: &Arc<LogicalPlan>, // Keep logical input for schema context if needed
+        input: &Arc<LogicalPlan>,
         expr: &[Expr],
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let input_logical_schema = input.as_ref().schema();
-
-        // Attempt to detect if the physical input is a PIVOT-derived AggregateExec.
-        if let Some(agg_exec) = input_exec.as_any().downcast_ref::<AggregateExec>() {
-            let agg_schema = agg_exec.schema();
-            let group_by_len = agg_exec.group_expr().expr().len();
-
-            // Heuristic check for PIVOT result: requires group by columns and additional pivoted columns.
-            if group_by_len > 0 && group_by_len < agg_schema.fields().len() {
-                // PIVOT aggregate detected. Reconstruct the projection to ensure all output columns
-                // from the aggregate are included, potentially overriding user's complex expressions
-                // to avoid index mismatches.
-
-                // Get the names of columns originally projected by the user (using original logical exprs)
-                // This helps decide whether to include group-by columns if the user projected specific columns.
-                let projected_names: std::collections::HashSet<String> = expr
-                    .iter()
-                    .map(physical_name)
-                    .collect::<Result<_>>()?;
-
-                let mut final_physical_exprs = vec![];
-
-                // 1. Include columns corresponding to the group-by expressions.
-                //    We include them only if the user projected them explicitly OR if the projection was SELECT *.
-                for (i, (_group_expr, group_name)) in agg_exec.group_expr().expr().iter().enumerate() {
-                    // Check if the *original* logical projection included this group column name.
-                    if expr.is_empty() || projected_names.contains(group_name) {
-                        final_physical_exprs.push((
-                            Arc::new(crate::physical_plan::expressions::Column::new(group_name, i)) as Arc<dyn PhysicalExpr>,
-                            group_name.clone(),
-                        ));
-                    } else {
-                        // If user projected specific columns and didn't include this group-by column,
-                        // respect that and don't add it automatically.
-                    }
-                }
-
-                // 2. Include all pivot value columns (those after group by columns in agg schema).
-                //    These are always included because they are the core result of the PIVOT.
-                for (i, field) in agg_schema.fields().iter().enumerate().skip(group_by_len) {
-                    final_physical_exprs.push((
-                        Arc::new(crate::physical_plan::expressions::Column::new(field.name(), i)) as Arc<dyn PhysicalExpr>,
-                        field.name().clone(),
-                    ));
-                }
-
-                // Determine the schema for the new ProjectionExec based on the fields we decided to include.
-                let final_fields = final_physical_exprs
-                    .iter()
-                    .map(|(_expr, name)| agg_schema.field_with_name(name).cloned())
-                    .collect::<Result<Vec<_>, _>>()?; // This might fail if a name isn't found, but shouldn't with this logic.
-                
-                // Add metadata marker to indicate this projection is derived from a PIVOT
-                let mut metadata = input_exec.schema().metadata().clone(); // Start with input metadata
-                // TODO: THIS CAN BE USEFUL
-                //metadata.insert("is_pivot_derived_projection".to_string(), "true".to_string());
-                let final_schema = Arc::new(Schema::new_with_metadata(final_fields, metadata));
-
-                // Use the reconstructed expressions, which are guaranteed to be valid Columns
-                // referring to the AggregateExec's output schema.
-                // We need to create a new ProjectionExec with the potentially adjusted schema.
-                // Note: This approach might drop complex expressions if user projected `f(pivot_col)`.
-                return Ok(Arc::new(ProjectionExec::try_new_with_schema(
-                    final_physical_exprs,
-                    input_exec,
-                    final_schema, // Pass schema derived from the fields we are projecting
-                )?));
-            }
-        }
-
-        // Default case (Not detected as PIVOT): Create projection using original logic.
-        // This still assumes logical_schema and input_exec.schema() are compatible enough
-        // for the indices used in `create_physical_expr` to be valid.
+        let input_schema = input.as_ref().schema();
         let physical_exprs = expr
             .iter()
             .map(|e| {
+                // For projections, SQL planner and logical plan builder may convert user
+                // provided expressions into logical Column expressions if their results
+                // are already provided from the input plans. Because we work with
+                // qualified columns in logical plane, derived columns involve operators or
+                // functions will contain qualifiers as well. This will result in logical
+                // columns with names like `SUM(t1.c1)`, `t1.c1 + t1.c2`, etc.
+                //
+                // If we run these logical columns through physical_name function, we will
+                // get physical names with column qualifiers, which violates DataFusion's
+                // field name semantics. To account for this, we need to derive the
+                // physical name from physical input instead.
+                //
+                // This depends on the invariant that logical schema field index MUST match
+                // with physical schema field index.
                 let physical_name = if let Expr::Column(col) = e {
-                    match input_logical_schema.index_of_column(col) {
+                    match input_schema.index_of_column(col) {
                         Ok(idx) => {
-                            if idx < input_exec.schema().fields().len() {
-                                Ok(input_exec.schema().field(idx).name().to_string())
-                            } else {
-                                // Fallback if index out of bounds
-                                physical_name(e)
-                            }
+                            // index physical field using logical field index
+                            Ok(input_exec.schema().field(idx).name().to_string())
                         }
-                        Err(_) => physical_name(e), // Not found in logical schema, use original name logic
+                        // logical column is not a derived column, safe to pass along to
+                        // physical_name
+                        Err(_) => physical_name(e),
                     }
                 } else {
                     physical_name(e)
                 };
 
                 tuple_err((
-                    self.create_physical_expr(e, input_logical_schema, session_state),
+                    self.create_physical_expr(e, input_schema, session_state),
                     physical_name,
                 ))
             })
             .collect::<Result<Vec<_>>>()?;
 
+        // Check if input plan was transformed from a PIVOT operation
+        // The original logical plan will be a LogicalPlan::Pivot that has been transformed to an Aggregate
+        match input.as_ref() {
+            // Direct PIVOT
+            LogicalPlan::Pivot(_) => {
+                // When we detect a PIVOT-derived plan, ensure all generated columns are preserved
+                if input_exec.as_any().downcast_ref::<AggregateExec>().is_some() {
+                    let agg_exec = input_exec.as_any().downcast_ref::<AggregateExec>().unwrap();
+                    let schema = input_exec.schema();
+                    let group_by_len = agg_exec.group_expr().expr().len();
+
+                    // If we have aggregate expressions that correspond to pivot columns
+                    if group_by_len < schema.fields().len() {
+                        // This is a pivot result - we need to include all columns from the aggregate
+                        let mut all_exprs = physical_exprs.clone();
+
+                        // Add any missing pivot columns (which are all columns after the group_by columns)
+                        for (i, field) in schema.fields().iter().enumerate().skip(group_by_len) {
+                            // Check if this column is already included in the projection
+                            if !physical_exprs.iter().any(|(_, name)| name == field.name()) {
+                                // Add this pivot column to the projection
+                                all_exprs.push((
+                                    Arc::new(crate::physical_plan::expressions::Column::new(field.name(), i)) as Arc<dyn PhysicalExpr>,
+                                    field.name().clone(),
+                                ));
+                            }
+                        }
+
+                        return Ok(Arc::new(ProjectionExec::try_new(
+                            all_exprs,
+                            input_exec,
+                        )?));
+                    }
+                }
+            },
+           _ => {}
+        }
+        
         Ok(Arc::new(ProjectionExec::try_new(
             physical_exprs,
             input_exec,
@@ -2429,8 +2407,6 @@ mod tests {
         let plan = plan(&logical_plan).await?;
 
         // c12 is f64, c7 is u8 -> cast c7 to f64
-        // the cast here is implicit so has CastOptions with safe=true
-        // the cast from u8 to i64 for literal will be simplified, and get lit(int64(5))
         // the cast here is implicit so has CastOptions with safe=true
         let _expected = "predicate: BinaryExpr { left: TryCastExpr { expr: Column { name: \"c7\", index: 6 }, cast_type: Float64 }, op: Lt, right: Column { name: \"c12\", index: 11 } }";
         let plan_debug_str = format!("{plan:?}");

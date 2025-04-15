@@ -27,7 +27,6 @@ use crate::PhysicalOptimizerRule;
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::tree_node::{TransformedResult, TreeNode};
 use datafusion_common::Result;
-use datafusion_physical_plan::aggregates::AggregateExec;
 use datafusion_physical_plan::projection::remove_unnecessary_projections;
 use datafusion_physical_plan::ExecutionPlan;
 
@@ -59,22 +58,4 @@ impl PhysicalOptimizerRule for ProjectionPushdown {
     fn schema_check(&self) -> bool {
         true
     }
-}
-
-/// Check if the execution plan contains a PIVOT-derived aggregate
-fn contains_pivot_derived_aggregate<T: ExecutionPlan + ?Sized>(plan: &T) -> bool {
-    // Check if the schema has the PIVOT marker
-    if plan.schema().metadata().contains_key("is_pivot_derived") {
-        return true;
-    }
-
-    // Check using our existing heuristic
-    if let Some(agg_exec) = plan.as_any().downcast_ref::<AggregateExec>() {
-        if agg_exec.group_expr().expr().len() < plan.schema().fields().len() {
-            return true;
-        }
-    }
-    
-    // Recursively check children
-    plan.children().iter().any(|child| contains_pivot_derived_aggregate(child.as_ref()))
 }
