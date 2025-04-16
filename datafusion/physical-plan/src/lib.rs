@@ -72,7 +72,6 @@ pub mod limit;
 pub mod memory;
 pub mod metrics;
 pub mod placeholder_row;
-pub mod pivot;
 pub mod projection;
 pub mod recursive_query;
 pub mod repartition;
