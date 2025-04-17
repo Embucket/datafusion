@@ -24,6 +24,7 @@ use std::fs::metadata;
 use std::hash::{Hash, Hasher};
 use std::str::FromStr;
 use std::sync::{Arc, LazyLock};
+use serde::{Serialize, Deserialize};
 
 use super::dml::CopyTo;
 use super::invariants::{
@@ -763,7 +764,7 @@ impl LogicalPlan {
                 pivot_values,
                 schema,
                 value_subquery,
-                ..
+                pivot_config
             }) => {
                 // Create Pivot with the same value_subquery
                 let new_pivot = if let Some(subquery) = value_subquery {
@@ -774,6 +775,7 @@ impl LogicalPlan {
                         pivot_values: pivot_values.clone(),
                         schema: schema.clone(),
                         value_subquery: Some(Arc::clone(&subquery)),
+                        pivot_config: pivot_config.clone(),
                     }
                 } else {
                     Pivot::try_new(
@@ -1179,23 +1181,26 @@ impl LogicalPlan {
                 Ok(new_plan)
             }
             LogicalPlan::Pivot(Pivot {
+                input,
                 aggregate_expr,
                 pivot_column,
                 pivot_values,
                 schema,
                 value_subquery,
-                ..
+                pivot_config
             }) => {
                 let input = self.only_input(inputs)?;
                 let new_aggregate_expr = self.only_expr(expr)?;
                 
                 // Create Pivot with the same value_subquery
                 let new_pivot = if let Some(subquery) = value_subquery {
-                    Pivot::try_new_with_subquery(Arc::new(input),
-                                                 new_aggregate_expr,
-                                                 pivot_column.clone(),
-                                                 subquery.clone())?
-
+                    Pivot::try_new_with_subquery(
+                        Arc::new(input),
+                        new_aggregate_expr,
+                        pivot_column.clone(),
+                        subquery.clone(),
+                        pivot_config.clone()
+                    )?
                 } else {
                     Pivot::try_new(
                         Arc::new(input),
@@ -2292,6 +2297,31 @@ pub struct Pivot {
     /// When provided, this will be executed during physical planning
     /// to dynamically determine the pivot values
     pub value_subquery: Option<Arc<LogicalPlan>>,
+    /// Placeholder information for dynamic pivot
+    /// Unlike the unnest pattern with multiple placeholders, 
+    /// pivot operation only needs a single placeholder configuration
+    pub pivot_config: Option<PivotConfig>,
+}
+
+/// Define the metadata for pivot operation
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd)]
+pub struct PivotConfig {
+    /// Name of the aggregate expression
+    pub agg_expr_name: String,
+    /// Data type of the aggregate
+    pub column_type: String, // Use String instead of DataType for serialization
+    /// Name of the pivot column
+    pub pivot_column_name: String,
+    /// Name of the pivot placeholder column
+    pub placeholder_name: String,
+}
+
+/// Define the metadata for pivot columns
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PivotColumnInfo {
+    pub agg_expr_name: String,
+    pub column_type: DataType,
+    pub pivot_value: Option<ScalarValue>,
 }
 
 impl PartialOrd for Pivot {
@@ -2302,6 +2332,7 @@ impl PartialOrd for Pivot {
             &self.pivot_column,
             &self.pivot_values,
             &self.value_subquery,
+            &self.pivot_config,
         );
         let other_tuple = (
             &other.input,
@@ -2309,6 +2340,7 @@ impl PartialOrd for Pivot {
             &other.pivot_column,
             &other.pivot_values,
             &other.value_subquery,
+            &other.pivot_config,
         );
         self_tuple.partial_cmp(&other_tuple)
     }
@@ -2335,6 +2367,7 @@ impl Pivot {
             pivot_values,
             schema: Arc::new(schema),
             value_subquery: None,
+            pivot_config: None,
         })
     }
     
@@ -2344,6 +2377,7 @@ impl Pivot {
         aggregate_expr: Expr,
         pivot_column: Column,
         value_subquery: Arc<LogicalPlan>,
+        pivot_config: Option<PivotConfig>,
     ) -> Result<Self> {
         // Create an empty schema - will be filled in when the subquery is executed
         let schema = pivot_schema_without_values(
@@ -2359,6 +2393,7 @@ impl Pivot {
             pivot_values: Vec::new(), // Will be populated during physical planning
             schema: Arc::new(schema),
             value_subquery: Some(value_subquery),
+            pivot_config,
         })
     }
 }

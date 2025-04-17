@@ -59,6 +59,17 @@ impl ProjectionMapping {
                 Arc::clone(expression)
                     .transform_down(|e| match e.as_any().downcast_ref::<Column>() {
                         Some(col) => {
+                            // Handle pivot placeholder specially - allow for mismatch between
+                            // expression name and input schema, since the actual names are generated at runtime
+                            if col.name().contains("__pivot_placeholder") {
+                                // For pivot placeholders, create the mapping without checking the name
+                                let idx = col.index();
+                                let matching_input_field = input_schema.field(idx);
+                                let matching_input_column =
+                                    Column::new(matching_input_field.name(), idx);
+                                return Ok(Transformed::yes(Arc::new(matching_input_column)))
+                            }
+                            
                             // Sometimes, an expression and its name in the input_schema
                             // doesn't match. This can cause problems, so we make sure
                             // that the expression name matches with the name in `input_schema`.

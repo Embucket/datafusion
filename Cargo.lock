@@ -2187,6 +2187,7 @@ dependencies = [
  "indexmap 2.7.1",
  "paste",
  "recursive",
+ "serde",
  "serde_json",
  "sqlparser",
 ]
@@ -2519,6 +2520,7 @@ dependencies = [
  "recursive",
  "regex",
  "rstest",
+ "serde_json",
  "sqlparser",
 ]
 
