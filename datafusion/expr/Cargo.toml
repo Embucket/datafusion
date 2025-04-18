@@ -54,7 +54,6 @@ paste = "^1.0"
 recursive = { workspace = true, optional = true }
 serde_json = { workspace = true }
 sqlparser = { workspace = true }
-serde = { version = "1.0", features = ["derive"] }
 
 [dev-dependencies]
 ctor = { workspace = true }

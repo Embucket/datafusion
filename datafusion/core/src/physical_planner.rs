@@ -2100,20 +2100,14 @@ impl DefaultPhysicalPlanner {
                 // This depends on the invariant that logical schema field index MUST match
                 // with physical schema field index.
                 let physical_name = if let Expr::Column(col) = e {
-                    // Special handling for pivot placeholder columns
-                    if col.name.contains("__pivot_placeholder") {
-                        // Keep the placeholder name as is
-                        Ok(col.name.clone())
-                    } else {
-                        match input_schema.index_of_column(col) {
-                            Ok(idx) => {
-                                // index physical field using logical field index
-                                Ok(input_exec.schema().field(idx).name().to_string())
-                            }
-                            // logical column is not a derived column, safe to pass along to
-                            // physical_name
-                            Err(_) => physical_name(e),
+                    match input_schema.index_of_column(col) {
+                        Ok(idx) => {
+                            // index physical field using logical field index
+                            Ok(input_exec.schema().field(idx).name().to_string())
                         }
+                        // logical column is not a derived column, safe to pass along to
+                        // physical_name
+                        Err(_) => physical_name(e),
                     }
                 } else {
                     physical_name(e)

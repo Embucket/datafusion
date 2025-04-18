@@ -16,24 +16,20 @@
 // under the License.
 
 use std::sync::Arc;
-use std::collections::{BTreeMap, HashMap};
 
 use crate::planner::{ContextProvider, PlannerContext, SqlToRel};
-use crate::utils::{register_pivot_placeholder, PIVOT_PLACEHOLDER};
 
 use datafusion_common::tree_node::{Transformed, TreeNode};
 use datafusion_common::{
     not_impl_err, plan_err, DFSchema, Diagnostic, Result, Span, Spans, TableReference,
-    Column, DFSchemaRef, ScalarValue, DataFusionError,
+    Column, DFSchemaRef, ScalarValue,
 };
 use datafusion_expr::builder::subquery_alias;
 use datafusion_expr::{expr::Unnest, Expr, LogicalPlan, LogicalPlanBuilder, Sort};
 use datafusion_expr::expr::{AggregateFunction, BinaryExpr, Alias, AggregateFunctionParams};
-use datafusion_expr::{Subquery, SubqueryAlias, Operator, PivotConfig};
+use datafusion_expr::{Subquery, SubqueryAlias, Operator};
 use sqlparser::ast::{FunctionArg, FunctionArgExpr, Spanned, TableFactor};
-use arrow::datatypes::{Field, Schema, SchemaRef};
-use serde_json;
-
+use arrow::datatypes::Field;
 
 mod join;
 
@@ -220,21 +216,14 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                             pivot_values,
                             schema: Arc::new(schema),
                             value_subquery: None,
-                            pivot_config: None,
                         });
                         
                         (pivot_plan, alias)
                     },
                     sqlparser::ast::PivotValueSource::Any(order_by) => {
-                        let pivot_values: Vec<ScalarValue> = Vec::new(); 
+                        let pivot_values = Vec::new(); 
 
                         let input_arc = Arc::new(input_plan);
-                        
-                        let pivot_config = register_pivot_placeholder(
-                            &agg_expr, 
-                            &pivot_column,
-                            input_arc.schema()
-                        )?;
 
                         let mut subquery_builder = LogicalPlanBuilder::from(input_arc.as_ref().clone())
                             .project(vec![Expr::Column(pivot_column.clone())])? // Select only the pivot column
@@ -267,11 +256,11 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                         
                         let subquery_plan = subquery_builder.build()?;
 
-                        let schema = derive_dynamic_pivot_schema(
+                        let schema = derive_pivot_schema(
                             input_arc.schema(),
                             &agg_expr,
                             &pivot_column,
-                            &pivot_config
+                            &pivot_values
                         )?;
 
                         let pivot_plan = LogicalPlan::Pivot(datafusion_expr::Pivot {
@@ -280,8 +269,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                             pivot_column,
                             pivot_values,
                             schema: Arc::new(schema),
-                            value_subquery: Some(Arc::new(subquery_plan)),
-                            pivot_config: Some(pivot_config),
+                            value_subquery: Some(Arc::new(subquery_plan)), // Pass the subquery with sorting
                         });
 
                         (pivot_plan, alias)
@@ -291,17 +279,13 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                         
                         let input_arc = Arc::new(input_plan);
                         
-                        let pivot_config = register_pivot_placeholder(
-                            &agg_expr, 
-                            &pivot_column,
-                            input_arc.schema()
-                        )?;
-
-                        let schema = derive_dynamic_pivot_schema(
+                        let pivot_values = Vec::new();
+                        
+                        let schema = derive_pivot_schema(
                             input_arc.schema(),
                             &agg_expr,
                             &pivot_column,
-                            &pivot_config
+                            &pivot_values
                         )?;
                         
                         let pivot_plan = LogicalPlan::Pivot(
@@ -310,7 +294,6 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                                 agg_expr,
                                 pivot_column,
                                 Arc::new(subquery_plan),
-                                Some(pivot_config)
                             )?
                         );
                         
@@ -454,45 +437,6 @@ pub fn derive_pivot_schema(
     DFSchema::new_with_metadata(new_fields, input_schema.metadata().clone())
 }
 
-pub fn derive_dynamic_pivot_schema(
-    input_schema: &DFSchemaRef,
-    agg_expr: &Expr,
-    pivot_column: &Column,
-    pivot_config: &PivotConfig
-) -> Result<DFSchema> {
-    use datafusion_expr::ExprSchemable;
-    
-    let field_type = agg_expr.get_type(input_schema.as_ref())?;
-    
-    let mut new_fields = Vec::<(Option<TableReference>, Arc<Field>)>::new();
-
-    // Include all input columns except pivot column and agg columns
-    for field in input_schema.fields().iter() {
-        if field.name() != pivot_column.name() && 
-           !agg_expr.column_refs().iter().any(|col| col.name() == field.name()) {
-            new_fields.push((None, field.clone()));
-        }
-    }
-    
-    // Add a placeholder field 
-    let field = Field::new(
-        pivot_config.placeholder_name.clone(), 
-        field_type.clone(), 
-        true
-    );
-    new_fields.push((None, Arc::new(field)));
-    
-    // Create the schema with metadata including pivot config
-    let mut metadata = input_schema.metadata().clone();
-    metadata.insert(
-        "pivot_config".to_string(), 
-        serde_json::to_string(pivot_config)
-            .map_err(|e| DataFusionError::External(Box::new(e)))?
-    );
-    
-    DFSchema::new_with_metadata(new_fields, metadata)
-}
-
 /// Transform a PIVOT operation into a more standard Aggregate + Projection plan
 ///
 /// This follows the DuckDB approach of using filter conditions with aggregates.
@@ -513,8 +457,9 @@ pub fn derive_dynamic_pivot_schema(
 /// 2. Create a dedicated PIVOT logical plan node that is transformed during planning
 ///    into the appropriate physical operator at execution time
 ///
-/// The implementation follows a hybrid approach, where ANY and SUBQUERY cases will
-/// be transformed during physical planning, while static values are transformed here.
+/// The current implementation follows option 1, but has limitations. A more complete 
+/// implementation would use option 2, which would require changes to both the logical 
+/// and physical planner.
 pub fn transform_pivot_to_aggregate(
     input: Arc<LogicalPlan>,
     aggregate_expr: &Expr,
@@ -539,30 +484,6 @@ pub fn transform_pivot_to_aggregate(
     
     let mut builder = LogicalPlanBuilder::from(Arc::unwrap_or_clone(input.clone()));
 
-    // For ANY or SUBQUERY case, preserve the placeholder in the schema
-    if pivot_values.is_none() || value_subquery.is_some() {
-        // Create a special PIVOT node that will be handled during physical planning
-        let pivot_config = match &value_subquery {
-            Some(_) => register_pivot_placeholder(aggregate_expr, pivot_column, df_schema)?,
-            None => PivotConfig {
-                agg_expr_name: format!("{}", aggregate_expr),
-                column_type: "unknown".to_string(),
-                pivot_column_name: pivot_column.name.clone(),
-                placeholder_name: format!("__pivot_placeholder({},{})", aggregate_expr, pivot_column.name),
-            }
-        };
-        
-        return Ok(LogicalPlan::Pivot(datafusion_expr::Pivot {
-            input: input.clone(),
-            aggregate_expr: aggregate_expr.clone(),
-            pivot_column: pivot_column.clone(),
-            pivot_values: vec![],
-            schema: df_schema.clone(),
-            value_subquery: value_subquery,
-            pivot_config: Some(pivot_config),
-        }));
-    }
-    
     let pivot_values = match pivot_values {
         Some(values) => {
             if values.is_empty() {
@@ -571,8 +492,16 @@ pub fn transform_pivot_to_aggregate(
             values
         },
         None => {
-            // This should not happen as we've handled the None case above
-            return plan_err!("PIVOT values not provided");
+            // With dynamic pivot values (ANY or SUBQUERY), we should not transform to aggregate yet
+            // Instead, return a special PIVOT node that will be handled during physical planning
+            return Ok(LogicalPlan::Pivot(datafusion_expr::Pivot {
+                input: input.clone(),
+                aggregate_expr: aggregate_expr.clone(),
+                pivot_column: pivot_column.clone(),
+                pivot_values: vec![],
+                schema: df_schema.clone(),
+                value_subquery: value_subquery,
+            }));
         }
     };
     

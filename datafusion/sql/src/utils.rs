@@ -18,7 +18,6 @@
 //! SQL Utility Functions
 
 use std::vec;
-use std::collections::{BTreeMap, HashMap, HashSet};
 
 use arrow::datatypes::{
     DataType, DECIMAL128_MAX_PRECISION, DECIMAL256_MAX_PRECISION, DECIMAL_DEFAULT_SCALE,
@@ -28,13 +27,12 @@ use datafusion_common::tree_node::{
 };
 use datafusion_common::{
     exec_err, internal_err, plan_err, Column, DFSchemaRef, DataFusionError, Diagnostic,
-    Result, ScalarValue,
+    HashMap, Result, ScalarValue,
 };
 use datafusion_expr::builder::get_struct_unnested_columns;
 use datafusion_expr::expr::{
     Alias, GroupingSet, Unnest, WindowFunction, WindowFunctionParams,
 };
-use datafusion_expr::logical_plan::Pivot;
 use datafusion_expr::utils::{expr_as_column_expr, find_column_exprs};
 use datafusion_expr::{
     col, expr_vec_fmt, ColumnUnnestList, Expr, ExprSchemable, LogicalPlan,
@@ -42,7 +40,6 @@ use datafusion_expr::{
 
 use indexmap::IndexMap;
 use sqlparser::ast::{Ident, Value};
-use datafusion_expr::PivotConfig;
 
 /// Make a best-effort attempt at resolving all columns in the expression tree
 pub(crate) fn resolve_columns(expr: &Expr, plan: &LogicalPlan) -> Result<Expr> {
@@ -656,32 +653,6 @@ pub(crate) fn rewrite_recursive_unnest_bottom_up(
         Ok(vec![transformed_expr])
     }
 }
-
-
-pub const PIVOT_PLACEHOLDER: &str = "__pivot_placeholder";
-
-pub fn register_pivot_placeholder(
-    agg_expr: &Expr,
-    pivot_column: &Column,
-    schema: &DFSchemaRef,
-) -> Result<PivotConfig> {
-    let agg_expr_name = format!("{}", agg_expr);
-    let column_type = match agg_expr.get_type(schema.as_ref()) {
-        Ok(data_type) => format!("{:?}", data_type),
-        Err(_) => "unknown".to_string(),
-    };
-    
-    let placeholder_name = format!("{PIVOT_PLACEHOLDER}({agg_expr_name},{column_name})", 
-                                  column_name = pivot_column.name);
-    
-    Ok(PivotConfig {
-        agg_expr_name,
-        column_type,  // Convert DataType to string
-        pivot_column_name: pivot_column.name.clone(),
-        placeholder_name,
-    })
-}
-
 
 #[cfg(test)]
 mod tests {

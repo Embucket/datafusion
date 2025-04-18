@@ -1022,8 +1022,7 @@ impl AsLogicalPlan for LogicalPlanNode {
                         pivot_column,
                         pivot_values,
                         schema,
-                        value_subquery: value_subquery,
-                        pivot_config: None,
+                        value_subquery: value_subquery
                     }
                 ))
             }

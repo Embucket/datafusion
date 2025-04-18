@@ -53,7 +53,6 @@ log = { workspace = true }
 recursive = { workspace = true, optional = true }
 regex = { workspace = true }
 sqlparser = { workspace = true }
-serde_json = { version = "1.0" }
 
 [dev-dependencies]
 ctor = { workspace = true }

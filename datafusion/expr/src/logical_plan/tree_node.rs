@@ -335,7 +335,6 @@ impl TreeNode for LogicalPlan {
                 pivot_values,
                 schema,
                 value_subquery,
-                pivot_config,
             }) => input.map_elements(f)?.update_data(|input| {
                 LogicalPlan::Pivot(Pivot {
                     input,
@@ -344,7 +343,6 @@ impl TreeNode for LogicalPlan {
                     pivot_values,
                     schema,
                     value_subquery,
-                    pivot_config,
                 })
             }),
             LogicalPlan::RecursiveQuery(RecursiveQuery {
@@ -671,7 +669,6 @@ impl LogicalPlan {
                 pivot_values,
                 schema,
                 value_subquery,
-                pivot_config,
             }) => f(aggregate_expr)?.update_data(|aggregate_expr| {
                 LogicalPlan::Pivot(Pivot {
                     input,
@@ -680,7 +677,6 @@ impl LogicalPlan {
                     pivot_values,
                     schema,
                     value_subquery,
-                    pivot_config,
                 })
             }),
             LogicalPlan::Statement(stmt) => match stmt {

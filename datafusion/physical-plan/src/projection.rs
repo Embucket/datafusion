@@ -21,7 +21,7 @@
 //! projection expressions. `SELECT` without `FROM` will only evaluate expressions.
 
 use std::any::Any;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -36,14 +36,13 @@ use crate::execution_plan::CardinalityEffect;
 use crate::joins::utils::{ColumnIndex, JoinFilter};
 use crate::{ColumnStatistics, DisplayFormatType, ExecutionPlan, PhysicalExpr};
 
-use arrow::array::ArrayRef;
-use arrow::datatypes::{Field, Schema, DataType, SchemaRef};
+use arrow::datatypes::{Field, Schema, SchemaRef};
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion_common::stats::Precision;
 use datafusion_common::tree_node::{
     Transformed, TransformedResult, TreeNode, TreeNodeRecursion,
 };
-use datafusion_common::{internal_err, JoinSide, Result, DataFusionError};
+use datafusion_common::{internal_err, JoinSide, Result};
 use datafusion_execution::TaskContext;
 use datafusion_physical_expr::equivalence::ProjectionMapping;
 use datafusion_physical_expr::utils::collect_columns;
@@ -53,9 +52,6 @@ use datafusion_physical_expr_common::physical_expr::fmt_sql;
 use futures::stream::{Stream, StreamExt};
 use itertools::Itertools;
 use log::trace;
-
-// Define constant here since we can't import it
-const PIVOT_PLACEHOLDER: &str = "__pivot_placeholder";
 
 /// Execution plan for a projection
 #[derive(Debug, Clone)]
@@ -240,7 +236,6 @@ impl ExecutionPlan for ProjectionExec {
             expr: self.expr.iter().map(|x| Arc::clone(&x.0)).collect(),
             input: self.input.execute(partition, context)?,
             baseline_metrics: BaselineMetrics::new(&self.metrics, partition),
-            projection_exec: Arc::new(self.clone()),
         }))
     }
 
@@ -330,13 +325,36 @@ fn stats_projection(
     stats
 }
 
+impl ProjectionStream {
+    fn batch_project(&self, batch: &RecordBatch) -> Result<RecordBatch> {
+        // Records time on drop
+        let _timer = self.baseline_metrics.elapsed_compute().timer();
+        let arrays = self
+            .expr
+            .iter()
+            .map(|expr| {
+                expr.evaluate(batch)
+                    .and_then(|v| v.into_array(batch.num_rows()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        if arrays.is_empty() {
+            let options =
+                RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
+            RecordBatch::try_new_with_options(Arc::clone(&self.schema), arrays, &options)
+                .map_err(Into::into)
+        } else {
+            RecordBatch::try_new(Arc::clone(&self.schema), arrays).map_err(Into::into)
+        }
+    }
+}
+
 /// Projection iterator
 struct ProjectionStream {
     schema: SchemaRef,
     expr: Vec<Arc<dyn PhysicalExpr>>,
     input: SendableRecordBatchStream,
     baseline_metrics: BaselineMetrics,
-    projection_exec: Arc<ProjectionExec>,
 }
 
 impl Stream for ProjectionStream {
@@ -365,174 +383,6 @@ impl RecordBatchStream for ProjectionStream {
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
-}
-
-impl ProjectionStream {
-    fn batch_project(&self, batch: &RecordBatch) -> Result<RecordBatch> {
-        // Records time on drop
-        let _timer = self.baseline_metrics.elapsed_compute().timer();
-        
-        // Check if we need to resolve pivot placeholders
-        let has_pivot_placeholders = self.expr.iter().any(|expr| {
-            if let Some(col) = expr.as_any().downcast_ref::<Column>() {
-                col.name().contains("__pivot_placeholder")
-            } else {
-                false
-            }
-        });
-        
-        if has_pivot_placeholders {
-            // Special handling for pivot placeholders
-            // Extract schema information from the batch
-            let batch_schema = batch.schema();
-            let field_names: Vec<&str> = batch_schema.fields().iter().map(|f| f.name().as_str()).collect();
-            
-            // Find potential pivot value columns
-            let non_placeholder_fields: Vec<&str> = field_names.iter()
-                .filter(|&name| !name.contains("__pivot_placeholder"))
-                .copied()
-                .collect();
-                
-            let pivot_value_columns = identify_pivot_value_columns(&non_placeholder_fields, batch);
-            
-            // Process all source arrays and detect pivot columns
-            let (arrays, field_names) = self.resolve_arrays_and_fields(batch, &pivot_value_columns)?;
-            
-            // Now create a schema that matches our column names
-            let mut fields = Vec::with_capacity(field_names.len());
-            
-            // Create fields for each column in the result
-            for (i, name) in field_names.iter().enumerate() {
-                let data_type = arrays[i].data_type().clone();
-                let field = Field::new(name, data_type, true);
-                fields.push(field);
-            }
-            
-            // Create the dynamic schema
-            let dynamic_schema = Schema::new_with_metadata(fields, self.schema.metadata().clone());
-            
-            // Debug output
-            println!("Created dynamic schema: {:?}", dynamic_schema.fields());
-            println!("Arrays count: {}", arrays.len());
-            
-            // Create the record batch with our dynamic schema
-            if arrays.is_empty() {
-                let options = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
-                RecordBatch::try_new_with_options(Arc::new(dynamic_schema), arrays, &options)
-                    .map_err(Into::into)
-        } else {
-                RecordBatch::try_new(Arc::new(dynamic_schema), arrays).map_err(Into::into)
-            }
-        } else {
-            // Regular projection without pivot placeholders
-            let arrays = self.expr
-                .iter()
-                .map(|expr| {
-                    expr.evaluate(batch)
-                        .and_then(|v| v.into_array(batch.num_rows()))
-                })
-                .collect::<Result<Vec<_>>>()?;
-        
-        // Create record batch
-        if arrays.is_empty() {
-                let options = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
-            RecordBatch::try_new_with_options(Arc::clone(&self.schema), arrays, &options)
-                .map_err(Into::into)
-        } else {
-            RecordBatch::try_new(Arc::clone(&self.schema), arrays).map_err(Into::into)
-            }
-        }
-    }
-    
-    // Helper method to resolve arrays and field names for pivot operations
-    fn resolve_arrays_and_fields(
-        &self, 
-        batch: &RecordBatch, 
-        pivot_value_columns: &[&str]
-    ) -> Result<(Vec<ArrayRef>, Vec<String>)> {
-        let batch_schema = batch.schema();
-        let mut result_arrays = Vec::new();
-        let mut field_names = Vec::new();
-        
-        // Process all non-placeholder columns normally
-        for expr in &self.expr {
-                if let Some(column) = expr.as_any().downcast_ref::<Column>() {
-                if column.name().contains("__pivot_placeholder") {
-                    // Skip placeholder columns - will handle separately
-                    continue;
-                }
-                
-                // Regular column - add to result
-                let array = expr.evaluate(batch).and_then(|v| v.into_array(batch.num_rows()))?;
-                result_arrays.push(array);
-                field_names.push(column.name().to_string());
-            } else {
-                // Non-column expression - evaluate normally
-                let array = expr.evaluate(batch).and_then(|v| v.into_array(batch.num_rows()))?;
-                result_arrays.push(array);
-                field_names.push("expr".to_string());
-            }
-        }
-        
-        // Now process all pivot value columns and add them directly
-        for &pivot_col in pivot_value_columns {
-            if let Ok(idx) = batch_schema.index_of(pivot_col) {
-                // For pivot operation, include this column in the result
-                result_arrays.push(batch.column(idx).clone());
-                field_names.push(pivot_col.to_string());
-            }
-        }
-        
-        Ok((result_arrays, field_names))
-    }
-}
-
-// Helper function to identify column names that are likely pivot value columns
-fn identify_pivot_value_columns<'a>(non_placeholder_fields: &[&'a str], batch: &RecordBatch) -> Vec<&'a str> {
-    // Get all potential pivot value fields - these are the columns that:
-    // 1. Are not placeholder columns
-    // 2. Are not likely group-by or input columns (typically these would be columns like empid, managerid, etc)
-    // 3. Often contain quarter names, dates, or values that were used in PIVOT IN clause
-    let _schema = batch.schema();
-    
-    // Identify likely non-pivot columns (group by columns) - typically these are at the beginning
-    // and have common naming patterns like id, name, etc.
-    let mut likely_pivot_columns = Vec::new();
-    let mut likely_groupby_columns = Vec::new();
-    
-    // Debug output to help identify what columns are found
-    println!("Searching for pivot columns among: {:?}", non_placeholder_fields);
-    
-    for &field_name in non_placeholder_fields {
-        // Common naming patterns for group-by columns
-        if field_name.ends_with("id") || 
-           field_name.ends_with("name") || 
-           field_name.ends_with("key") || 
-           field_name.ends_with("code") {
-            likely_groupby_columns.push(field_name);
-        } else {
-            // If this field doesn't match common group-by naming patterns,
-            // it's likely a pivot value column
-            likely_pivot_columns.push(field_name);
-        }
-    }
-    
-    // If we couldn't identify any pivot columns, fall back to assuming all non-group-by columns
-    // are pivot columns
-    if likely_pivot_columns.is_empty() {
-        // Simple heuristic: skip the first 1-2 fields which are likely group-by columns
-        let skip_count = if non_placeholder_fields.len() > 2 { 2 } else { 1 };
-        likely_pivot_columns = non_placeholder_fields.iter()
-            .skip(skip_count)
-            .copied()
-            .collect();
-    }
-    
-    // Print identification results
-    println!("Identified group-by columns: {:?}", likely_groupby_columns);
-    println!("Identified pivot columns: {:?}", likely_pivot_columns);
-    
-    likely_pivot_columns
 }
 
 pub trait EmbeddedProjection: ExecutionPlan + Sized {
