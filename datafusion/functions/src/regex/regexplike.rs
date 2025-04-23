@@ -35,12 +35,6 @@ use datafusion_macros::user_doc;
 use std::any::Any;
 use std::sync::{Arc, OnceLock};
 
-#[derive(Debug)]
-pub struct RegexpLikeFunc {
-    signature: Signature,
-    aliases: Vec<String>,
-}
-
 #[user_doc(
     doc_section(label = "Regular Expression Functions"),
     description = "Returns true if a [regular expression](https://docs.rs/regex/latest/regex/#syntax) has at least one match in a string, false otherwise.",
@@ -76,6 +70,7 @@ Additional examples can be found [here](https://github.com/apache/datafusion/blo
 #[derive(Debug)]
 pub struct RegexpLikeFunc {
     signature: Signature,
+    aliases: Vec<String>,
 }
 
 impl Default for RegexpLikeFunc {
