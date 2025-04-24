@@ -33,7 +33,7 @@ use crate::physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner};
 use datafusion_catalog::information_schema::{
     InformationSchemaProvider, INFORMATION_SCHEMA,
 };
-use datafusion_catalog::MemoryCatalogProviderList;
+use datafusion_catalog::{MemoryCatalogProviderList};
 
 use arrow::datatypes::{DataType, SchemaRef};
 use datafusion_catalog::{Session, TableFunction, TableFunctionImpl};
@@ -1655,7 +1655,7 @@ impl ContextProvider for SessionContextProvider<'_> {
     fn get_table_function_source(
         &self,
         name: &str,
-        args: Vec<Expr>,
+        args: Vec<(Expr, Option<String>)>,
     ) -> datafusion_common::Result<Arc<dyn TableSource>> {
         let tbl_func = self
             .state

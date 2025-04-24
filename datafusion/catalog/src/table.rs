@@ -316,7 +316,7 @@ pub trait TableProviderFactory: Debug + Sync + Send {
 /// A trait for table function implementations
 pub trait TableFunctionImpl: Debug + Sync + Send {
     /// Create a table provider
-    fn call(&self, args: &[Expr]) -> Result<Arc<dyn TableProvider>>;
+    fn call(&self, args: &[(Expr, Option<String>)]) -> Result<Arc<dyn TableProvider>>;
 }
 
 /// A table that uses a function to generate data
@@ -345,7 +345,7 @@ impl TableFunction {
     }
 
     /// Get the function implementation and generate a table
-    pub fn create_table_provider(&self, args: &[Expr]) -> Result<Arc<dyn TableProvider>> {
+    pub fn create_table_provider(&self, args: &[(Expr, Option<String>)]) -> Result<Arc<dyn TableProvider>> {
         self.fun.call(args)
     }
 }
