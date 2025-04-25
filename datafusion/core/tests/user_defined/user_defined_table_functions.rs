@@ -204,7 +204,7 @@ impl TableFunctionImpl for SimpleCsvTableFunc {
         dbg!(args);
         let mut new_exprs = vec![];
         let mut filepath = String::new();
-        for (expr,_) in args {
+        for (expr, _) in args {
             match expr {
                 Expr::Literal(ScalarValue::Utf8(Some(ref path))) => {
                     filepath.clone_from(path);

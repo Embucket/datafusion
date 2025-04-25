@@ -194,7 +194,7 @@ impl TableFunctionImpl for GenerateSeriesFuncImpl {
         }
 
         let mut normalize_args = Vec::new();
-        for (expr,_) in exprs {
+        for (expr, _) in exprs {
             match expr {
                 Expr::Literal(ScalarValue::Null) => {}
                 Expr::Literal(ScalarValue::Int64(Some(n))) => normalize_args.push(*n),

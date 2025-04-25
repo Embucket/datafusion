@@ -345,7 +345,10 @@ impl TableFunction {
     }
 
     /// Get the function implementation and generate a table
-    pub fn create_table_provider(&self, args: &[(Expr, Option<String>)]) -> Result<Arc<dyn TableProvider>> {
+    pub fn create_table_provider(
+        &self,
+        args: &[(Expr, Option<String>)],
+    ) -> Result<Arc<dyn TableProvider>> {
         self.fun.call(args)
     }
 }

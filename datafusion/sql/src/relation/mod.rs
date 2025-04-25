@@ -56,12 +56,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                                     planner_context,
                                 )
                                 .map(|expr| (expr, None))
-                            } else if let FunctionArg::Named {
-                                name,
-                                arg,
-                                ..
-                            } = arg
-                            {
+                            } else if let FunctionArg::Named { name, arg, .. } = arg {
                                 if let FunctionArgExpr::Expr(expr) = arg {
                                     self.sql_expr_to_logical_expr(
                                         expr,
