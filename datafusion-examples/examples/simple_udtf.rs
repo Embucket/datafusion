@@ -133,13 +133,14 @@ struct LocalCsvTableFunc {}
 
 impl TableFunctionImpl for LocalCsvTableFunc {
     fn call(&self, exprs: &[(Expr, Option<String>)]) -> Result<Arc<dyn TableProvider>> {
-        let Some((Expr::Literal(ScalarValue::Utf8(Some(ref path))),_)) = exprs.first() else {
+        let Some((Expr::Literal(ScalarValue::Utf8(Some(ref path))), _)) = exprs.first()
+        else {
             return plan_err!("read_csv requires at least one string argument");
         };
 
         let limit = exprs
             .get(1)
-            .map(|(expr,_)| {
+            .map(|(expr, _)| {
                 // try to simplify the expression, so 1+2 becomes 3, for example
                 let execution_props = ExecutionProps::new();
                 let info = SimplifyContext::new(&execution_props);
