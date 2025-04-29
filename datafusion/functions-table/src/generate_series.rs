@@ -191,13 +191,13 @@ struct GenerateSeriesFuncImpl {
 }
 
 impl TableFunctionImpl for GenerateSeriesFuncImpl {
-    fn call(&self, exprs: &[Expr]) -> Result<Arc<dyn TableProvider>> {
+    fn call(&self, exprs: &[(Expr, Option<String>)]) -> Result<Arc<dyn TableProvider>> {
         if exprs.is_empty() || exprs.len() > 3 {
             return plan_err!("{} function requires 1 to 3 arguments", self.name);
         }
 
         let mut normalize_args = Vec::new();
-        for expr in exprs {
+        for (expr, _) in exprs {
             match expr {
                 Expr::Literal(ScalarValue::Null) => {}
                 Expr::Literal(ScalarValue::Int64(Some(n))) => normalize_args.push(*n),
@@ -260,7 +260,7 @@ impl TableFunctionImpl for GenerateSeriesFuncImpl {
 pub struct GenerateSeriesFunc {}
 
 impl TableFunctionImpl for GenerateSeriesFunc {
-    fn call(&self, exprs: &[Expr]) -> Result<Arc<dyn TableProvider>> {
+    fn call(&self, exprs: &[(Expr, Option<String>)]) -> Result<Arc<dyn TableProvider>> {
         let impl_func = GenerateSeriesFuncImpl {
             name: "generate_series",
             include_end: true,
@@ -273,7 +273,7 @@ impl TableFunctionImpl for GenerateSeriesFunc {
 pub struct RangeFunc {}
 
 impl TableFunctionImpl for RangeFunc {
-    fn call(&self, exprs: &[Expr]) -> Result<Arc<dyn TableProvider>> {
+    fn call(&self, exprs: &[(Expr, Option<String>)]) -> Result<Arc<dyn TableProvider>> {
         let impl_func = GenerateSeriesFuncImpl {
             name: "range",
             include_end: false,

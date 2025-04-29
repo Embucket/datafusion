@@ -1667,7 +1667,7 @@ impl ContextProvider for SessionContextProvider<'_> {
     fn get_table_function_source(
         &self,
         name: &str,
-        args: Vec<Expr>,
+        args: Vec<(Expr, Option<String>)>,
     ) -> datafusion_common::Result<Arc<dyn TableSource>> {
         let tbl_func = self
             .state

@@ -52,7 +52,7 @@ pub trait ContextProvider {
     fn get_table_function_source(
         &self,
         _name: &str,
-        _args: Vec<Expr>,
+        _args: Vec<(Expr, Option<String>)>,
     ) -> Result<Arc<dyn TableSource>> {
         not_impl_err!("Table Functions are not supported")
     }
