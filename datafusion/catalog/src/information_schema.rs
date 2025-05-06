@@ -20,7 +20,7 @@
 //! [Information Schema]: https://en.wikipedia.org/wiki/Information_schema
 
 use crate::streaming::StreamingTable;
-use crate::{CatalogProvider, CatalogProviderList, SchemaProvider, TableProvider};
+use crate::{CatalogProviderList, SchemaProvider, TableProvider};
 use arrow::array::builder::{BooleanBuilder, UInt8Builder};
 use arrow::{
     array::{StringBuilder, UInt64Builder},
