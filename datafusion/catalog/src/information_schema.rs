@@ -74,9 +74,15 @@ pub struct InformationSchemaProvider {
 
 impl InformationSchemaProvider {
     /// Creates a new [`InformationSchemaProvider`] for the provided `catalog_list`
-    pub fn new(catalog_list: Arc<dyn CatalogProviderList>, catalog_name: Arc<str>) -> Self {
+    pub fn new(
+        catalog_list: Arc<dyn CatalogProviderList>,
+        catalog_name: Arc<str>,
+    ) -> Self {
         Self {
-            config: InformationSchemaConfig { catalog_list, catalog_name },
+            config: InformationSchemaConfig {
+                catalog_list,
+                catalog_name,
+            },
         }
     }
 }
@@ -84,7 +90,7 @@ impl InformationSchemaProvider {
 #[derive(Clone, Debug)]
 struct InformationSchemaConfig {
     catalog_list: Arc<dyn CatalogProviderList>,
-    catalog_name: Arc<str>
+    catalog_name: Arc<str>,
 }
 
 impl InformationSchemaConfig {
@@ -96,7 +102,7 @@ impl InformationSchemaConfig {
         let Some(catalog) = self.catalog_list.catalog(&self.catalog_name) else {
             return Ok(());
         };
-        
+
         // create a mem table with the names of tables
         for schema_name in catalog.schema_names() {
             if schema_name != INFORMATION_SCHEMA {
@@ -131,9 +137,9 @@ impl InformationSchemaConfig {
 
     async fn make_schemata(&self, builder: &mut InformationSchemataBuilder) {
         let Some(catalog) = self.catalog_list.catalog(&self.catalog_name) else {
-            return
+            return;
         };
-        
+
         for schema_name in catalog.schema_names() {
             if schema_name != INFORMATION_SCHEMA {
                 if let Some(schema) = catalog.schema(&schema_name) {
@@ -151,7 +157,7 @@ impl InformationSchemaConfig {
         let Some(catalog) = self.catalog_list.catalog(&self.catalog_name) else {
             return Ok(());
         };
-        
+
         for schema_name in catalog.schema_names() {
             if schema_name != INFORMATION_SCHEMA {
                 // schema name may not exist in the catalog, so we need to check
@@ -180,7 +186,7 @@ impl InformationSchemaConfig {
         let Some(catalog) = self.catalog_list.catalog(&self.catalog_name) else {
             return Ok(());
         };
-        
+
         for schema_name in catalog.schema_names() {
             if schema_name != INFORMATION_SCHEMA {
                 // schema name may not exist in the catalog, so we need to check
