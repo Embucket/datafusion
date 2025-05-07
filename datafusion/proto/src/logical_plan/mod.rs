@@ -1838,19 +1838,6 @@ impl AsLogicalPlan for LogicalPlanNode {
                 })
             }
             LogicalPlan::Pivot(_) => {
-                /*let input =
-                    LogicalPlanNode::try_from_logical_plan(pivot.input.as_ref(), extension_codec)?;
-                Ok(LogicalPlanNode {
-                    logical_plan_type: Some(LogicalPlanType::Pivot(Box::new(
-                        protobuf::PivotNode {
-                            input: Some(Box::new(input)),
-                            aggregate_expr: pivot.aggregate_expr.clone(),
-                            pivot_column: pivot.pivot_column.clone(),
-                            pivot_values: pivot.pivot_values.clone(),
-                            schema:  convert_required!(*pivot.schema)?,
-                        },
-                    ))),
-                })*/
                 Err(proto_error(
                     "LogicalPlan serde is not yet implemented for Statement",
                 ))

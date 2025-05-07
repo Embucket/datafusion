@@ -24,7 +24,7 @@ use crate::{
     expr_vec_fmt, Aggregate, DescribeTable, Distinct, DistinctOn, DmlStatement, Expr,
     Filter, Join, Limit, LogicalPlan, Partitioning, Projection, RecursiveQuery,
     Repartition, Sort, Subquery, SubqueryAlias, TableProviderFilterPushDown, TableScan,
-    Unnest, Values, Window, Pivot,
+    Unnest, Values, Window,
 };
 
 use crate::dml::CopyTo;

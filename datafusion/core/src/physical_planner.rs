@@ -64,8 +64,8 @@ use arrow::datatypes::{Schema, SchemaRef};
 use datafusion_common::display::ToStringifiedPlan;
 use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion, TreeNodeVisitor};
 use datafusion_common::{
-    exec_err, internal_datafusion_err, internal_err, not_impl_err, plan_err, DFSchema, DFSchemaRef,
-    ScalarValue, Column, TableReference,
+    exec_err, internal_datafusion_err, internal_err, not_impl_err, plan_err, DFSchema,
+    ScalarValue, Column,
 };
 use datafusion_datasource::memory::MemorySourceConfig;
 use datafusion_expr::dml::{CopyTo, InsertOp, DmlStatement, WriteOp};
@@ -78,7 +78,7 @@ use datafusion_expr::logical_plan::builder::wrap_projection_for_join_if_necessar
 use datafusion_expr::{
     Analyze, DescribeTable, DmlStatement,Explain, ExplainFormat, Extension, FetchType,
     Filter, JoinType, RecursiveQuery, SkipType, SortExpr, StringifiedPlan, WindowFrame,
-    WindowFrameBound, WriteOp, SubqueryAlias,
+    WindowFrameBound, WriteOp, SubqueryAlias, LogicalPlanBuilder, BinaryExpr
 };
 use datafusion_execution::FunctionRegistry;
 use datafusion_physical_expr::aggregate::{AggregateExprBuilder, AggregateFunctionExpr};
@@ -97,8 +97,7 @@ use itertools::{multiunzip, Itertools};
 use log::{debug, trace};
 use sqlparser::ast::NullTreatment;
 use tokio::sync::Mutex;
-
-use datafusion_sql::transform_pivot_to_aggregate;
+use datafusion_expr_common::operator::Operator;
 
 use datafusion_physical_plan::collect;
 
@@ -923,20 +922,17 @@ impl DefaultPhysicalPlanner {
                     pivot.pivot_values.clone()
                 };
 
-                if !pivot_values.is_empty() {
-                    // Transform Pivot into Aggregate plan with the resolved pivot values
+                return if !pivot_values.is_empty() {
                     let agg_plan = transform_pivot_to_aggregate(
                         Arc::new(pivot.input.as_ref().clone()),
                         &pivot.aggregate_expr,
                         &pivot.pivot_column,
-                        Some(pivot_values),
-                        None,
+                        pivot_values,
                     )?;
 
-                    // The schema information is already preserved in the agg_plan
-                    return self.create_physical_plan(&agg_plan, session_state).await;
+                    self.create_physical_plan(&agg_plan, session_state).await
                 } else {
-                    return plan_err!("PIVOT operation requires at least one value to pivot on");
+                    plan_err!("PIVOT operation requires at least one value to pivot on")
                 }
             }
             // 2 Children
@@ -1733,6 +1729,76 @@ pub fn create_aggregate_expr_and_maybe_filter(
 pub use datafusion_physical_expr::{
     create_physical_sort_expr, create_physical_sort_exprs,
 };
+
+/// Transform a PIVOT operation into a more standard Aggregate + Projection plan
+/// For known pivot values, we create a projection that includes "IS NOT DISTINCT FROM" conditions
+///
+/// For example, for SUM(amount) PIVOT(quarter FOR quarter in ('2023_Q1', '2023_Q2')), we create:
+/// - SUM(amount) FILTER (WHERE quarter IS NOT DISTINCT FROM '2023_Q1') AS "2023_Q1"
+/// - SUM(amount) FILTER (WHERE quarter IS NOT DISTINCT FROM '2023_Q2') AS "2023_Q2"
+///
+pub fn transform_pivot_to_aggregate(
+    input: Arc<LogicalPlan>,
+    aggregate_expr: &Expr,
+    pivot_column: &Column,
+    pivot_values: Vec<ScalarValue>,
+) -> Result<LogicalPlan> {
+    let df_schema = input.schema();
+
+    let all_columns: Vec<Column> = df_schema.columns();
+
+    // Filter to include only columns we want for GROUP BY
+    // (exclude pivot column and aggregate expression columns)
+    let group_by_columns: Vec<Expr> = all_columns
+        .into_iter()
+        .filter(|col| {
+            col.name != pivot_column.name
+                && !aggregate_expr.column_refs().iter().any(|agg_col| agg_col.name == col.name)
+        })
+        .map(|col| Expr::Column(col))
+        .collect();
+
+    let builder = LogicalPlanBuilder::from(Arc::unwrap_or_clone(input.clone()));
+
+    let mut aggregate_exprs = Vec::new();
+
+    for value in &pivot_values {
+        let filter_condition = Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(Expr::Column(pivot_column.clone())),
+            Operator::IsNotDistinctFrom,
+            Box::new(Expr::Literal(value.clone()))
+        ));
+
+        let filtered_agg = match aggregate_expr {
+            Expr::AggregateFunction(agg) => {
+                let mut new_params = agg.params.clone();
+                new_params.filter = Some(Box::new(filter_condition));
+                Expr::AggregateFunction(AggregateFunction {
+                    func: agg.func.clone(),
+                    params: new_params,
+                })
+            },
+            _ => {
+                return plan_err!("Unsupported aggregate expression should always be AggregateFunction");
+            }
+        };
+
+        // Use the pivot value as the column name
+        let field_name = value.to_string().trim_matches('\'').to_string();
+        let aliased_agg = Expr::Alias(Alias {
+            expr: Box::new(filtered_agg),
+            relation: None,
+            name: field_name,
+            metadata: None,
+        });
+
+        aggregate_exprs.push(aliased_agg);
+    }
+
+    let aggregate_plan = builder.aggregate(group_by_columns, aggregate_exprs)?.build()?;
+
+    Ok(aggregate_plan)
+}
 
 impl DefaultPhysicalPlanner {
     /// Handles capturing the various plans for EXPLAIN queries

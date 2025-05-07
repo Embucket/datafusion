@@ -562,28 +562,6 @@ impl SessionState {
 
     /// Optimizes the logical plan by applying optimizer rules.
     pub fn optimize(&self, plan: &LogicalPlan) -> datafusion_common::Result<LogicalPlan> {
-        // Special case for Pivot nodes with subqueries
-        /*if let LogicalPlan::Pivot(p) = plan {
-            if let Some(subquery) = &p.value_subquery {
-                // Optimize the subquery first
-                let optimized_subquery = self.optimizer.optimize(
-                    subquery.as_ref().clone(),
-                    self,
-                    |_, _| {},
-                )?;
-                
-                // Create a new Pivot with the optimized subquery
-                return Ok(LogicalPlan::Pivot(datafusion_expr::Pivot {
-                    input: p.input.clone(),
-                    aggregate_expr: p.aggregate_expr.clone(),
-                    pivot_column: p.pivot_column.clone(),
-                    pivot_values: p.pivot_values.clone(),
-                    schema: p.schema.clone(),
-                    value_subquery: Some(Arc::new(optimized_subquery)),
-                }));
-            }
-        }*/
-
         if let LogicalPlan::Explain(e) = plan {
             let mut stringified_plans = e.stringified_plans.clone();
 
@@ -673,9 +651,7 @@ impl SessionState {
         &self,
         logical_plan: &LogicalPlan,
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
-        println!("logical_plan_beore_optPIVOT328: {:#?}", logical_plan);
         let logical_plan = self.optimize(logical_plan)?;
-        println!("logical_plan_PIVOT329: {:#?}", logical_plan);
         self.query_planner
             .create_physical_plan(&logical_plan, self)
             .await
