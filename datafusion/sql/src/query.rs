@@ -56,6 +56,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 let plan = self.select_to_plan(*select, oby_exprs, planner_context)?;
                 let plan =
                     self.limit(plan, query.offset, query.limit, planner_context)?;
+
                 // Process the `SELECT INTO` after `LIMIT`.
                 self.select_into(plan, select_into)
             }
