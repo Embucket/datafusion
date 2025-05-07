@@ -20,7 +20,6 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Debug, Display, Formatter};
-use std::fs::metadata;
 use std::hash::{Hash, Hasher};
 use std::str::FromStr;
 use std::sync::{Arc, LazyLock};
@@ -1179,10 +1178,10 @@ impl LogicalPlan {
                 Ok(new_plan)
             }
             LogicalPlan::Pivot(Pivot {
-                aggregate_expr,
+                aggregate_expr: _,
                 pivot_column,
                 pivot_values,
-                schema,
+                schema: _,
                 value_subquery,
                 ..
             }) => {
@@ -2345,7 +2344,6 @@ impl Pivot {
         pivot_column: Column,
         value_subquery: Arc<LogicalPlan>,
     ) -> Result<Self> {
-        // Create an empty schema - will be filled in when the subquery is executed
         let schema = pivot_schema_without_values(
             input.schema(),
             &aggregate_expr,
@@ -2356,15 +2354,13 @@ impl Pivot {
             input,
             aggregate_expr,
             pivot_column,
-            pivot_values: Vec::new(), // Will be populated during physical planning
+            pivot_values: Vec::new(),
             schema: Arc::new(schema),
             value_subquery: Some(value_subquery),
         })
     }
 }
 
-/// Create a pivot schema without knowing the pivot values
-/// This is used when we have a subquery for pivot values
 fn pivot_schema_without_values(
     input_schema: &DFSchemaRef,
     aggregate_expr: &Expr,
@@ -2387,7 +2383,6 @@ fn pivot_schema_without_values(
     DFSchema::new_with_metadata(fields_with_table_ref, input_schema.metadata().clone())
 }
 
-/// Create a pivot schema with known pivot values
 fn pivot_schema(
     input_schema: &DFSchemaRef,
     aggregate_expr: &Expr,
@@ -2396,14 +2391,12 @@ fn pivot_schema(
 ) -> Result<DFSchema> {
     let mut fields = vec![];
     
-    // Include all fields except pivot and value columns
     for field in input_schema.fields() {
         if !aggregate_expr.column_refs().iter().any(|col| col.name() == field.name()) && field.name() != pivot_column.name() {
             fields.push(field.clone());
         }
     }
 
-    // Add new fields for each pivot value
     for pivot_value in pivot_values {
         let field_name = format!("{}", pivot_value);
         let data_type = aggregate_expr.get_type(input_schema)?;
@@ -5558,4 +5551,3 @@ digraph {
         Ok(())
     }
 }
-
