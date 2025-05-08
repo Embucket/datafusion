@@ -2839,4 +2839,29 @@ mod tests {
 
         Ok(())
     }
+
+    #[test]
+    fn plan_builder_pivot() -> Result<()> {
+        let schema = Schema::new(vec![
+            Field::new("region", DataType::Utf8, false),
+            Field::new("product", DataType::Utf8, false),
+            Field::new("sales", DataType::Int32, false),
+        ]);
+        
+        let plan = LogicalPlanBuilder::scan("sales", table_source(&schema), None)?
+            .pivot(
+                col("sales"),
+                Column::from_name("product"),
+                vec![
+                    ScalarValue::Utf8(Some("widget".to_string())),
+                    ScalarValue::Utf8(Some("gadget".to_string())),
+                ],
+            )?
+            .build()?;
+
+        let expected = "Pivot: sales FOR product IN (widget, gadget)\n  TableScan: sales";
+        assert_eq!(expected, format!("{plan}"));
+
+        Ok(())
+    }
 }
