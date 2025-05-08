@@ -78,7 +78,7 @@ use datafusion_expr::logical_plan::builder::wrap_projection_for_join_if_necessar
 use datafusion_expr::{
     Analyze, DescribeTable, DmlStatement, Explain, ExplainFormat, Extension, FetchType,
     Filter, JoinType, RecursiveQuery, SkipType, StringifiedPlan, WindowFrame,
-    WindowFrameBound, WriteOp,
+    WindowFrameBound, WriteOp, LogicalPlanBuilder, BinaryExpr
 };
 use datafusion_physical_expr::aggregate::{AggregateExprBuilder, AggregateFunctionExpr};
 use datafusion_physical_expr::expressions::{Column, Literal};
@@ -96,6 +96,9 @@ use itertools::{multiunzip, Itertools};
 use log::{debug, trace};
 use sqlparser::ast::NullTreatment;
 use tokio::sync::Mutex;
+use datafusion_expr_common::operator::Operator;
+
+use datafusion_physical_plan::collect;
 
 /// Physical query planner that converts a `LogicalPlan` to an
 /// `ExecutionPlan` suitable for execution.
@@ -887,7 +890,50 @@ impl DefaultPhysicalPlanner {
                     options.clone(),
                 ))
             }
+            LogicalPlan::Pivot(pivot) => {
+                let pivot_values = if let Some(subquery) = &pivot.value_subquery {
+                    let optimized_subquery = session_state.optimize(subquery.as_ref())?;
 
+                    let subquery_physical_plan = self.create_physical_plan(
+                        &optimized_subquery,
+                        session_state
+                    ).await?;
+
+                    let subquery_results = collect(subquery_physical_plan.clone(), session_state.task_ctx()).await?;
+
+                    let mut pivot_values = Vec::new();
+                    for batch in subquery_results.iter() {
+                        if batch.num_columns() != 1 {
+                            return plan_err!("Pivot subquery must return a single column");
+                        }
+
+                        let column = batch.column(0);
+                        for row_idx in 0..batch.num_rows() {
+                            if !column.is_null(row_idx) {
+                                pivot_values.push(
+                                    ScalarValue::try_from_array(column, row_idx)?
+                                );
+                            }
+                        }
+                    }
+                    pivot_values
+                } else {
+                    pivot.pivot_values.clone()
+                };
+
+                return if !pivot_values.is_empty() {
+                    let agg_plan = transform_pivot_to_aggregate(
+                        Arc::new(pivot.input.as_ref().clone()),
+                        &pivot.aggregate_expr,
+                        &pivot.pivot_column,
+                        pivot_values,
+                    )?;
+
+                    self.create_physical_plan(&agg_plan, session_state).await
+                } else {
+                    plan_err!("PIVOT operation requires at least one value to pivot on")
+                }
+            }
             // 2 Children
             LogicalPlan::Join(Join {
                 left,
@@ -1683,6 +1729,76 @@ pub use datafusion_physical_expr::{
     create_physical_sort_expr, create_physical_sort_exprs,
 };
 
+/// Transform a PIVOT operation into a more standard Aggregate + Projection plan
+/// For known pivot values, we create a projection that includes "IS NOT DISTINCT FROM" conditions
+///
+/// For example, for SUM(amount) PIVOT(quarter FOR quarter in ('2023_Q1', '2023_Q2')), we create:
+/// - SUM(amount) FILTER (WHERE quarter IS NOT DISTINCT FROM '2023_Q1') AS "2023_Q1"
+/// - SUM(amount) FILTER (WHERE quarter IS NOT DISTINCT FROM '2023_Q2') AS "2023_Q2"
+///
+pub fn transform_pivot_to_aggregate(
+    input: Arc<LogicalPlan>,
+    aggregate_expr: &Expr,
+    pivot_column: &datafusion_common::Column,
+    pivot_values: Vec<ScalarValue>,
+) -> Result<LogicalPlan> {
+    let df_schema = input.schema();
+
+    let all_columns: Vec<datafusion_common::Column> = df_schema.columns();
+
+    // Filter to include only columns we want for GROUP BY
+    // (exclude pivot column and aggregate expression columns)
+    let group_by_columns: Vec<Expr> = all_columns
+        .into_iter()
+        .filter(|col: &datafusion_common::Column | {
+            col.name != pivot_column.name
+                && !aggregate_expr.column_refs().iter().any(|agg_col| agg_col.name == col.name)
+        })
+        .map(|col: datafusion_common::Column | Expr::Column(col))
+        .collect();
+
+    let builder = LogicalPlanBuilder::from(Arc::unwrap_or_clone(input.clone()));
+
+    let mut aggregate_exprs = Vec::new();
+
+    for value in &pivot_values {
+        let filter_condition = Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(Expr::Column(pivot_column.clone())),
+            Operator::IsNotDistinctFrom,
+            Box::new(Expr::Literal(value.clone()))
+        ));
+
+        let filtered_agg = match aggregate_expr {
+            Expr::AggregateFunction(agg) => {
+                let mut new_params = agg.params.clone();
+                new_params.filter = Some(Box::new(filter_condition));
+                Expr::AggregateFunction(AggregateFunction {
+                    func: agg.func.clone(),
+                    params: new_params,
+                })
+            },
+            _ => {
+                return plan_err!("Unsupported aggregate expression should always be AggregateFunction");
+            }
+        };
+
+        // Use the pivot value as the column name
+        let field_name = value.to_string().trim_matches('\'').to_string();
+        let aliased_agg = Expr::Alias(Alias {
+            expr: Box::new(filtered_agg),
+            relation: None,
+            name: field_name,
+            metadata: None,
+        });
+
+        aggregate_exprs.push(aliased_agg);
+    }
+
+    let aggregate_plan = builder.aggregate(group_by_columns, aggregate_exprs)?.build()?;
+
+    Ok(aggregate_plan)
+}
+
 impl DefaultPhysicalPlanner {
     /// Handles capturing the various plans for EXPLAIN queries
     ///
@@ -2043,6 +2159,36 @@ impl DefaultPhysicalPlanner {
                 tuple_err((final_physical_expr, physical_name))
             })
             .collect::<Result<Vec<_>>>()?;
+
+        // When we detect a PIVOT-derived plan with a value_subquery, ensure all generated columns are preserved
+        match input.as_ref() {
+            LogicalPlan::Pivot(pivot) => {
+                if pivot.value_subquery.is_some() && input_exec.as_any().downcast_ref::<AggregateExec>().is_some() {
+                    let agg_exec = input_exec.as_any().downcast_ref::<AggregateExec>().unwrap();
+                    let schema = input_exec.schema();
+                    let group_by_len = agg_exec.group_expr().expr().len();
+
+                    if group_by_len < schema.fields().len() {
+                        let mut all_exprs = physical_exprs.clone();
+
+                        for (i, field) in schema.fields().iter().enumerate().skip(group_by_len) {
+                            if !physical_exprs.iter().any(|(_, name)| name == field.name()) {
+                                all_exprs.push((
+                                    Arc::new(Column::new(field.name(), i)) as Arc<dyn PhysicalExpr>,
+                                    field.name().clone(),
+                                ));
+                            }
+                        }
+
+                        return Ok(Arc::new(ProjectionExec::try_new(
+                            all_exprs,
+                            input_exec,
+                        )?));
+                    }
+                }
+            },
+           _ => {}
+        }
 
         Ok(Arc::new(ProjectionExec::try_new(
             physical_exprs,
