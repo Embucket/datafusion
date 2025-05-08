@@ -25,9 +25,8 @@ use datafusion_common::{
     Column, DFSchemaRef, ScalarValue,
 };
 use datafusion_expr::builder::subquery_alias;
-use datafusion_expr::{expr::Unnest, Expr, LogicalPlan, LogicalPlanBuilder, Sort};
-use datafusion_expr::expr::{AggregateFunction, BinaryExpr, Alias, AggregateFunctionParams};
-use datafusion_expr::{Subquery, SubqueryAlias, Operator};
+use datafusion_expr::{expr::Unnest, Expr, LogicalPlan, LogicalPlanBuilder};
+use datafusion_expr::{Subquery, SubqueryAlias};
 use sqlparser::ast::{FunctionArg, FunctionArgExpr, Spanned, TableFactor};
 use arrow::datatypes::Field;
 
@@ -260,8 +259,8 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                                     expr.map(|e| {
                                         // Create a Sort expression
                                         e.sort(
-                                            item.asc.unwrap_or(true),
-                                            item.nulls_first.unwrap_or(false)
+                                            item.options.asc.unwrap_or(true),
+                                            item.options.nulls_first.unwrap_or(false)
                                         )
                                     })
                                 })

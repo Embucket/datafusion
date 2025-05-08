@@ -65,10 +65,10 @@ use datafusion_common::display::ToStringifiedPlan;
 use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion, TreeNodeVisitor};
 use datafusion_common::{
     exec_err, internal_datafusion_err, internal_err, not_impl_err, plan_err, DFSchema,
-    ScalarValue, Column,
+    ScalarValue,
 };
 use datafusion_datasource::memory::MemorySourceConfig;
-use datafusion_expr::dml::{CopyTo, InsertOp, DmlStatement, WriteOp};
+use datafusion_expr::dml::{CopyTo, InsertOp};
 use datafusion_expr::expr::{
     physical_name, AggregateFunction, AggregateFunctionParams, Alias, GroupingSet,
     WindowFunction, WindowFunctionParams,
@@ -76,11 +76,10 @@ use datafusion_expr::expr::{
 use datafusion_expr::expr_rewriter::unnormalize_cols;
 use datafusion_expr::logical_plan::builder::wrap_projection_for_join_if_necessary;
 use datafusion_expr::{
-    Analyze, DescribeTable, DmlStatement,Explain, ExplainFormat, Extension, FetchType,
-    Filter, JoinType, RecursiveQuery, SkipType, SortExpr, StringifiedPlan, WindowFrame,
-    WindowFrameBound, WriteOp, SubqueryAlias, LogicalPlanBuilder, BinaryExpr
+    Analyze, DescribeTable, DmlStatement, Explain, ExplainFormat, Extension, FetchType,
+    Filter, JoinType, RecursiveQuery, SkipType, StringifiedPlan, WindowFrame,
+    WindowFrameBound, WriteOp, LogicalPlanBuilder, BinaryExpr
 };
-use datafusion_execution::FunctionRegistry;
 use datafusion_physical_expr::aggregate::{AggregateExprBuilder, AggregateFunctionExpr};
 use datafusion_physical_expr::expressions::{Column, Literal};
 use datafusion_physical_expr::LexOrdering;
@@ -1740,22 +1739,22 @@ pub use datafusion_physical_expr::{
 pub fn transform_pivot_to_aggregate(
     input: Arc<LogicalPlan>,
     aggregate_expr: &Expr,
-    pivot_column: &Column,
+    pivot_column: &datafusion_common::Column,
     pivot_values: Vec<ScalarValue>,
 ) -> Result<LogicalPlan> {
     let df_schema = input.schema();
 
-    let all_columns: Vec<Column> = df_schema.columns();
+    let all_columns: Vec<datafusion_common::Column> = df_schema.columns();
 
     // Filter to include only columns we want for GROUP BY
     // (exclude pivot column and aggregate expression columns)
     let group_by_columns: Vec<Expr> = all_columns
         .into_iter()
-        .filter(|col| {
+        .filter(|col: &datafusion_common::Column | {
             col.name != pivot_column.name
                 && !aggregate_expr.column_refs().iter().any(|agg_col| agg_col.name == col.name)
         })
-        .map(|col| Expr::Column(col))
+        .map(|col: datafusion_common::Column | Expr::Column(col))
         .collect();
 
     let builder = LogicalPlanBuilder::from(Arc::unwrap_or_clone(input.clone()));
@@ -2183,7 +2182,7 @@ impl DefaultPhysicalPlanner {
                             if !physical_exprs.iter().any(|(_, name)| name == field.name()) {
                                 // Add this pivot column to the projection
                                 all_exprs.push((
-                                    Arc::new(crate::physical_plan::expressions::Column::new(field.name(), i)) as Arc<dyn PhysicalExpr>,
+                                    Arc::new(Column::new(field.name(), i)) as Arc<dyn PhysicalExpr>,
                                     field.name().clone(),
                                 ));
                             }
