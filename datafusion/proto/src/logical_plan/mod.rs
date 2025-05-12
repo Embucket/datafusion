@@ -64,8 +64,8 @@ use datafusion_expr::{
     logical_plan::{
         builder::project, Aggregate, CreateCatalog, CreateCatalogSchema,
         CreateExternalTable, CreateView, DdlStatement, Distinct, EmptyRelation,
-        Extension, Join, JoinConstraint, Prepare, Projection, Repartition, Sort,
-        SubqueryAlias, TableScan, Values, Window, Pivot
+        Extension, Join, JoinConstraint, Pivot, Prepare, Projection, Repartition, Sort,
+        SubqueryAlias, TableScan, Values, Window,
     },
     DistinctOn, DropView, Expr, LogicalPlan, LogicalPlanBuilder, ScalarUDF, SortExpr,
     Statement, WindowUDF,
@@ -995,37 +995,50 @@ impl AsLogicalPlan for LogicalPlanNode {
                 ),
             )),
             LogicalPlanType::Pivot(pivot) => {
-                let aggregate_expr = pivot.aggregate_expr
+                let aggregate_expr = pivot
+                    .aggregate_expr
                     .as_ref()
                     .map(|expr| from_proto::parse_expr(expr, ctx, extension_codec))
                     .transpose()?
-                    .ok_or_else(|| DataFusionError::Internal("aggregate_expr required".to_string()))?;
-                let pivot_column = pivot.pivot_column
+                    .ok_or_else(|| {
+                        DataFusionError::Internal("aggregate_expr required".to_string())
+                    })?;
+                let pivot_column = pivot
+                    .pivot_column
                     .as_ref()
                     .map(|col| col.clone().into())
-                    .ok_or_else(|| DataFusionError::Internal("pivot_column required".to_string()))?;
-                let pivot_values = pivot.pivot_values
-    .iter()
-    .map(|val| val.try_into())
-    .collect::<Result<Vec<datafusion_common::ScalarValue>, _>>()?;
+                    .ok_or_else(|| {
+                        DataFusionError::Internal("pivot_column required".to_string())
+                    })?;
+                let pivot_values = pivot
+                    .pivot_values
+                    .iter()
+                    .map(|val| val.try_into())
+                    .collect::<Result<Vec<datafusion_common::ScalarValue>, _>>(
+                )?;
                 let schema = Arc::new(convert_required!(pivot.schema)?);
                 let value_subquery = if pivot.value_subquery.is_some() {
-                    Some(Arc::new(into_logical_plan!(pivot.value_subquery, ctx, extension_codec)?))
+                    Some(Arc::new(into_logical_plan!(
+                        pivot.value_subquery,
+                        ctx,
+                        extension_codec
+                    )?))
                 } else {
                     None
                 };
-                Ok(LogicalPlan::Pivot(
-                    Pivot {
-                        input: Arc::new(into_logical_plan!(pivot.input, ctx, extension_codec)?),
-                        aggregate_expr,
-                        pivot_column,
-                        pivot_values,
-                        schema,
-                        value_subquery: value_subquery
-                    }
-                ))
+                Ok(LogicalPlan::Pivot(Pivot {
+                    input: Arc::new(into_logical_plan!(
+                        pivot.input,
+                        ctx,
+                        extension_codec
+                    )?),
+                    aggregate_expr,
+                    pivot_column,
+                    pivot_values,
+                    schema,
+                    value_subquery: value_subquery,
+                }))
             }
-        
         }
     }
 
@@ -1837,11 +1850,9 @@ impl AsLogicalPlan for LogicalPlanNode {
                     ))),
                 })
             }
-            LogicalPlan::Pivot(_) => {
-                Err(proto_error(
-                    "LogicalPlan serde is not yet implemented for Statement",
-                ))
-            }
+            LogicalPlan::Pivot(_) => Err(proto_error(
+                "LogicalPlan serde is not yet implemented for Statement",
+            )),
         }
     }
 }

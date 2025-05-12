@@ -289,7 +289,6 @@ pub enum LogicalPlan {
     RecursiveQuery(RecursiveQuery),
     /// Pivot
     Pivot(Pivot),
-
 }
 
 impl Default for LogicalPlan {
@@ -754,7 +753,7 @@ impl LogicalPlan {
             }) => {
                 // Update schema with unnested column type.
                 unnest_with_options(Arc::unwrap_or_clone(input), exec_columns, options)
-            },
+            }
             LogicalPlan::Pivot(Pivot {
                 input,
                 aggregate_expr,
@@ -762,6 +761,7 @@ impl LogicalPlan {
                 pivot_values,
                 schema,
                 value_subquery,
+                default_on_null_expr,
                 ..
             }) => {
                 // Create Pivot with the same value_subquery
@@ -773,6 +773,7 @@ impl LogicalPlan {
                         pivot_values: pivot_values.clone(),
                         schema: schema.clone(),
                         value_subquery: Some(Arc::clone(&subquery)),
+                        default_on_null_expr: None,
                     }
                 } else {
                     Pivot::try_new(
@@ -780,9 +781,10 @@ impl LogicalPlan {
                         aggregate_expr.clone(),
                         pivot_column.clone(),
                         pivot_values.clone(),
+                        default_on_null_expr.clone(),
                     )?
                 };
-                
+
                 Ok(LogicalPlan::Pivot(new_pivot))
             }
         }
@@ -821,7 +823,7 @@ impl LogicalPlan {
         match self {
             // Since expr may be different than the previous expr, schema of the projection
             // may change. We need to use try_new method instead of try_new_with_schema method.
-            LogicalPlan::Projection(Projection { .. } ) => {
+            LogicalPlan::Projection(Projection { .. }) => {
                 let input = self.only_input(inputs)?;
                 Projection::try_new(expr, Arc::new(input)).map(LogicalPlan::Projection)
             }
@@ -1183,27 +1185,31 @@ impl LogicalPlan {
                 pivot_values,
                 schema: _,
                 value_subquery,
+                default_on_null_expr,
                 ..
             }) => {
                 let input = self.only_input(inputs)?;
                 let new_aggregate_expr = self.only_expr(expr)?;
-                
+
                 // Create Pivot with the same value_subquery
                 let new_pivot = if let Some(subquery) = value_subquery {
-                    Pivot::try_new_with_subquery(Arc::new(input),
-                                                 new_aggregate_expr,
-                                                 pivot_column.clone(),
-                                                 subquery.clone())?
-
+                    Pivot::try_new_with_subquery(
+                        Arc::new(input),
+                        new_aggregate_expr,
+                        pivot_column.clone(),
+                        subquery.clone(),
+                        default_on_null_expr.clone(),
+                    )?
                 } else {
                     Pivot::try_new(
                         Arc::new(input),
                         new_aggregate_expr,
                         pivot_column.clone(),
                         pivot_values.clone(),
+                        default_on_null_expr.clone(),
                     )?
                 };
-                
+
                 Ok(LogicalPlan::Pivot(new_pivot))
             }
         }
@@ -2291,6 +2297,8 @@ pub struct Pivot {
     /// When provided, this will be executed during physical planning
     /// to dynamically determine the pivot values
     pub value_subquery: Option<Arc<LogicalPlan>>,
+    /// Optional default value for replacing NULL values in the pivot result
+    pub default_on_null_expr: Option<Expr>,
 }
 
 impl PartialOrd for Pivot {
@@ -2301,6 +2309,7 @@ impl PartialOrd for Pivot {
             &self.pivot_column,
             &self.pivot_values,
             &self.value_subquery,
+            &self.default_on_null_expr,
         );
         let other_tuple = (
             &other.input,
@@ -2308,6 +2317,7 @@ impl PartialOrd for Pivot {
             &other.pivot_column,
             &other.pivot_values,
             &other.value_subquery,
+            &other.default_on_null_expr,
         );
         self_tuple.partial_cmp(&other_tuple)
     }
@@ -2319,6 +2329,7 @@ impl Pivot {
         aggregate_expr: Expr,
         pivot_column: Column,
         pivot_values: Vec<ScalarValue>,
+        default_on_null_expr: Option<Expr>,
     ) -> Result<Self> {
         let schema = pivot_schema(
             input.schema(),
@@ -2334,22 +2345,21 @@ impl Pivot {
             pivot_values,
             schema: Arc::new(schema),
             value_subquery: None,
+            default_on_null_expr,
         })
     }
-    
+
     /// Create a new Pivot with a subquery for pivot values
     pub fn try_new_with_subquery(
         input: Arc<LogicalPlan>,
         aggregate_expr: Expr,
         pivot_column: Column,
         value_subquery: Arc<LogicalPlan>,
+        default_on_null_expr: Option<Expr>,
     ) -> Result<Self> {
-        let schema = pivot_schema_without_values(
-            input.schema(),
-            &aggregate_expr,
-            &pivot_column,
-        )?;
-        
+        let schema =
+            pivot_schema_without_values(input.schema(), &aggregate_expr, &pivot_column)?;
+
         Ok(Self {
             input,
             aggregate_expr,
@@ -2357,6 +2367,7 @@ impl Pivot {
             pivot_values: Vec::new(),
             schema: Arc::new(schema),
             value_subquery: Some(value_subquery),
+            default_on_null_expr,
         })
     }
 }
@@ -2367,18 +2378,21 @@ fn pivot_schema_without_values(
     pivot_column: &Column,
 ) -> Result<DFSchema> {
     let mut fields = vec![];
-    
+
     // Include all fields except pivot and value columns
     for field in input_schema.fields() {
-        if !aggregate_expr.column_refs().iter().any(|col| col.name() == field.name()) && field.name() != pivot_column.name() {
+        if !aggregate_expr
+            .column_refs()
+            .iter()
+            .any(|col| col.name() == field.name())
+            && field.name() != pivot_column.name()
+        {
             fields.push(field.clone());
         }
     }
 
-    let fields_with_table_ref: Vec<(Option<TableReference>, Arc<Field>)> = fields
-        .into_iter()
-        .map(|field| (None, field))
-        .collect();
+    let fields_with_table_ref: Vec<(Option<TableReference>, Arc<Field>)> =
+        fields.into_iter().map(|field| (None, field)).collect();
 
     DFSchema::new_with_metadata(fields_with_table_ref, input_schema.metadata().clone())
 }
@@ -2390,9 +2404,14 @@ fn pivot_schema(
     pivot_values: &[ScalarValue],
 ) -> Result<DFSchema> {
     let mut fields = vec![];
-    
+
     for field in input_schema.fields() {
-        if !aggregate_expr.column_refs().iter().any(|col| col.name() == field.name()) && field.name() != pivot_column.name() {
+        if !aggregate_expr
+            .column_refs()
+            .iter()
+            .any(|col| col.name() == field.name())
+            && field.name() != pivot_column.name()
+        {
             fields.push(field.clone());
         }
     }
@@ -2403,10 +2422,8 @@ fn pivot_schema(
         fields.push(Arc::new(Field::new(field_name, data_type, true)));
     }
 
-    let fields_with_table_ref: Vec<(Option<TableReference>, Arc<Field>)> = fields
-        .into_iter()
-        .map(|field| (None, field))
-        .collect();
+    let fields_with_table_ref: Vec<(Option<TableReference>, Arc<Field>)> =
+        fields.into_iter().map(|field| (None, field)).collect();
 
     DFSchema::new_with_metadata(fields_with_table_ref, input_schema.metadata().clone())
 }

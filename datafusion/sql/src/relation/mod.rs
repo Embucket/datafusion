@@ -19,16 +19,17 @@ use std::sync::Arc;
 
 use crate::planner::{ContextProvider, PlannerContext, SqlToRel};
 
+use arrow::datatypes::Field;
 use datafusion_common::tree_node::{Transformed, TreeNode};
 use datafusion_common::{
-    not_impl_err, plan_err, DFSchema, Diagnostic, Result, Span, Spans, TableReference,
-    Column, DFSchemaRef, ScalarValue,
+    not_impl_err, plan_err, Column, DFSchema, DFSchemaRef, Diagnostic, Result,
+    ScalarValue, Span, Spans, TableReference,
 };
 use datafusion_expr::builder::subquery_alias;
+use datafusion_expr::type_coercion::binary::comparison_coercion;
 use datafusion_expr::{expr::Unnest, Expr, LogicalPlan, LogicalPlanBuilder};
 use datafusion_expr::{Subquery, SubqueryAlias};
 use sqlparser::ast::{FunctionArg, FunctionArgExpr, Spanned, TableFactor};
-use arrow::datatypes::Field;
 
 mod join;
 
@@ -171,7 +172,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     "UNNEST table factor with offset is not supported yet"
                 );
             }
-            TableFactor::Pivot { 
+            TableFactor::Pivot {
                 table,
                 aggregate_functions,
                 value_column,
@@ -180,131 +181,124 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 alias,
             } => {
                 let input_plan = self.create_relation(*table, planner_context)?;
-                
+
                 if aggregate_functions.len() != 1 {
                     return plan_err!("PIVOT requires exactly one aggregate function");
                 }
-                
+
                 let agg_expr = self.sql_expr_to_logical_expr(
                     aggregate_functions[0].expr.clone(),
                     input_plan.schema(),
                     planner_context,
                 )?;
-                
+
                 if value_column.is_empty() {
                     return plan_err!("PIVOT value column is required");
                 }
-                
+
                 let column_name = value_column.last().unwrap().value.clone();
                 let pivot_column = Column::new(None::<&str>, column_name);
 
+                let default_on_null_expr = default_on_null
+                    .map(|expr| {
+                        self.sql_expr_to_logical_expr(
+                            expr,
+                            input_plan.schema(), // Default expression should be context-independent or use input schema
+                            planner_context,
+                        )
+                    })
+                    .transpose()?;
+
                 match value_source {
                     sqlparser::ast::PivotValueSource::List(exprs) => {
-                        let pivot_values = exprs.iter()
+                        let pivot_values = exprs
+                            .iter()
                             .map(|expr| {
                                 let logical_expr = self.sql_expr_to_logical_expr(
                                     expr.expr.clone(),
                                     input_plan.schema(),
                                     planner_context,
                                 )?;
-                                
-                                // Convert the expression to a scalar value
+
                                 match logical_expr {
                                     Expr::Literal(scalar) => Ok(scalar),
                                     _ => plan_err!("PIVOT values must be literals"),
                                 }
                             })
                             .collect::<Result<Vec<_>>>()?;
-                            
+
                         let input_arc = Arc::new(input_plan);
-                        let schema = derive_pivot_schema(
-                            input_arc.schema(),
-                            &agg_expr,
-                            &pivot_column,
-                            &pivot_values
-                        )?;
-                        
-                        let pivot_plan = LogicalPlan::Pivot(datafusion_expr::Pivot {
-                            input: input_arc,
-                            aggregate_expr: agg_expr,
+
+                        let pivot_plan = datafusion_expr::Pivot::try_new(
+                            input_arc,
+                            agg_expr,
                             pivot_column,
                             pivot_values,
-                            schema: Arc::new(schema),
-                            value_subquery: None,
-                        });
-                        
-                        (pivot_plan, alias)
-                    },
-                    sqlparser::ast::PivotValueSource::Any(order_by) => {
-                        let pivot_values = Vec::new(); 
+                            default_on_null_expr.clone(),
+                        )?;
 
+                        (LogicalPlan::Pivot(pivot_plan), alias)
+                    }
+                    sqlparser::ast::PivotValueSource::Any(order_by) => {
                         let input_arc = Arc::new(input_plan);
 
-                        let mut subquery_builder = LogicalPlanBuilder::from(input_arc.as_ref().clone())
-                            .project(vec![Expr::Column(pivot_column.clone())])? // Select only the pivot column
-                            .distinct()?; // Get distinct values
-                        
+                        let mut subquery_builder =
+                            LogicalPlanBuilder::from(input_arc.as_ref().clone())
+                                .project(vec![Expr::Column(pivot_column.clone())])?
+                                .distinct()?;
+
                         if !order_by.is_empty() {
                             let sort_exprs = order_by
                                 .iter()
                                 .map(|item| {
                                     let input_schema = subquery_builder.schema();
-                                    
+
                                     let expr = self.sql_expr_to_logical_expr(
                                         item.expr.clone(),
                                         input_schema,
                                         planner_context,
                                     );
-                                    
+
                                     expr.map(|e| {
-                                        // Create a Sort expression
                                         e.sort(
                                             item.options.asc.unwrap_or(true),
-                                            item.options.nulls_first.unwrap_or(false)
+                                            item.options.nulls_first.unwrap_or(false),
                                         )
                                     })
                                 })
                                 .collect::<Result<Vec<_>>>()?;
-                            
+
                             subquery_builder = subquery_builder.sort(sort_exprs)?;
                         }
-                        
+
                         let subquery_plan = subquery_builder.build()?;
 
-                        let schema = derive_pivot_schema(
-                            input_arc.schema(),
-                            &agg_expr,
-                            &pivot_column,
-                            &pivot_values
+                        let pivot_plan = datafusion_expr::Pivot::try_new_with_subquery(
+                            input_arc,
+                            agg_expr,
+                            pivot_column,
+                            Arc::new(subquery_plan),
+                            default_on_null_expr.clone(),
                         )?;
 
-                        let pivot_plan = LogicalPlan::Pivot(datafusion_expr::Pivot {
-                            input: input_arc,
-                            aggregate_expr: agg_expr,
-                            pivot_column,
-                            pivot_values,
-                            schema: Arc::new(schema),
-                            value_subquery: Some(Arc::new(subquery_plan)), // Pass the subquery with sorting
-                        });
-
-                        (pivot_plan, alias)
-                    },
+                        (LogicalPlan::Pivot(pivot_plan), alias)
+                    }
                     sqlparser::ast::PivotValueSource::Subquery(subquery) => {
-                        let subquery_plan = self.query_to_plan(*subquery.clone(), planner_context)?;
-                        
+                        let subquery_plan =
+                            self.query_to_plan(*subquery.clone(), planner_context)?;
+
                         let input_arc = Arc::new(input_plan);
-                                                                     
-                        let pivot_plan = LogicalPlan::Pivot(
-                            datafusion_expr::Pivot::try_new_with_subquery(
-                                input_arc,
-                                agg_expr,
-                                pivot_column,
-                                Arc::new(subquery_plan),
-                            )?
-                        );
-                        
-                        (pivot_plan, alias)
-                    },
+
+                        let pivot_plan = datafusion_expr::Pivot::try_new_with_subquery(
+                            input_arc,
+                            agg_expr,
+                            pivot_column,
+                            Arc::new(subquery_plan),
+                            default_on_null_expr.clone(),
+                        )?;
+
+                        (LogicalPlan::Pivot(pivot_plan), alias)
+                    }
                 }
             }
             // @todo: Support TableFactory::TableFunction
@@ -404,40 +398,4 @@ fn optimize_subquery_sort(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>>
         }
     });
     new_plan
-}
-
-/// Derive the schema for a pivot operation
-/// This creates a schema including:
-/// 1. All the original columns from the input (excluding pivot column and aggregate columns)
-/// 2. New columns for each pivot value provided
-///
-/// When executing with ANY or SUBQUERY value sources, additional columns would be 
-/// added dynamically during execution.
-pub fn derive_pivot_schema(
-    input_schema: &DFSchemaRef,
-    agg_expr: &Expr,
-    pivot_column: &Column,
-    pivot_values: &[ScalarValue],
-) -> Result<DFSchema> {
-    use datafusion_expr::ExprSchemable;
-    
-    let field_type = agg_expr.get_type(input_schema.as_ref())?;
-    
-    let mut new_fields = Vec::<(Option<TableReference>, Arc<Field>)>::new();
-
-    for field in input_schema.fields().iter() {
-        if field.name() != pivot_column.name() && 
-           !agg_expr.column_refs().iter().any(|col| col.name() == field.name()) {
-            new_fields.push((None, field.clone()));
-        }
-    }
-    
-    for value in pivot_values {
-        let field_name = value.to_string().trim_matches('\'').to_string();
-        
-        let field = Field::new(field_name, field_type.clone(), true);
-        new_fields.push((None, Arc::new(field)));
-    }
-    
-    DFSchema::new_with_metadata(new_fields, input_schema.metadata().clone())
 }

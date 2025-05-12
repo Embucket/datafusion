@@ -76,9 +76,9 @@ use datafusion_expr::expr::{
 use datafusion_expr::expr_rewriter::unnormalize_cols;
 use datafusion_expr::logical_plan::builder::wrap_projection_for_join_if_necessary;
 use datafusion_expr::{
-    Analyze, DescribeTable, DmlStatement, Explain, ExplainFormat, Extension, FetchType,
-    Filter, JoinType, RecursiveQuery, SkipType, StringifiedPlan, WindowFrame,
-    WindowFrameBound, WriteOp, LogicalPlanBuilder, BinaryExpr
+    Analyze, BinaryExpr, DescribeTable, DmlStatement, Explain, ExplainFormat, Extension,
+    FetchType, Filter, JoinType, LogicalPlanBuilder, RecursiveQuery, SkipType,
+    StringifiedPlan, WindowFrame, WindowFrameBound, WriteOp,
 };
 use datafusion_physical_expr::aggregate::{AggregateExprBuilder, AggregateFunctionExpr};
 use datafusion_physical_expr::expressions::{Column, Literal};
@@ -91,12 +91,12 @@ use datafusion_physical_plan::unnest::ListUnnest;
 use crate::schema_equivalence::schema_satisfied_by;
 use async_trait::async_trait;
 use datafusion_datasource::file_groups::FileGroup;
+use datafusion_expr_common::operator::Operator;
 use futures::{StreamExt, TryStreamExt};
 use itertools::{multiunzip, Itertools};
 use log::{debug, trace};
 use sqlparser::ast::NullTreatment;
 use tokio::sync::Mutex;
-use datafusion_expr_common::operator::Operator;
 
 use datafusion_physical_plan::collect;
 
@@ -891,42 +891,50 @@ impl DefaultPhysicalPlanner {
                 ))
             }
             LogicalPlan::Pivot(pivot) => {
-                let pivot_values = if let Some(subquery) = &pivot.value_subquery {
+                return if !pivot.pivot_values.is_empty() {
+                    let agg_plan = transform_pivot_to_aggregate(
+                        Arc::new(pivot.input.as_ref().clone()),
+                        &pivot.aggregate_expr,
+                        &pivot.pivot_column,
+                        pivot.pivot_values.clone(),
+                        pivot.default_on_null_expr.as_ref(),
+                    )?;
+
+                    self.create_physical_plan(&agg_plan, session_state).await
+                } else if let Some(subquery) = &pivot.value_subquery {
                     let optimized_subquery = session_state.optimize(subquery.as_ref())?;
 
-                    let subquery_physical_plan = self.create_physical_plan(
-                        &optimized_subquery,
-                        session_state
-                    ).await?;
+                    let subquery_physical_plan = self
+                        .create_physical_plan(&optimized_subquery, session_state)
+                        .await?;
 
-                    let subquery_results = collect(subquery_physical_plan.clone(), session_state.task_ctx()).await?;
+                    let subquery_results =
+                        collect(subquery_physical_plan.clone(), session_state.task_ctx())
+                            .await?;
 
                     let mut pivot_values = Vec::new();
                     for batch in subquery_results.iter() {
                         if batch.num_columns() != 1 {
-                            return plan_err!("Pivot subquery must return a single column");
+                            return plan_err!(
+                                "Pivot subquery must return a single column"
+                            );
                         }
 
                         let column = batch.column(0);
                         for row_idx in 0..batch.num_rows() {
                             if !column.is_null(row_idx) {
-                                pivot_values.push(
-                                    ScalarValue::try_from_array(column, row_idx)?
-                                );
+                                pivot_values
+                                    .push(ScalarValue::try_from_array(column, row_idx)?);
                             }
                         }
                     }
-                    pivot_values
-                } else {
-                    pivot.pivot_values.clone()
-                };
 
-                return if !pivot_values.is_empty() {
                     let agg_plan = transform_pivot_to_aggregate(
                         Arc::new(pivot.input.as_ref().clone()),
                         &pivot.aggregate_expr,
                         &pivot.pivot_column,
                         pivot_values,
+                        pivot.default_on_null_expr.as_ref(),
                     )?;
 
                     self.create_physical_plan(&agg_plan, session_state).await
@@ -1736,11 +1744,14 @@ pub use datafusion_physical_expr::{
 /// - SUM(amount) FILTER (WHERE quarter IS NOT DISTINCT FROM '2023_Q1') AS "2023_Q1"
 /// - SUM(amount) FILTER (WHERE quarter IS NOT DISTINCT FROM '2023_Q2') AS "2023_Q2"
 ///
+/// If DEFAULT ON NULL is specified, each aggregate expression is wrapped with an outer projection that
+/// applies COALESCE to the results.
 pub fn transform_pivot_to_aggregate(
     input: Arc<LogicalPlan>,
     aggregate_expr: &Expr,
     pivot_column: &datafusion_common::Column,
     pivot_values: Vec<ScalarValue>,
+    default_on_null_expr: Option<&Expr>,
 ) -> Result<LogicalPlan> {
     let df_schema = input.schema();
 
@@ -1750,22 +1761,26 @@ pub fn transform_pivot_to_aggregate(
     // (exclude pivot column and aggregate expression columns)
     let group_by_columns: Vec<Expr> = all_columns
         .into_iter()
-        .filter(|col: &datafusion_common::Column | {
+        .filter(|col: &datafusion_common::Column| {
             col.name != pivot_column.name
-                && !aggregate_expr.column_refs().iter().any(|agg_col| agg_col.name == col.name)
+                && !aggregate_expr
+                    .column_refs()
+                    .iter()
+                    .any(|agg_col| agg_col.name == col.name)
         })
-        .map(|col: datafusion_common::Column | Expr::Column(col))
+        .map(|col: datafusion_common::Column| Expr::Column(col))
         .collect();
 
     let builder = LogicalPlanBuilder::from(Arc::unwrap_or_clone(input.clone()));
 
+    // Create the aggregate plan with filtered aggregates
     let mut aggregate_exprs = Vec::new();
 
     for value in &pivot_values {
         let filter_condition = Expr::BinaryExpr(BinaryExpr::new(
             Box::new(Expr::Column(pivot_column.clone())),
             Operator::IsNotDistinctFrom,
-            Box::new(Expr::Literal(value.clone()))
+            Box::new(Expr::Literal(value.clone())),
         ));
 
         let filtered_agg = match aggregate_expr {
@@ -1776,9 +1791,11 @@ pub fn transform_pivot_to_aggregate(
                     func: agg.func.clone(),
                     params: new_params,
                 })
-            },
+            }
             _ => {
-                return plan_err!("Unsupported aggregate expression should always be AggregateFunction");
+                return plan_err!(
+                    "Unsupported aggregate expression should always be AggregateFunction"
+                );
             }
         };
 
@@ -1794,9 +1811,60 @@ pub fn transform_pivot_to_aggregate(
         aggregate_exprs.push(aliased_agg);
     }
 
-    let aggregate_plan = builder.aggregate(group_by_columns, aggregate_exprs)?.build()?;
+    // Create the plan with the aggregate
+    let aggregate_plan = builder
+        .aggregate(group_by_columns, aggregate_exprs)?
+        .build()?;
 
-    Ok(aggregate_plan)
+    // If DEFAULT ON NULL is specified, add a projection to apply COALESCE
+    if let Some(default_expr) = default_on_null_expr {
+        let schema = aggregate_plan.schema();
+        let mut projection_exprs = Vec::new();
+
+        for field in schema.fields() {
+            if !pivot_values
+                .iter()
+                .any(|v| field.name() == v.to_string().trim_matches('\''))
+            {
+                projection_exprs.push(Expr::Column(
+                    datafusion_common::Column::from_name(field.name()),
+                ));
+            }
+        }
+
+        // Apply COALESCE to aggregate columns
+        for value in &pivot_values {
+            let field_name = value.to_string().trim_matches('\'').to_string();
+            let aggregate_col =
+                Expr::Column(datafusion_common::Column::from_name(&field_name));
+
+            // Create COALESCE expression using CASE: CASE WHEN col IS NULL THEN default_value ELSE col END
+            let coalesce_expr = Expr::Case(datafusion_expr::expr::Case {
+                expr: None,
+                when_then_expr: vec![(
+                    Box::new(Expr::IsNull(Box::new(aggregate_col.clone()))),
+                    Box::new(default_expr.clone()),
+                )],
+                else_expr: Some(Box::new(aggregate_col)),
+            });
+
+            let aliased_coalesce = Expr::Alias(Alias {
+                expr: Box::new(coalesce_expr),
+                relation: None,
+                name: field_name,
+                metadata: None,
+            });
+
+            projection_exprs.push(aliased_coalesce);
+        }
+
+        // Apply the projection
+        LogicalPlanBuilder::from(aggregate_plan)
+            .project(projection_exprs)?
+            .build()
+    } else {
+        Ok(aggregate_plan)
+    }
 }
 
 impl DefaultPhysicalPlanner {
@@ -2163,31 +2231,42 @@ impl DefaultPhysicalPlanner {
         // When we detect a PIVOT-derived plan with a value_subquery, ensure all generated columns are preserved
         match input.as_ref() {
             LogicalPlan::Pivot(pivot) => {
-                if pivot.value_subquery.is_some() && input_exec.as_any().downcast_ref::<AggregateExec>().is_some() {
-                    let agg_exec = input_exec.as_any().downcast_ref::<AggregateExec>().unwrap();
+                if pivot.value_subquery.is_some()
+                    && input_exec
+                        .as_any()
+                        .downcast_ref::<AggregateExec>()
+                        .is_some()
+                {
+                    let agg_exec =
+                        input_exec.as_any().downcast_ref::<AggregateExec>().unwrap();
                     let schema = input_exec.schema();
                     let group_by_len = agg_exec.group_expr().expr().len();
 
                     if group_by_len < schema.fields().len() {
                         let mut all_exprs = physical_exprs.clone();
 
-                        for (i, field) in schema.fields().iter().enumerate().skip(group_by_len) {
-                            if !physical_exprs.iter().any(|(_, name)| name == field.name()) {
+                        for (i, field) in
+                            schema.fields().iter().enumerate().skip(group_by_len)
+                        {
+                            if !physical_exprs
+                                .iter()
+                                .any(|(_, name)| name == field.name())
+                            {
                                 all_exprs.push((
-                                    Arc::new(Column::new(field.name(), i)) as Arc<dyn PhysicalExpr>,
+                                    Arc::new(Column::new(field.name(), i))
+                                        as Arc<dyn PhysicalExpr>,
                                     field.name().clone(),
                                 ));
                             }
                         }
 
                         return Ok(Arc::new(ProjectionExec::try_new(
-                            all_exprs,
-                            input_exec,
+                            all_exprs, input_exec,
                         )?));
                     }
                 }
-            },
-           _ => {}
+            }
+            _ => {}
         }
 
         Ok(Arc::new(ProjectionExec::try_new(

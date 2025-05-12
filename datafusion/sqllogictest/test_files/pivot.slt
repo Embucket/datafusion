@@ -61,12 +61,12 @@ SELECT *
 FROM quarterly_sales
 PIVOT(SUM(amount) 
   FOR quarter IN ('2023_Q1', '2023_Q2')
-  DEFAULT ON NULL (0))
+  DEFAULT ON NULL (1001))
 ORDER BY empid;
 ----
 1 10400 8000
 2 39500 90700
-3 NULL NULL
+3 1001 1001
 
 # PIVOT with automatic detection of all distinct column values using ANY
 query TIII
@@ -148,17 +148,13 @@ PIVOT(SUM(amount)
 ORDER BY empid;
 
 # Invalid DEFAULT ON NULL value (dependent on pivot/aggregation columns)
-query III
+query error DataFusion error: Schema error: No field named quarterly_sales\.amount\. Valid fields are quarterly_sales\.empid, "2023_Q1", "2023_Q2"\.
 SELECT *
 FROM quarterly_sales
 PIVOT(SUM(amount) 
   FOR quarter IN ('2023_Q1', '2023_Q2')
   DEFAULT ON NULL (amount))
 ORDER BY empid;
-----
-1 10400 8000
-2 39500 90700
-3 NULL NULL
 
 # PIVOT after a PIVOT
 query error DataFusion error: Schema error: No field named empid\. Valid fields are "2023_Q2", "0", "10000", "20000", "2023_Q2", "0", "10000", "20000"\.

@@ -384,8 +384,7 @@ fn optimize_projections(
         }
         LogicalPlan::Pivot(_) => {
             return Ok(Transformed::no(plan));
-        },
-
+        }
     };
 
     // Required indices are currently ordered (child0, child1, ...)

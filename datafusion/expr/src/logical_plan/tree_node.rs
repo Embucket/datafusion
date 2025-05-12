@@ -40,9 +40,9 @@
 use crate::{
     dml::CopyTo, Aggregate, Analyze, CreateMemoryTable, CreateView, DdlStatement,
     Distinct, DistinctOn, DmlStatement, Execute, Explain, Expr, Extension, Filter, Join,
-    Limit, LogicalPlan, Partitioning, Prepare, Projection, RecursiveQuery, Repartition,
-    Sort, Statement, Subquery, SubqueryAlias, TableScan, Union, Unnest,
-    UserDefinedLogicalNode, Values, Window, Pivot
+    Limit, LogicalPlan, Partitioning, Pivot, Prepare, Projection, RecursiveQuery,
+    Repartition, Sort, Statement, Subquery, SubqueryAlias, TableScan, Union, Unnest,
+    UserDefinedLogicalNode, Values, Window,
 };
 use datafusion_common::tree_node::TreeNodeRefContainer;
 
@@ -335,6 +335,7 @@ impl TreeNode for LogicalPlan {
                 pivot_values,
                 schema,
                 value_subquery,
+                default_on_null_expr,
             }) => input.map_elements(f)?.update_data(|input| {
                 LogicalPlan::Pivot(Pivot {
                     input,
@@ -343,6 +344,7 @@ impl TreeNode for LogicalPlan {
                     pivot_values,
                     schema,
                     value_subquery,
+                    default_on_null_expr,
                 })
             }),
             LogicalPlan::RecursiveQuery(RecursiveQuery {
@@ -669,6 +671,7 @@ impl LogicalPlan {
                 pivot_values,
                 schema,
                 value_subquery,
+                default_on_null_expr,
             }) => f(aggregate_expr)?.update_data(|aggregate_expr| {
                 LogicalPlan::Pivot(Pivot {
                     input,
@@ -677,6 +680,7 @@ impl LogicalPlan {
                     pivot_values,
                     schema,
                     value_subquery,
+                    default_on_null_expr,
                 })
             }),
             LogicalPlan::Statement(stmt) => match stmt {

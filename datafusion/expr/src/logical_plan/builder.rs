@@ -32,9 +32,9 @@ use crate::expr_rewriter::{
 };
 use crate::logical_plan::{
     Aggregate, Analyze, Distinct, DistinctOn, EmptyRelation, Explain, Filter, Join,
-    JoinConstraint, JoinType, Limit, LogicalPlan, Partitioning, PlanType, Prepare,
+    JoinConstraint, JoinType, Limit, LogicalPlan, Partitioning, Pivot, PlanType, Prepare,
     Projection, Repartition, Sort, SubqueryAlias, TableScan, Union, Unnest, Values,
-    Window, Pivot,
+    Window,
 };
 use crate::select_expr::SelectExpr;
 use crate::utils::{
@@ -1433,12 +1433,14 @@ impl LogicalPlanBuilder {
         aggregate_expr: Expr,
         pivot_column: Column,
         pivot_values: Vec<ScalarValue>,
+        default_on_null: Option<Expr>,
     ) -> Result<Self> {
         let pivot_plan = Pivot::try_new(
             self.plan,
             aggregate_expr,
             pivot_column,
             pivot_values,
+            default_on_null,
         )?;
         Ok(Self::new(LogicalPlan::Pivot(pivot_plan)))
     }
@@ -2847,7 +2849,7 @@ mod tests {
             Field::new("product", DataType::Utf8, false),
             Field::new("sales", DataType::Int32, false),
         ]);
-        
+
         let plan = LogicalPlanBuilder::scan("sales", table_source(&schema), None)?
             .pivot(
                 col("sales"),
@@ -2856,6 +2858,7 @@ mod tests {
                     ScalarValue::Utf8(Some("widget".to_string())),
                     ScalarValue::Utf8(Some("gadget".to_string())),
                 ],
+                None,
             )?
             .build()?;
 
