@@ -299,6 +299,99 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     }
                 }
             }
+            TableFactor::Unpivot {
+                table,
+                include_nulls,
+                value,
+                name,
+                columns,
+                alias,
+            } => {
+                let base_plan = self.create_relation(*table, planner_context)?;
+                let base_schema = base_plan.schema();
+                
+                let value_column = value.value.clone();
+                let name_column = name.value.clone();
+                
+                let mut unpivot_column_indices = Vec::new();
+                let mut unpivot_column_names = Vec::new();
+                
+                let mut common_type = None;
+                
+                for column_ident in &columns {
+                    let column_name = column_ident.value.clone();
+                    
+                    if let Some(idx) = base_schema.index_of_column_by_name(None, &column_name) {
+                        let field = base_schema.field(idx);
+                        let field_type = field.data_type();
+                        
+                        // Verify all unpivot columns have compatible types
+                        if let Some(current_type) = &common_type {
+                            if comparison_coercion(current_type, field_type).is_none() {
+                                return plan_err!(
+                                    "UNPIVOT columns must have the same data type. Found {} and {}",
+                                    current_type, field_type
+                                );
+                            }
+                        } else {
+                            common_type = Some(field_type.clone());
+                        }
+                        
+                        unpivot_column_indices.push(idx);
+                        unpivot_column_names.push(column_name);
+                    } else {
+                        return plan_err!("Column '{}' not found in input", column_name);
+                    }
+                }
+                
+                if unpivot_column_names.is_empty() {
+                    return plan_err!("UNPIVOT requires at least one column to unpivot");
+                }
+                
+                let non_pivot_exprs: Vec<Expr> = base_schema
+                    .fields()
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| !unpivot_column_indices.contains(i))
+                    .map(|(_, f)| Expr::Column(Column::new(None::<&str>, f.name())))
+                    .collect();
+                
+                let mut union_inputs = Vec::with_capacity(unpivot_column_names.len());
+                
+                for col_name in &unpivot_column_names {
+                    let mut projection_exprs = non_pivot_exprs.clone();
+                    
+                    let name_expr = Expr::Literal(ScalarValue::Utf8(Some(col_name.clone())))
+                        .alias(name_column.clone());
+                    
+                    let value_expr = Expr::Column(Column::new(None::<&str>, col_name.clone()))
+                        .alias(value_column.clone());
+                    
+                    projection_exprs.push(name_expr);
+                    projection_exprs.push(value_expr);
+                    
+                    let mut builder = LogicalPlanBuilder::from(base_plan.clone())
+                        .project(projection_exprs)?;
+                    
+                    if !include_nulls.unwrap_or(false) {
+                        let col = Column::new(None::<&str>, value_column.clone());
+                        builder = builder.filter(Expr::IsNotNull(Box::new(Expr::Column(col))))?;
+                    }
+                    
+                    union_inputs.push(builder.build()?);
+                }
+                
+                let first = union_inputs.remove(0);
+                let mut union_builder = LogicalPlanBuilder::from(first);
+                
+                for plan in union_inputs {
+                    union_builder = union_builder.union(plan)?;
+                }
+                
+                let unpivot_plan = union_builder.build()?;
+                
+                (unpivot_plan, alias)
+            }
             // @todo: Support TableFactory::TableFunction
             _ => {
                 return not_impl_err!(
