@@ -33,7 +33,7 @@ use datafusion_expr::{
 use datafusion_macros::user_doc;
 
 use std::any::Any;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 #[user_doc(
     doc_section(label = "Regular Expression Functions"),

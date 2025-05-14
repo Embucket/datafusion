@@ -1956,7 +1956,7 @@ Additional examples can be found [here](https://github.com/apache/datafusion/blo
 
 Returns the substring that matches a [regular expression](https://docs.rs/regex/latest/regex/#syntax) within a string.
 
-```
+```sql
 regexp_substr(str, regexp[, position[, occurrence[, flags[, group_num]]]])
 ```
 

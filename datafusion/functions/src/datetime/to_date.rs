@@ -455,8 +455,12 @@ mod tests {
             ScalarValue::TimestampNanosecond(Some(1736782134736782134), None),
         ];
         for scalar in test_cases {
-            let timestamp_to_date_result = ToDateFunc::new()
-                .invoke_batch(&[ColumnarValue::Scalar(scalar.clone())], 1);
+            let timestamp_to_date_result =
+                ToDateFunc::new().invoke_with_args(datafusion_expr::ScalarFunctionArgs {
+                    args: vec![ColumnarValue::Scalar(scalar.clone())],
+                    number_rows: 1,
+                    return_type: &DataType::Date32,
+                });
 
             match timestamp_to_date_result {
                 Ok(ColumnarValue::Scalar(ScalarValue::Date32(date_val))) => {

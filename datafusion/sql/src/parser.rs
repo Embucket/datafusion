@@ -1070,7 +1070,7 @@ mod tests {
     }
 
     #[test]
-    fn skip_create_stage_snowflake() -> Result<(), ParserError> {
+    fn skip_create_stage_snowflake() -> Result<(), DataFusionError> {
         let sql =
             "CREATE OR REPLACE STAGE stage URL='s3://data.csv' FILE_FORMAT=(TYPE=csv)";
         let dialect = Box::new(SnowflakeDialect);
