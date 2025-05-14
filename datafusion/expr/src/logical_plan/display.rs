@@ -655,6 +655,7 @@ impl<'a, 'b> PgJsonVisitor<'a, 'b> {
                 pivot_column,
                 pivot_values,
                 value_subquery,
+                default_on_null_expr,
                 ..
             }) => {
                 let mut object = json!({
@@ -674,6 +675,11 @@ impl<'a, 'b> PgJsonVisitor<'a, 'b> {
 
                 if value_subquery.is_some() {
                     object["Value Subquery"] =
+                        serde_json::Value::String("Provided".to_string());
+                }
+
+                if default_on_null_expr.is_some() {
+                    object["Default On Null"] =
                         serde_json::Value::String("Provided".to_string());
                 }
 
@@ -798,6 +804,7 @@ mod tests {
             pivot_values,
             schema: schema.clone(),
             value_subquery: None,
+            default_on_null_expr: None,
         };
 
         // Test the to_json_value function
@@ -837,6 +844,7 @@ mod tests {
                 produce_one_row: false,
                 schema: schema.clone(),
             }))),
+            default_on_null_expr: None,
         };
 
         // Test the to_json_value function

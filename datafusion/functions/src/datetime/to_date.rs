@@ -166,7 +166,7 @@ mod tests {
     use arrow::datatypes::DataType;
     use arrow::{compute::kernels::cast_utils::Parser, datatypes::Date32Type};
     use datafusion_common::ScalarValue;
-    use datafusion_expr::{ColumnarValue, ScalarUDFImpl};
+    use datafusion_expr::{ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl};
     use std::sync::Arc;
 
     #[test]

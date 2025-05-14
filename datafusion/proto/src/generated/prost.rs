@@ -1948,6 +1948,8 @@ pub struct PivotNode {
     pub schema: ::core::option::Option<super::datafusion_common::DfSchema>,
     #[prost(message, optional, tag = "6")]
     pub value_subquery: ::core::option::Option<::prost::alloc::boxed::Box<LogicalPlanNode>>,
+    #[prost(message, optional, tag = "7")]
+    pub default_on_null_expr: ::core::option::Option<::prost::alloc::boxed::Box<LogicalExprNode>>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]

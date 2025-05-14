@@ -1026,6 +1026,15 @@ impl AsLogicalPlan for LogicalPlanNode {
                 } else {
                     None
                 };
+                let default_on_null_expr = if pivot.default_on_null_expr.is_some() {
+                    pivot
+                        .default_on_null_expr
+                        .as_ref()
+                        .map(|expr| from_proto::parse_expr(expr, ctx, extension_codec))
+                        .transpose()?
+                } else {
+                    None
+                };
                 Ok(LogicalPlan::Pivot(Pivot {
                     input: Arc::new(into_logical_plan!(
                         pivot.input,
@@ -1037,6 +1046,7 @@ impl AsLogicalPlan for LogicalPlanNode {
                     pivot_values,
                     schema,
                     value_subquery: value_subquery,
+                    default_on_null_expr: default_on_null_expr,
                 }))
             }
         }
