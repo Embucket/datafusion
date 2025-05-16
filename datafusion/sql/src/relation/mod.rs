@@ -21,13 +21,13 @@ use crate::planner::{ContextProvider, PlannerContext, SqlToRel};
 
 use datafusion_common::tree_node::{Transformed, TreeNode};
 use datafusion_common::{
-    not_impl_err, plan_err, Column, DFSchema, Diagnostic, Result, Span, Spans,
-    TableReference,
+    not_impl_err, plan_err, Column, DFSchema, Diagnostic, Result, ScalarValue, Span, Spans, TableReference
 };
 use datafusion_expr::builder::subquery_alias;
 use datafusion_expr::{expr::Unnest, Expr, LogicalPlan, LogicalPlanBuilder};
 use datafusion_expr::{Subquery, SubqueryAlias};
-use sqlparser::ast::{FunctionArg, FunctionArgExpr, Spanned, TableFactor};
+use sqlparser::ast::{FunctionArg, FunctionArgExpr, Spanned, TableFactor, NullInclusion};
+use datafusion_expr::binary::comparison_coercion;
 
 mod join;
 
@@ -301,7 +301,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             }
             TableFactor::Unpivot {
                 table,
-                include_nulls,
+                null_inclusion,
                 value,
                 name,
                 columns,
@@ -373,7 +373,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     let mut builder = LogicalPlanBuilder::from(base_plan.clone())
                         .project(projection_exprs)?;
                     
-                    if !include_nulls.unwrap_or(false) {
+                    if null_inclusion.clone().unwrap_or(NullInclusion::ExcludeNulls) == NullInclusion::ExcludeNulls {
                         let col = Column::new(None::<&str>, value_column.clone());
                         builder = builder.filter(Expr::IsNotNull(Box::new(Expr::Column(col))))?;
                     }
