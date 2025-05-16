@@ -32,7 +32,7 @@ use crate::expr_rewriter::{
 };
 use crate::logical_plan::{
     Aggregate, Analyze, Distinct, DistinctOn, EmptyRelation, Explain, Filter, Join,
-    JoinConstraint, JoinType, Limit, LogicalPlan, Partitioning, PlanType, Prepare,
+    JoinConstraint, JoinType, Limit, LogicalPlan, Partitioning, Pivot, PlanType, Prepare,
     Projection, Repartition, Sort, SubqueryAlias, TableScan, Union, Unnest, Values,
     Window,
 };
@@ -1427,6 +1427,23 @@ impl LogicalPlanBuilder {
         unnest_with_options(Arc::unwrap_or_clone(self.plan), columns, options)
             .map(Self::new)
     }
+
+    pub fn pivot(
+        self,
+        aggregate_expr: Expr,
+        pivot_column: Column,
+        pivot_values: Vec<ScalarValue>,
+        default_on_null: Option<Expr>,
+    ) -> Result<Self> {
+        let pivot_plan = Pivot::try_new(
+            self.plan,
+            aggregate_expr,
+            pivot_column,
+            pivot_values,
+            default_on_null,
+        )?;
+        Ok(Self::new(LogicalPlan::Pivot(pivot_plan)))
+    }
 }
 
 impl From<LogicalPlan> for LogicalPlanBuilder {
@@ -2820,6 +2837,32 @@ mod tests {
         let expected =
             "Aggregate: groupBy=[[employee_csv.id, employee_csv.state, employee_csv.salary]], aggr=[[sum(employee_csv.salary)]]\
         \n  TableScan: employee_csv projection=[id, state, salary]";
+        assert_eq!(expected, format!("{plan}"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn plan_builder_pivot() -> Result<()> {
+        let schema = Schema::new(vec![
+            Field::new("region", DataType::Utf8, false),
+            Field::new("product", DataType::Utf8, false),
+            Field::new("sales", DataType::Int32, false),
+        ]);
+
+        let plan = LogicalPlanBuilder::scan("sales", table_source(&schema), None)?
+            .pivot(
+                col("sales"),
+                Column::from_name("product"),
+                vec![
+                    ScalarValue::Utf8(Some("widget".to_string())),
+                    ScalarValue::Utf8(Some("gadget".to_string())),
+                ],
+                None,
+            )?
+            .build()?;
+
+        let expected = "Pivot: sales FOR product IN (widget, gadget)\n  TableScan: sales";
         assert_eq!(expected, format!("{plan}"));
 
         Ok(())

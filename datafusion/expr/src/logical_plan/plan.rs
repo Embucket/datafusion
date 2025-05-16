@@ -287,6 +287,8 @@ pub enum LogicalPlan {
     Unnest(Unnest),
     /// A variadic query (e.g. "Recursive CTEs")
     RecursiveQuery(RecursiveQuery),
+    /// Pivot
+    Pivot(Pivot),
 }
 
 impl Default for LogicalPlan {
@@ -351,6 +353,7 @@ impl LogicalPlan {
                 // we take the schema of the static term as the schema of the entire recursive query
                 static_term.schema()
             }
+            LogicalPlan::Pivot(Pivot { schema, .. }) => schema,
         }
     }
 
@@ -467,7 +470,8 @@ impl LogicalPlan {
             LogicalPlan::Dml(write) => vec![&write.input],
             LogicalPlan::Copy(copy) => vec![&copy.input],
             LogicalPlan::Ddl(ddl) => ddl.inputs(),
-            LogicalPlan::Unnest(Unnest { input, .. }) => vec![input],
+            LogicalPlan::Unnest(Unnest { input, .. })
+            | LogicalPlan::Pivot(Pivot { input, .. }) => vec![input],
             LogicalPlan::RecursiveQuery(RecursiveQuery {
                 static_term,
                 recursive_term,
@@ -589,7 +593,8 @@ impl LogicalPlan {
             | LogicalPlan::Copy(_)
             | LogicalPlan::Ddl(_)
             | LogicalPlan::DescribeTable(_)
-            | LogicalPlan::Unnest(_) => Ok(None),
+            | LogicalPlan::Unnest(_)
+            | LogicalPlan::Pivot(_) => Ok(None),
         }
     }
 
@@ -748,6 +753,39 @@ impl LogicalPlan {
             }) => {
                 // Update schema with unnested column type.
                 unnest_with_options(Arc::unwrap_or_clone(input), exec_columns, options)
+            }
+            LogicalPlan::Pivot(Pivot {
+                input,
+                aggregate_expr,
+                pivot_column,
+                pivot_values,
+                schema,
+                value_subquery,
+                default_on_null_expr,
+                ..
+            }) => {
+                // Create Pivot with the same value_subquery
+                let new_pivot = if let Some(subquery) = value_subquery {
+                    Pivot {
+                        input,
+                        aggregate_expr,
+                        pivot_column: pivot_column.clone(),
+                        pivot_values: pivot_values.clone(),
+                        schema: Arc::clone(&schema),
+                        value_subquery: Some(Arc::clone(&subquery)),
+                        default_on_null_expr: None,
+                    }
+                } else {
+                    Pivot::try_new(
+                        Arc::clone(&input),
+                        aggregate_expr.clone(),
+                        pivot_column.clone(),
+                        pivot_values.clone(),
+                        default_on_null_expr.clone(),
+                    )?
+                };
+
+                Ok(LogicalPlan::Pivot(new_pivot))
             }
         }
     }
@@ -1141,6 +1179,39 @@ impl LogicalPlan {
                     unnest_with_options(input, columns.clone(), options.clone())?;
                 Ok(new_plan)
             }
+            LogicalPlan::Pivot(Pivot {
+                aggregate_expr: _,
+                pivot_column,
+                pivot_values,
+                schema: _,
+                value_subquery,
+                default_on_null_expr,
+                ..
+            }) => {
+                let input = self.only_input(inputs)?;
+                let new_aggregate_expr = self.only_expr(expr)?;
+
+                // Create Pivot with the same value_subquery
+                let new_pivot = if let Some(subquery) = value_subquery {
+                    Pivot::try_new_with_subquery(
+                        Arc::new(input),
+                        new_aggregate_expr,
+                        pivot_column.clone(),
+                        Arc::clone(subquery),
+                        default_on_null_expr.clone(),
+                    )?
+                } else {
+                    Pivot::try_new(
+                        Arc::new(input),
+                        new_aggregate_expr,
+                        pivot_column.clone(),
+                        pivot_values.clone(),
+                        default_on_null_expr.clone(),
+                    )?
+                };
+
+                Ok(LogicalPlan::Pivot(new_pivot))
+            }
         }
     }
 
@@ -1373,7 +1444,8 @@ impl LogicalPlan {
             | LogicalPlan::Copy(_)
             | LogicalPlan::DescribeTable(_)
             | LogicalPlan::Statement(_)
-            | LogicalPlan::Extension(_) => None,
+            | LogicalPlan::Extension(_)
+            | LogicalPlan::Pivot(_) => None,
         }
     }
 
@@ -2018,6 +2090,20 @@ impl LogicalPlan {
                         expr_vec_fmt!(list_type_columns),
                         expr_vec_fmt!(struct_type_columns))
                     }
+                    LogicalPlan::Pivot(Pivot {
+                        aggregate_expr,
+                        pivot_column,
+                        pivot_values,
+                        ..
+                    }) => {
+                        write!(
+                            f,
+                            "Pivot: {} FOR {} IN ({})",
+                            aggregate_expr,
+                            pivot_column,
+                            pivot_values.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(", ")
+                        )
+                    }
                 }
             }
         }
@@ -2191,6 +2277,155 @@ pub fn projection_schema(input: &LogicalPlan, exprs: &[Expr]) -> Result<Arc<DFSc
             )?)?;
 
     Ok(Arc::new(schema))
+}
+
+/// Pivot operator for transforming rows into columns.
+/// This is used for queries that contain `PIVOT` clauses.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Pivot {
+    /// Input logical plan
+    pub input: Arc<LogicalPlan>,
+    /// Aggregate expression (e.g., SUM(amount))
+    pub aggregate_expr: Expr,
+    /// Column whose values become new columns
+    pub pivot_column: Column,
+    /// List of pivot values (distinct values from pivot column)
+    pub pivot_values: Vec<ScalarValue>,
+    /// Output schema after pivot
+    pub schema: DFSchemaRef,
+    /// Optional subquery for pivot values
+    /// When provided, this will be executed during physical planning
+    /// to dynamically determine the pivot values
+    pub value_subquery: Option<Arc<LogicalPlan>>,
+    /// Optional default value for replacing NULL values in the pivot result
+    pub default_on_null_expr: Option<Expr>,
+}
+
+impl PartialOrd for Pivot {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        let self_tuple = (
+            &self.input,
+            &self.aggregate_expr,
+            &self.pivot_column,
+            &self.pivot_values,
+            &self.value_subquery,
+            &self.default_on_null_expr,
+        );
+        let other_tuple = (
+            &other.input,
+            &other.aggregate_expr,
+            &other.pivot_column,
+            &other.pivot_values,
+            &other.value_subquery,
+            &other.default_on_null_expr,
+        );
+        self_tuple.partial_cmp(&other_tuple)
+    }
+}
+
+impl Pivot {
+    pub fn try_new(
+        input: Arc<LogicalPlan>,
+        aggregate_expr: Expr,
+        pivot_column: Column,
+        pivot_values: Vec<ScalarValue>,
+        default_on_null_expr: Option<Expr>,
+    ) -> Result<Self> {
+        let schema = pivot_schema(
+            input.schema(),
+            &aggregate_expr,
+            &pivot_column,
+            &pivot_values,
+        )?;
+
+        Ok(Self {
+            input,
+            aggregate_expr,
+            pivot_column,
+            pivot_values,
+            schema: Arc::new(schema),
+            value_subquery: None,
+            default_on_null_expr,
+        })
+    }
+
+    /// Create a new Pivot with a subquery for pivot values
+    pub fn try_new_with_subquery(
+        input: Arc<LogicalPlan>,
+        aggregate_expr: Expr,
+        pivot_column: Column,
+        value_subquery: Arc<LogicalPlan>,
+        default_on_null_expr: Option<Expr>,
+    ) -> Result<Self> {
+        let schema =
+            pivot_schema_without_values(input.schema(), &aggregate_expr, &pivot_column)?;
+
+        Ok(Self {
+            input,
+            aggregate_expr,
+            pivot_column,
+            pivot_values: Vec::new(),
+            schema: Arc::new(schema),
+            value_subquery: Some(value_subquery),
+            default_on_null_expr,
+        })
+    }
+}
+
+fn pivot_schema_without_values(
+    input_schema: &DFSchemaRef,
+    aggregate_expr: &Expr,
+    pivot_column: &Column,
+) -> Result<DFSchema> {
+    let mut fields = vec![];
+
+    // Include all fields except pivot and value columns
+    for field in input_schema.fields() {
+        if !aggregate_expr
+            .column_refs()
+            .iter()
+            .any(|col| col.name() == field.name())
+            && field.name() != pivot_column.name()
+        {
+            fields.push(Arc::clone(field));
+        }
+    }
+
+    let fields_with_table_ref: Vec<(Option<TableReference>, Arc<Field>)> =
+        fields.into_iter().map(|field| (None, field)).collect();
+
+    DFSchema::new_with_metadata(fields_with_table_ref, input_schema.metadata().clone())
+}
+
+fn pivot_schema(
+    input_schema: &DFSchemaRef,
+    aggregate_expr: &Expr,
+    pivot_column: &Column,
+    pivot_values: &[ScalarValue],
+) -> Result<DFSchema> {
+    let mut fields = vec![];
+
+    for field in input_schema.fields() {
+        if !aggregate_expr
+            .column_refs()
+            .iter()
+            .any(|col| col.name() == field.name())
+            && field.name() != pivot_column.name()
+        {
+            fields.push(Arc::clone(field));
+        }
+    }
+
+    for pivot_value in pivot_values {
+        let field_name = format!("{}", pivot_value);
+        let data_type = aggregate_expr.get_type(input_schema)?;
+        fields.push(Arc::new(Field::new(field_name, data_type, true)));
+    }
+
+    let fields_with_table_ref: Vec<(Option<TableReference>, Arc<Field>)> =
+        fields.into_iter().map(|field| (None, field)).collect();
+
+    DFSchema::new_with_metadata(fields_with_table_ref, input_schema.metadata().clone())
 }
 
 /// Aliased subquery

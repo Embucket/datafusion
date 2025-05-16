@@ -21,7 +21,8 @@ use crate::planner::{ContextProvider, PlannerContext, SqlToRel};
 
 use datafusion_common::tree_node::{Transformed, TreeNode};
 use datafusion_common::{
-    not_impl_err, plan_err, DFSchema, Diagnostic, Result, Span, Spans, TableReference,
+    not_impl_err, plan_err, Column, DFSchema, Diagnostic, Result, Span, Spans,
+    TableReference,
 };
 use datafusion_expr::builder::subquery_alias;
 use datafusion_expr::{expr::Unnest, Expr, LogicalPlan, LogicalPlanBuilder};
@@ -169,7 +170,136 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     "UNNEST table factor with offset is not supported yet"
                 );
             }
-            // @todo Support TableFactory::TableFunction?
+            TableFactor::Pivot {
+                table,
+                aggregate_functions,
+                value_column,
+                value_source,
+                default_on_null,
+                alias,
+            } => {
+                let input_plan = self.create_relation(*table, planner_context)?;
+
+                if aggregate_functions.len() != 1 {
+                    return plan_err!("PIVOT requires exactly one aggregate function");
+                }
+
+                let agg_expr = self.sql_expr_to_logical_expr(
+                    aggregate_functions[0].expr.clone(),
+                    input_plan.schema(),
+                    planner_context,
+                )?;
+
+                if value_column.is_empty() {
+                    return plan_err!("PIVOT value column is required");
+                }
+
+                let column_name = value_column.last().unwrap().value.clone();
+                let pivot_column = Column::new(None::<&str>, column_name);
+
+                let default_on_null_expr = default_on_null
+                    .map(|expr| {
+                        self.sql_expr_to_logical_expr(
+                            expr,
+                            input_plan.schema(), // Default expression should be context-independent or use input schema
+                            planner_context,
+                        )
+                    })
+                    .transpose()?;
+
+                match value_source {
+                    sqlparser::ast::PivotValueSource::List(exprs) => {
+                        let pivot_values = exprs
+                            .iter()
+                            .map(|expr| {
+                                let logical_expr = self.sql_expr_to_logical_expr(
+                                    expr.expr.clone(),
+                                    input_plan.schema(),
+                                    planner_context,
+                                )?;
+
+                                match logical_expr {
+                                    Expr::Literal(scalar) => Ok(scalar),
+                                    _ => plan_err!("PIVOT values must be literals"),
+                                }
+                            })
+                            .collect::<Result<Vec<_>>>()?;
+
+                        let input_arc = Arc::new(input_plan);
+
+                        let pivot_plan = datafusion_expr::Pivot::try_new(
+                            input_arc,
+                            agg_expr,
+                            pivot_column,
+                            pivot_values,
+                            default_on_null_expr.clone(),
+                        )?;
+
+                        (LogicalPlan::Pivot(pivot_plan), alias)
+                    }
+                    sqlparser::ast::PivotValueSource::Any(order_by) => {
+                        let input_arc = Arc::new(input_plan);
+
+                        let mut subquery_builder =
+                            LogicalPlanBuilder::from(input_arc.as_ref().clone())
+                                .project(vec![Expr::Column(pivot_column.clone())])?
+                                .distinct()?;
+
+                        if !order_by.is_empty() {
+                            let sort_exprs = order_by
+                                .iter()
+                                .map(|item| {
+                                    let input_schema = subquery_builder.schema();
+
+                                    let expr = self.sql_expr_to_logical_expr(
+                                        item.expr.clone(),
+                                        input_schema,
+                                        planner_context,
+                                    );
+
+                                    expr.map(|e| {
+                                        e.sort(
+                                            item.options.asc.unwrap_or(true),
+                                            item.options.nulls_first.unwrap_or(false),
+                                        )
+                                    })
+                                })
+                                .collect::<Result<Vec<_>>>()?;
+
+                            subquery_builder = subquery_builder.sort(sort_exprs)?;
+                        }
+
+                        let subquery_plan = subquery_builder.build()?;
+
+                        let pivot_plan = datafusion_expr::Pivot::try_new_with_subquery(
+                            input_arc,
+                            agg_expr,
+                            pivot_column,
+                            Arc::new(subquery_plan),
+                            default_on_null_expr.clone(),
+                        )?;
+
+                        (LogicalPlan::Pivot(pivot_plan), alias)
+                    }
+                    sqlparser::ast::PivotValueSource::Subquery(subquery) => {
+                        let subquery_plan =
+                            self.query_to_plan(*subquery.clone(), planner_context)?;
+
+                        let input_arc = Arc::new(input_plan);
+
+                        let pivot_plan = datafusion_expr::Pivot::try_new_with_subquery(
+                            input_arc,
+                            agg_expr,
+                            pivot_column,
+                            Arc::new(subquery_plan),
+                            default_on_null_expr.clone(),
+                        )?;
+
+                        (LogicalPlan::Pivot(pivot_plan), alias)
+                    }
+                }
+            }
+            // @todo: Support TableFactory::TableFunction
             _ => {
                 return not_impl_err!(
                     "Unsupported ast node {relation:?} in create_relation"
