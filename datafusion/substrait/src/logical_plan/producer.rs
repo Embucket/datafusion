@@ -21,8 +21,8 @@ use substrait::proto::expression_reference::ExprType;
 use datafusion::arrow::datatypes::{Field, IntervalUnit};
 use datafusion::logical_expr::{
     Aggregate, Distinct, EmptyRelation, Extension, Filter, Join, Like, Limit,
-    Partitioning, Pivot, Projection, Repartition, Sort, SortExpr, SubqueryAlias,
-    TableScan, TryCast, Union, Values, Window, WindowFrameUnits,
+    Partitioning, Projection, Repartition, Sort, SortExpr, SubqueryAlias, TableScan,
+    TryCast, Union, Values, Window, WindowFrameUnits,
 };
 use datafusion::{
     arrow::datatypes::{DataType, TimeUnit},

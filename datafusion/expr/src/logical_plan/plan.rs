@@ -767,17 +767,17 @@ impl LogicalPlan {
                 // Create Pivot with the same value_subquery
                 let new_pivot = if let Some(subquery) = value_subquery {
                     Pivot {
-                        input: input,
-                        aggregate_expr: aggregate_expr,
+                        input,
+                        aggregate_expr,
                         pivot_column: pivot_column.clone(),
                         pivot_values: pivot_values.clone(),
-                        schema: schema.clone(),
+                        schema: Arc::clone(&schema),
                         value_subquery: Some(Arc::clone(&subquery)),
                         default_on_null_expr: None,
                     }
                 } else {
                     Pivot::try_new(
-                        input.clone(),
+                        Arc::clone(&input),
                         aggregate_expr.clone(),
                         pivot_column.clone(),
                         pivot_values.clone(),
@@ -1197,7 +1197,7 @@ impl LogicalPlan {
                         Arc::new(input),
                         new_aggregate_expr,
                         pivot_column.clone(),
-                        subquery.clone(),
+                        Arc::clone(subquery),
                         default_on_null_expr.clone(),
                     )?
                 } else {
@@ -2387,7 +2387,7 @@ fn pivot_schema_without_values(
             .any(|col| col.name() == field.name())
             && field.name() != pivot_column.name()
         {
-            fields.push(field.clone());
+            fields.push(Arc::clone(field));
         }
     }
 
@@ -2412,7 +2412,7 @@ fn pivot_schema(
             .any(|col| col.name() == field.name())
             && field.name() != pivot_column.name()
         {
-            fields.push(field.clone());
+            fields.push(Arc::clone(field));
         }
     }
 

@@ -19,14 +19,12 @@ use std::sync::Arc;
 
 use crate::planner::{ContextProvider, PlannerContext, SqlToRel};
 
-use arrow::datatypes::Field;
 use datafusion_common::tree_node::{Transformed, TreeNode};
 use datafusion_common::{
-    not_impl_err, plan_err, Column, DFSchema, DFSchemaRef, Diagnostic, Result,
-    ScalarValue, Span, Spans, TableReference,
+    not_impl_err, plan_err, Column, DFSchema, Diagnostic, Result, Span, Spans,
+    TableReference,
 };
 use datafusion_expr::builder::subquery_alias;
-use datafusion_expr::type_coercion::binary::comparison_coercion;
 use datafusion_expr::{expr::Unnest, Expr, LogicalPlan, LogicalPlanBuilder};
 use datafusion_expr::{Subquery, SubqueryAlias};
 use sqlparser::ast::{FunctionArg, FunctionArgExpr, Spanned, TableFactor};

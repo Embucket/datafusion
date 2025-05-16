@@ -17007,7 +17007,7 @@ impl serde::Serialize for PivotNode {
         if self.input.is_some() {
             len += 1;
         }
-        if !self.aggregate_expr.is_empty() {
+        if self.aggregate_expr.is_some() {
             len += 1;
         }
         if self.pivot_column.is_some() {
@@ -17019,12 +17019,18 @@ impl serde::Serialize for PivotNode {
         if self.schema.is_some() {
             len += 1;
         }
+        if self.value_subquery.is_some() {
+            len += 1;
+        }
+        if self.default_on_null_expr.is_some() {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("datafusion.PivotNode", len)?;
         if let Some(v) = self.input.as_ref() {
             struct_ser.serialize_field("input", v)?;
         }
-        if !self.aggregate_expr.is_empty() {
-            struct_ser.serialize_field("aggregateExpr", &self.aggregate_expr)?;
+        if let Some(v) = self.aggregate_expr.as_ref() {
+            struct_ser.serialize_field("aggregateExpr", v)?;
         }
         if let Some(v) = self.pivot_column.as_ref() {
             struct_ser.serialize_field("pivotColumn", v)?;
@@ -17034,6 +17040,12 @@ impl serde::Serialize for PivotNode {
         }
         if let Some(v) = self.schema.as_ref() {
             struct_ser.serialize_field("schema", v)?;
+        }
+        if let Some(v) = self.value_subquery.as_ref() {
+            struct_ser.serialize_field("valueSubquery", v)?;
+        }
+        if let Some(v) = self.default_on_null_expr.as_ref() {
+            struct_ser.serialize_field("defaultOnNullExpr", v)?;
         }
         struct_ser.end()
     }
@@ -17053,6 +17065,10 @@ impl<'de> serde::Deserialize<'de> for PivotNode {
             "pivot_values",
             "pivotValues",
             "schema",
+            "value_subquery",
+            "valueSubquery",
+            "default_on_null_expr",
+            "defaultOnNullExpr",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -17062,6 +17078,8 @@ impl<'de> serde::Deserialize<'de> for PivotNode {
             PivotColumn,
             PivotValues,
             Schema,
+            ValueSubquery,
+            DefaultOnNullExpr,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -17088,6 +17106,8 @@ impl<'de> serde::Deserialize<'de> for PivotNode {
                             "pivotColumn" | "pivot_column" => Ok(GeneratedField::PivotColumn),
                             "pivotValues" | "pivot_values" => Ok(GeneratedField::PivotValues),
                             "schema" => Ok(GeneratedField::Schema),
+                            "valueSubquery" | "value_subquery" => Ok(GeneratedField::ValueSubquery),
+                            "defaultOnNullExpr" | "default_on_null_expr" => Ok(GeneratedField::DefaultOnNullExpr),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -17112,6 +17132,8 @@ impl<'de> serde::Deserialize<'de> for PivotNode {
                 let mut pivot_column__ = None;
                 let mut pivot_values__ = None;
                 let mut schema__ = None;
+                let mut value_subquery__ = None;
+                let mut default_on_null_expr__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::Input => {
@@ -17124,7 +17146,7 @@ impl<'de> serde::Deserialize<'de> for PivotNode {
                             if aggregate_expr__.is_some() {
                                 return Err(serde::de::Error::duplicate_field("aggregateExpr"));
                             }
-                            aggregate_expr__ = Some(map_.next_value()?);
+                            aggregate_expr__ = map_.next_value()?;
                         }
                         GeneratedField::PivotColumn => {
                             if pivot_column__.is_some() {
@@ -17144,14 +17166,28 @@ impl<'de> serde::Deserialize<'de> for PivotNode {
                             }
                             schema__ = map_.next_value()?;
                         }
+                        GeneratedField::ValueSubquery => {
+                            if value_subquery__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("valueSubquery"));
+                            }
+                            value_subquery__ = map_.next_value()?;
+                        }
+                        GeneratedField::DefaultOnNullExpr => {
+                            if default_on_null_expr__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("defaultOnNullExpr"));
+                            }
+                            default_on_null_expr__ = map_.next_value()?;
+                        }
                     }
                 }
                 Ok(PivotNode {
                     input: input__,
-                    aggregate_expr: aggregate_expr__.unwrap_or_default(),
+                    aggregate_expr: aggregate_expr__,
                     pivot_column: pivot_column__,
                     pivot_values: pivot_values__.unwrap_or_default(),
                     schema: schema__,
+                    value_subquery: value_subquery__,
+                    default_on_null_expr: default_on_null_expr__,
                 })
             }
         }

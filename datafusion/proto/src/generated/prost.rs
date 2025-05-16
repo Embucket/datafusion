@@ -1939,17 +1939,19 @@ pub struct PivotNode {
     #[prost(message, optional, boxed, tag = "1")]
     pub input: ::core::option::Option<::prost::alloc::boxed::Box<LogicalPlanNode>>,
     #[prost(message, optional, tag = "2")]
-    pub aggregate_expr: ::core::option::Option<::prost::alloc::boxed::Box<LogicalExprNode>>,
+    pub aggregate_expr: ::core::option::Option<LogicalExprNode>,
     #[prost(message, optional, tag = "3")]
     pub pivot_column: ::core::option::Option<super::datafusion_common::Column>,
     #[prost(message, repeated, tag = "4")]
     pub pivot_values: ::prost::alloc::vec::Vec<super::datafusion_common::ScalarValue>,
     #[prost(message, optional, tag = "5")]
     pub schema: ::core::option::Option<super::datafusion_common::DfSchema>,
-    #[prost(message, optional, tag = "6")]
-    pub value_subquery: ::core::option::Option<::prost::alloc::boxed::Box<LogicalPlanNode>>,
+    #[prost(message, optional, boxed, tag = "6")]
+    pub value_subquery: ::core::option::Option<
+        ::prost::alloc::boxed::Box<LogicalPlanNode>,
+    >,
     #[prost(message, optional, tag = "7")]
-    pub default_on_null_expr: ::core::option::Option<::prost::alloc::boxed::Box<LogicalExprNode>>,
+    pub default_on_null_expr: ::core::option::Option<LogicalExprNode>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]

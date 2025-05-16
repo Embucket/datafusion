@@ -1289,8 +1289,11 @@ message CteWorkTableScanNode {
 
 message PivotNode {
     LogicalPlanNode input = 1;
-    repeated LogicalExprNode aggregate_expr = 2;
+    LogicalExprNode aggregate_expr = 2;
     datafusion_common.Column pivot_column = 3;
     repeated datafusion_common.ScalarValue pivot_values = 4;
     datafusion_common.DfSchema schema = 5;
+    LogicalPlanNode value_subquery = 6;
+    LogicalExprNode default_on_null_expr = 7;
+
 }

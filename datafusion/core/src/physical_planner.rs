@@ -908,9 +908,11 @@ impl DefaultPhysicalPlanner {
                         .create_physical_plan(&optimized_subquery, session_state)
                         .await?;
 
-                    let subquery_results =
-                        collect(subquery_physical_plan.clone(), session_state.task_ctx())
-                            .await?;
+                    let subquery_results = collect(
+                        Arc::clone(&subquery_physical_plan),
+                        session_state.task_ctx(),
+                    )
+                    .await?;
 
                     let mut pivot_values = Vec::new();
                     for batch in subquery_results.iter() {
@@ -1771,7 +1773,7 @@ pub fn transform_pivot_to_aggregate(
         .map(|col: datafusion_common::Column| Expr::Column(col))
         .collect();
 
-    let builder = LogicalPlanBuilder::from(Arc::unwrap_or_clone(input.clone()));
+    let builder = LogicalPlanBuilder::from(Arc::unwrap_or_clone(input));
 
     // Create the aggregate plan with filtered aggregates
     let mut aggregate_exprs = Vec::new();
@@ -1788,7 +1790,7 @@ pub fn transform_pivot_to_aggregate(
                 let mut new_params = agg.params.clone();
                 new_params.filter = Some(Box::new(filter_condition));
                 Expr::AggregateFunction(AggregateFunction {
-                    func: agg.func.clone(),
+                    func: Arc::clone(&agg.func),
                     params: new_params,
                 })
             }
@@ -2229,45 +2231,35 @@ impl DefaultPhysicalPlanner {
             .collect::<Result<Vec<_>>>()?;
 
         // When we detect a PIVOT-derived plan with a value_subquery, ensure all generated columns are preserved
-        match input.as_ref() {
-            LogicalPlan::Pivot(pivot) => {
+        if let LogicalPlan::Pivot(pivot) = input.as_ref()
+            {
                 if pivot.value_subquery.is_some()
-                    && input_exec
-                        .as_any()
-                        .downcast_ref::<AggregateExec>()
-                        .is_some()
-                {
-                    let agg_exec =
-                        input_exec.as_any().downcast_ref::<AggregateExec>().unwrap();
-                    let schema = input_exec.schema();
-                    let group_by_len = agg_exec.group_expr().expr().len();
+            && input_exec
+                .as_any()
+                .downcast_ref::<AggregateExec>()
+                .is_some()
+        {
+            let agg_exec = input_exec.as_any().downcast_ref::<AggregateExec>().unwrap();
+            let schema = input_exec.schema();
+            let group_by_len = agg_exec.group_expr().expr().len();
 
-                    if group_by_len < schema.fields().len() {
-                        let mut all_exprs = physical_exprs.clone();
+            if group_by_len < schema.fields().len() {
+                let mut all_exprs = physical_exprs.clone();
 
-                        for (i, field) in
-                            schema.fields().iter().enumerate().skip(group_by_len)
-                        {
-                            if !physical_exprs
-                                .iter()
-                                .any(|(_, name)| name == field.name())
-                            {
-                                all_exprs.push((
-                                    Arc::new(Column::new(field.name(), i))
-                                        as Arc<dyn PhysicalExpr>,
-                                    field.name().clone(),
-                                ));
-                            }
-                        }
-
-                        return Ok(Arc::new(ProjectionExec::try_new(
-                            all_exprs, input_exec,
-                        )?));
+                for (i, field) in schema.fields().iter().enumerate().skip(group_by_len) {
+                    if !physical_exprs.iter().any(|(_, name)| name == field.name()) {
+                        all_exprs.push((
+                            Arc::new(Column::new(field.name(), i))
+                                as Arc<dyn PhysicalExpr>,
+                            field.name().clone(),
+                        ));
                     }
                 }
+
+                return Ok(Arc::new(ProjectionExec::try_new(all_exprs, input_exec)?));
             }
-            _ => {}
         }
+    }
 
         Ok(Arc::new(ProjectionExec::try_new(
             physical_exprs,
