@@ -21,13 +21,14 @@ use crate::planner::{ContextProvider, PlannerContext, SqlToRel};
 
 use datafusion_common::tree_node::{Transformed, TreeNode};
 use datafusion_common::{
-    not_impl_err, plan_err, Column, DFSchema, Diagnostic, Result, ScalarValue, Span, Spans, TableReference
+    not_impl_err, plan_err, Column, DFSchema, Diagnostic, Result, ScalarValue, Span,
+    Spans, TableReference,
 };
+use datafusion_expr::binary::comparison_coercion;
 use datafusion_expr::builder::subquery_alias;
 use datafusion_expr::{expr::Unnest, Expr, LogicalPlan, LogicalPlanBuilder};
 use datafusion_expr::{Subquery, SubqueryAlias};
-use sqlparser::ast::{FunctionArg, FunctionArgExpr, Spanned, TableFactor, NullInclusion};
-use datafusion_expr::binary::comparison_coercion;
+use sqlparser::ast::{FunctionArg, FunctionArgExpr, NullInclusion, Spanned, TableFactor};
 
 mod join;
 
@@ -309,45 +310,47 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             } => {
                 let base_plan = self.create_relation(*table, planner_context)?;
                 let base_schema = base_plan.schema();
-                
+
                 let value_column = value.value.clone();
                 let name_column = name.value.clone();
-                
+
                 let mut unpivot_column_indices = Vec::new();
                 let mut unpivot_column_names = Vec::new();
-                
+
                 let mut common_type = None;
-                
+
                 for column_ident in &columns {
                     let column_name = column_ident.value.clone();
-                    
-                    if let Some(idx) = base_schema.index_of_column_by_name(None, &column_name) {
+
+                    if let Some(idx) =
+                        base_schema.index_of_column_by_name(None, &column_name)
+                    {
                         let field = base_schema.field(idx);
                         let field_type = field.data_type();
-                        
+
                         // Verify all unpivot columns have compatible types
                         if let Some(current_type) = &common_type {
                             if comparison_coercion(current_type, field_type).is_none() {
                                 return plan_err!(
-                                    "UNPIVOT columns must have the same data type. Found {} and {}",
-                                    current_type, field_type
+                                    "The type of column '{}' conflicts with the type of other columns in the UNPIVOT list.",
+                                    column_name.to_uppercase()
                                 );
                             }
                         } else {
                             common_type = Some(field_type.clone());
                         }
-                        
+
                         unpivot_column_indices.push(idx);
                         unpivot_column_names.push(column_name);
                     } else {
                         return plan_err!("Column '{}' not found in input", column_name);
                     }
                 }
-                
+
                 if unpivot_column_names.is_empty() {
                     return plan_err!("UNPIVOT requires at least one column to unpivot");
                 }
-                
+
                 let non_pivot_exprs: Vec<Expr> = base_schema
                     .fields()
                     .iter()
@@ -355,41 +358,48 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     .filter(|(i, _)| !unpivot_column_indices.contains(i))
                     .map(|(_, f)| Expr::Column(Column::new(None::<&str>, f.name())))
                     .collect();
-                
+
                 let mut union_inputs = Vec::with_capacity(unpivot_column_names.len());
-                
+
                 for col_name in &unpivot_column_names {
                     let mut projection_exprs = non_pivot_exprs.clone();
-                    
-                    let name_expr = Expr::Literal(ScalarValue::Utf8(Some(col_name.clone())))
-                        .alias(name_column.clone());
-                    
-                    let value_expr = Expr::Column(Column::new(None::<&str>, col_name.clone()))
-                        .alias(value_column.clone());
-                    
+
+                    let name_expr =
+                        Expr::Literal(ScalarValue::Utf8(Some(col_name.clone())))
+                            .alias(name_column.clone());
+
+                    let value_expr =
+                        Expr::Column(Column::new(None::<&str>, col_name.clone()))
+                            .alias(value_column.clone());
+
                     projection_exprs.push(name_expr);
                     projection_exprs.push(value_expr);
-                    
+
                     let mut builder = LogicalPlanBuilder::from(base_plan.clone())
                         .project(projection_exprs)?;
-                    
-                    if null_inclusion.clone().unwrap_or(NullInclusion::ExcludeNulls) == NullInclusion::ExcludeNulls {
+
+                    if null_inclusion
+                        .clone()
+                        .unwrap_or(NullInclusion::ExcludeNulls)
+                        == NullInclusion::ExcludeNulls
+                    {
                         let col = Column::new(None::<&str>, value_column.clone());
-                        builder = builder.filter(Expr::IsNotNull(Box::new(Expr::Column(col))))?;
+                        builder = builder
+                            .filter(Expr::IsNotNull(Box::new(Expr::Column(col))))?;
                     }
-                    
+
                     union_inputs.push(builder.build()?);
                 }
-                
+
                 let first = union_inputs.remove(0);
                 let mut union_builder = LogicalPlanBuilder::from(first);
-                
+
                 for plan in union_inputs {
                     union_builder = union_builder.union(plan)?;
                 }
-                
+
                 let unpivot_plan = union_builder.build()?;
-                
+
                 (unpivot_plan, alias)
             }
             // @todo: Support TableFactory::TableFunction
