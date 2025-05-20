@@ -76,7 +76,7 @@ use datafusion_expr::expr::{
 use datafusion_expr::expr_rewriter::unnormalize_cols;
 use datafusion_expr::logical_plan::builder::wrap_projection_for_join_if_necessary;
 use datafusion_expr::{
-    Analyze, BinaryExpr, DescribeTable, DmlStatement, Explain, ExplainFormat, Extension,
+    Analyze, BinaryExpr, Cast, DescribeTable, DmlStatement, Explain, ExplainFormat, Extension,
     FetchType, Filter, JoinType, LogicalPlanBuilder, RecursiveQuery, SkipType,
     StringifiedPlan, WindowFrame, WindowFrameBound, WriteOp,
 };
@@ -1773,16 +1773,26 @@ pub fn transform_pivot_to_aggregate(
         .map(|col: datafusion_common::Column| Expr::Column(col))
         .collect();
 
-    let builder = LogicalPlanBuilder::from(Arc::unwrap_or_clone(input));
+    let builder = LogicalPlanBuilder::from(Arc::unwrap_or_clone(input.clone()));
 
     // Create the aggregate plan with filtered aggregates
     let mut aggregate_exprs = Vec::new();
+
+    let input_schema = input.schema();
+    let pivot_col_idx = match input_schema.index_of_column(pivot_column) {
+        Ok(idx) => idx,
+        Err(_) => return plan_err!("Pivot column '{}' does not exist in input schema", pivot_column),
+    };
+    let pivot_col_type = input_schema.field(pivot_col_idx).data_type();
 
     for value in &pivot_values {
         let filter_condition = Expr::BinaryExpr(BinaryExpr::new(
             Box::new(Expr::Column(pivot_column.clone())),
             Operator::IsNotDistinctFrom,
-            Box::new(Expr::Literal(value.clone())),
+            Box::new(Expr::Cast(Cast::new(
+                Box::new(Expr::Literal(value.clone())),
+                pivot_col_type.clone(),
+            ))),
         ));
 
         let filtered_agg = match aggregate_expr {
