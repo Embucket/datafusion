@@ -76,8 +76,8 @@ use datafusion_expr::expr::{
 use datafusion_expr::expr_rewriter::unnormalize_cols;
 use datafusion_expr::logical_plan::builder::wrap_projection_for_join_if_necessary;
 use datafusion_expr::{
-    Analyze, BinaryExpr, Cast, DescribeTable, DmlStatement, Explain, ExplainFormat, Extension,
-    FetchType, Filter, JoinType, LogicalPlanBuilder, RecursiveQuery, SkipType,
+    Analyze, BinaryExpr, Cast, DescribeTable, DmlStatement, Explain, ExplainFormat,
+    Extension, FetchType, Filter, JoinType, LogicalPlanBuilder, RecursiveQuery, SkipType,
     StringifiedPlan, WindowFrame, WindowFrameBound, WriteOp,
 };
 use datafusion_physical_expr::aggregate::{AggregateExprBuilder, AggregateFunctionExpr};
@@ -1781,7 +1781,12 @@ pub fn transform_pivot_to_aggregate(
     let input_schema = input.schema();
     let pivot_col_idx = match input_schema.index_of_column(pivot_column) {
         Ok(idx) => idx,
-        Err(_) => return plan_err!("Pivot column '{}' does not exist in input schema", pivot_column),
+        Err(_) => {
+            return plan_err!(
+                "Pivot column '{}' does not exist in input schema",
+                pivot_column
+            )
+        }
     };
     let pivot_col_type = input_schema.field(pivot_col_idx).data_type();
 
