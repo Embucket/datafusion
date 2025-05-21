@@ -1,0 +1,269 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+
+#   http://www.apache.org/licenses/LICENSE-2.0
+
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+#######
+# Setup test data table
+#######
+statement ok
+CREATE TABLE monthly_sales(
+  empid INT,
+  dept TEXT,
+  jan INT,
+  feb INT,
+  mar INT,
+  apr INT)
+  AS SELECT * FROM VALUES
+    (1, 'electronics', 100, 200, 300, 100),
+    (2, 'clothes', 100, 300, 150, 200),
+    (3, 'cars', 200, 400, 100, 50),
+    (4, 'appliances', 100, NULL, 100, 50);
+
+# Basic UNPIVOT excluding nulls (default behavior)
+query ITTI
+SELECT *
+  FROM monthly_sales
+    UNPIVOT (sales FOR month IN (jan, feb, mar, apr))
+  ORDER BY empid;
+----
+1 electronics jan 100
+1 electronics feb 200
+1 electronics mar 300
+1 electronics apr 100
+2 clothes jan 100
+2 clothes feb 300
+2 clothes mar 150
+2 clothes apr 200
+3 cars jan 200
+3 cars feb 400
+3 cars mar 100
+3 cars apr 50
+4 appliances jan 100
+4 appliances mar 100
+4 appliances apr 50
+
+# UNPIVOT with INCLUDE NULLS option
+query ITTI
+SELECT *
+  FROM monthly_sales
+    UNPIVOT INCLUDE NULLS (sales FOR month IN (jan, feb, mar, apr))
+  ORDER BY empid;
+----
+1 electronics jan 100
+1 electronics feb 200
+1 electronics mar 300
+1 electronics apr 100
+2 clothes jan 100
+2 clothes feb 300
+2 clothes mar 150
+2 clothes apr 200
+3 cars jan 200
+3 cars feb 400
+3 cars mar 100
+3 cars apr 50
+4 appliances jan 100
+4 appliances feb NULL
+4 appliances mar 100
+4 appliances apr 50
+
+query TTI
+SELECT dept, month, sales
+  FROM monthly_sales
+    UNPIVOT (sales FOR month IN (jan, feb, mar, apr))
+  ORDER BY dept;
+----
+appliances jan 100
+appliances mar 100
+appliances apr 50
+cars jan 200
+cars feb 400
+cars mar 100
+cars apr 50
+clothes jan 100
+clothes feb 300
+clothes mar 150
+clothes apr 200
+electronics jan 100
+electronics feb 200
+electronics mar 300
+electronics apr 100
+
+# UNPIVOT with filtering
+query ITTI
+SELECT *
+  FROM monthly_sales
+    UNPIVOT (sales FOR month IN (jan, feb, mar, apr))
+  WHERE sales > 100
+  ORDER BY empid;
+----
+1 electronics feb 200
+1 electronics mar 300
+2 clothes feb 300
+2 clothes mar 150
+2 clothes apr 200
+3 cars jan 200
+3 cars feb 400
+
+# UNPIVOT with aggregation
+query TI
+SELECT month, SUM(sales) as total_sales
+  FROM monthly_sales
+    UNPIVOT (sales FOR month IN (jan, feb, mar, apr))
+  GROUP BY month
+  ORDER BY month;
+----
+apr 400
+feb 900
+jan 500
+mar 650
+
+# UNPIVOT with JOIN
+query ITTI
+SELECT e.empid, e.dept, u.month, u.sales
+  FROM monthly_sales e
+  JOIN (
+    SELECT empid, month, sales
+    FROM monthly_sales
+    UNPIVOT (sales FOR month IN (jan, feb, mar, apr))
+  ) u ON e.empid = u.empid
+  WHERE u.sales > 200
+  ORDER BY e.empid, u.month;
+----
+1 electronics mar 300
+2 clothes feb 300
+3 cars feb 400
+
+query ITIITI
+SELECT *
+  FROM monthly_sales
+    UNPIVOT (sales FOR month IN (jan, mar))
+  ORDER BY empid;
+----
+1 electronics 200 100 jan 100
+1 electronics 200 100 mar 300
+2 clothes 300 200 jan 100
+2 clothes 300 200 mar 150
+3 cars 400 50 jan 200
+3 cars 400 50 mar 100
+4 appliances NULL 50 jan 100
+4 appliances NULL 50 mar 100
+
+# UNPIVOT with HAVING clause
+query TI
+SELECT month, SUM(sales) as total_sales
+  FROM monthly_sales
+    UNPIVOT (sales FOR month IN (jan, feb, mar, apr))
+  GROUP BY month
+  HAVING SUM(sales) > 400
+  ORDER BY month;
+----
+feb 900
+jan 500
+mar 650
+
+# UNPIVOT with subquery
+query ITTI
+SELECT *
+  FROM (
+    SELECT empid, dept, jan, feb, mar
+    FROM monthly_sales
+    WHERE dept IN ('electronics', 'clothes')
+  )
+  UNPIVOT (sales FOR month IN (jan, feb, mar))
+  ORDER BY empid;
+----
+1 electronics jan 100
+1 electronics feb 200
+1 electronics mar 300
+2 clothes jan 100
+2 clothes feb 300
+2 clothes mar 150
+
+# Non-existent column in the column list
+query error DataFusion error: Error during planning: Column 'non_existent' not found in input
+SELECT *
+  FROM monthly_sales
+    UNPIVOT (sales FOR month IN (non_existent, feb, mar))
+  ORDER BY empid;
+
+statement ok
+CREATE TABLE mixed_types(
+  id INT,
+  col1 INT,
+  col2 TEXT,
+  col3 FLOAT)
+  AS SELECT * FROM VALUES
+    (1, 100, 'abc', 10.5),
+    (2, 200, 'def', 20.5);
+
+query ITT
+SELECT *
+  FROM mixed_types
+    UNPIVOT (val FOR col_name IN (col1, col2, col3))
+  ORDER BY id;
+----
+1 col1 100
+1 col2 abc
+1 col3 10.5
+2 col1 200
+2 col2 def
+2 col3 20.5
+
+# UNPIVOT with CTE
+query ITTI
+WITH sales_data AS (
+  SELECT * FROM monthly_sales WHERE empid < 3
+)
+SELECT *
+  FROM sales_data
+    UNPIVOT (sales FOR month IN (jan, feb, mar, apr))
+  ORDER BY empid;
+----
+1 electronics jan 100
+1 electronics feb 200
+1 electronics mar 300
+1 electronics apr 100
+2 clothes jan 100
+2 clothes feb 300
+2 clothes mar 150
+2 clothes apr 200
+
+# UNPIVOT with UNION
+query ITIITI
+SELECT *
+  FROM monthly_sales
+    UNPIVOT (sales FOR month IN (jan, feb))
+  UNION ALL
+SELECT *
+  FROM monthly_sales
+    UNPIVOT (sales FOR month IN (mar, apr))
+  ORDER BY empid, month;
+----
+1 electronics 100 200 apr 100
+1 electronics 300 100 feb 200
+1 electronics 300 100 jan 100
+1 electronics 100 200 mar 300
+2 clothes 100 300 apr 200
+2 clothes 150 200 feb 300
+2 clothes 150 200 jan 100
+2 clothes 100 300 mar 150
+3 cars 200 400 apr 50
+3 cars 100 50 feb 400
+3 cars 100 50 jan 200
+3 cars 200 400 mar 100
+4 appliances 100 NULL apr 50
+4 appliances 100 50 jan 100
+4 appliances 100 NULL mar 100
