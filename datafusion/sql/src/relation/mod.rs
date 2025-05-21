@@ -322,29 +322,31 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 for column_ident in &columns {
                     let column_name = column_ident.value.clone();
 
-                    if let Some(idx) =
+                    let idx = if let Some(i) =
                         base_schema.index_of_column_by_name(None, &column_name)
                     {
-                        let field = base_schema.field(idx);
-                        let field_type = field.data_type();
+                        i
+                    } else {
+                        return plan_err!("Column '{}' not found in input", column_name);
+                    };
 
-                        // Verify all unpivot columns have compatible types
-                        if let Some(current_type) = &common_type {
-                            if comparison_coercion(current_type, field_type).is_none() {
-                                return plan_err!(
+                    let field = base_schema.field(idx);
+                    let field_type = field.data_type();
+
+                    // Verify all unpivot columns have compatible types
+                    if let Some(current_type) = &common_type {
+                        if comparison_coercion(current_type, field_type).is_none() {
+                            return plan_err!(
                                     "The type of column '{}' conflicts with the type of other columns in the UNPIVOT list.",
                                     column_name.to_uppercase()
                                 );
-                            }
-                        } else {
-                            common_type = Some(field_type.clone());
                         }
-
-                        unpivot_column_indices.push(idx);
-                        unpivot_column_names.push(column_name);
                     } else {
-                        return plan_err!("Column '{}' not found in input", column_name);
+                        common_type = Some(field_type.clone());
                     }
+
+                    unpivot_column_indices.push(idx);
+                    unpivot_column_names.push(column_name);
                 }
 
                 if unpivot_column_names.is_empty() {
@@ -378,11 +380,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     let mut builder = LogicalPlanBuilder::from(base_plan.clone())
                         .project(projection_exprs)?;
 
-                    if null_inclusion
-                        .clone()
-                        .unwrap_or(NullInclusion::ExcludeNulls)
-                        == NullInclusion::ExcludeNulls
-                    {
+                    if let Some(NullInclusion::ExcludeNulls) | None = null_inclusion {
                         let col = Column::new(None::<&str>, value_column.clone());
                         builder = builder
                             .filter(Expr::IsNotNull(Box::new(Expr::Column(col))))?;
