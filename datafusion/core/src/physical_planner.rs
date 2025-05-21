@@ -1773,7 +1773,7 @@ pub fn transform_pivot_to_aggregate(
         .map(|col: datafusion_common::Column| Expr::Column(col))
         .collect();
 
-    let builder = LogicalPlanBuilder::from(Arc::unwrap_or_clone(input.clone()));
+    let builder = LogicalPlanBuilder::from(Arc::unwrap_or_clone(Arc::clone(&input)));
 
     // Create the aggregate plan with filtered aggregates
     let mut aggregate_exprs = Vec::new();
