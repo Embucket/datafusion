@@ -358,7 +358,11 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     .iter()
                     .enumerate()
                     .filter(|(i, _)| !unpivot_column_indices.contains(i))
-                    .map(|(_, f)| Expr::Column(Column::new(None::<&str>, f.name())))
+                    .map(|(_, f)| {
+                        // Use alias with metadata to preserve field metadata in projection
+                        Expr::Column(Column::new(None::<&str>, f.name()))
+                            .alias_with_metadata(f.name(), Some(f.metadata().clone()))
+                    })
                     .collect();
 
                 let mut union_inputs = Vec::with_capacity(unpivot_column_names.len());
@@ -370,9 +374,12 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                         Expr::Literal(ScalarValue::Utf8(Some(col_name.clone())))
                             .alias(name_column.clone());
 
+                    // Create value column, preserving metadata from the original field
+                    let original_field_idx = base_schema.index_of_column_by_name(None, col_name).unwrap();
+                    let original_field = base_schema.field(original_field_idx);
                     let value_expr =
                         Expr::Column(Column::new(None::<&str>, col_name.clone()))
-                            .alias(value_column.clone());
+                            .alias_with_metadata(value_column.clone(), Some(original_field.metadata().clone()));
 
                     projection_exprs.push(name_expr);
                     projection_exprs.push(value_expr);

@@ -195,6 +195,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
 
     /// Generate a logical plan from an SQL statement
     pub fn sql_statement_to_plan(&self, statement: Statement) -> Result<LogicalPlan> {
+        println!("STATEMENT {:?}", statement);
         self.sql_statement_to_plan_with_context_impl(
             statement,
             &mut PlannerContext::new(),

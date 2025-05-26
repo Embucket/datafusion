@@ -79,6 +79,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         // Process `from` clause
         let plan = self.plan_from_tables(select.from, planner_context)?;
         let empty_from = matches!(plan, LogicalPlan::EmptyRelation(_));
+        println!("PLAN_FROM_TABLE {:?}", plan);
 
         // Process `where` clause
         let base_plan = self.plan_selection(select.selection, plan, planner_context)?;
