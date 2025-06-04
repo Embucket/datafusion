@@ -164,7 +164,7 @@ recursive = "0.1.1"
 regex = "1.8"
 rstest = "0.24.0"
 serde_json = "1"
-sqlparser = { git = "https://github.com/Embucket/datafusion-sqlparser-rs.git", rev = "7caf74317dfc704273819e527c2536dbb3a7051f", features = [
+sqlparser = { git = "https://github.com/Embucket/datafusion-sqlparser-rs.git", rev = "35314a15555f934e54a9d6a129ddfda9f98d47f9", features = [
     "visitor",
 ] }
 tempfile = "3"
