@@ -400,6 +400,48 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
 
                 (unpivot_plan, alias)
             }
+            TableFactor::Function {
+                name, args, alias, ..
+            } => {
+                let tbl_func_name = self.object_name_to_table_reference(name)?;
+                let schema = planner_context
+                    .outer_query_schema()
+                    .cloned()
+                    .unwrap_or_else(DFSchema::empty);
+                let func_args = args
+                    .into_iter()
+                    .map(|arg| match arg {
+                        FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => {
+                            let expr = self.sql_expr_to_logical_expr(
+                                expr,
+                                &schema,
+                                planner_context,
+                            )?;
+                            Ok((expr, None))
+                        }
+                        FunctionArg::Named {
+                            name,
+                            arg: FunctionArgExpr::Expr(expr),
+                            ..
+                        } => {
+                            let expr = self.sql_expr_to_logical_expr(
+                                expr,
+                                &schema,
+                                planner_context,
+                            )?;
+                            Ok((expr, Some(name.value.clone())))
+                        }
+                        _ => plan_err!("Unsupported function argument: {arg:?}"),
+                    })
+                    .collect::<Result<Vec<(Expr, Option<String>)>>>()?;
+
+                let provider = self
+                    .context_provider
+                    .get_table_function_source(tbl_func_name.table(), func_args)?;
+                let plan =
+                    LogicalPlanBuilder::scan(tbl_func_name, provider, None)?.build()?;
+                (plan, alias)
+            }
             // @todo: Support TableFactory::TableFunction
             _ => {
                 return not_impl_err!(
