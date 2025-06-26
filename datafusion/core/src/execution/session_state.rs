@@ -1669,10 +1669,11 @@ impl ContextProvider for SessionContextProvider<'_> {
         name: &str,
         args: Vec<(Expr, Option<String>)>,
     ) -> datafusion_common::Result<Arc<dyn TableSource>> {
+        let name = name.to_ascii_lowercase();
         let tbl_func = self
             .state
             .table_functions
-            .get(name)
+            .get(&name)
             .cloned()
             .ok_or_else(|| plan_datafusion_err!("table function '{name}' not found"))?;
         let provider = tbl_func.create_table_provider(&args)?;
