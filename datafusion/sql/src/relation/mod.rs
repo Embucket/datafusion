@@ -403,7 +403,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             TableFactor::Function {
                 name, args, alias, ..
             } => {
-                let tbl_func_name = self.object_name_to_table_reference(name)?;
+                let tbl_func_ref = self.object_name_to_table_reference(name)?;
                 let schema = planner_context
                     .outer_query_schema()
                     .cloned()
@@ -434,10 +434,10 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                         _ => plan_err!("Unsupported function argument: {arg:?}"),
                     })
                     .collect::<Result<Vec<(Expr, Option<String>)>>>()?;
-
+                let tbl_func_name = tbl_func_ref.table().to_ascii_lowercase();
                 let provider = self
                     .context_provider
-                    .get_table_function_source(tbl_func_name.table(), func_args)?;
+                    .get_table_function_source(&tbl_func_name, func_args)?;
                 let plan =
                     LogicalPlanBuilder::scan(tbl_func_name, provider, None)?.build()?;
                 (plan, alias)

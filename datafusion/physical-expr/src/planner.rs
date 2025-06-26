@@ -118,10 +118,6 @@ pub fn create_physical_expr(
             let idx = input_dfschema.index_of_column(c)?;
             Ok(Arc::new(Column::new(&c.name, idx)))
         }
-        Expr::OuterReferenceColumn(_datatype, c) => {
-            let idx = input_dfschema.index_of_column(c)?;
-            Ok(Arc::new(Column::new(&c.name, idx)))
-        }
         Expr::Literal(value) => Ok(Arc::new(Literal::new(value.clone()))),
         Expr::ScalarVariable(_, variable_names) => {
             if is_system_variables(variable_names) {
