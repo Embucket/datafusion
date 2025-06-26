@@ -1151,7 +1151,17 @@ fn string_concat_coercion(lhs_type: &DataType, rhs_type: &DataType) -> Option<Da
         (Dictionary(_, lhs_value_type), Dictionary(_, rhs_value_type)) => {
             string_coercion(lhs_value_type, rhs_value_type).or(None)
         }
-        _ => None,
+        _ => {
+            if can_cast_types(lhs_type, &Utf8) && can_cast_types(rhs_type, &Utf8) {
+                Some(Utf8)
+            } else if can_cast_types(lhs_type, &LargeUtf8)
+                && can_cast_types(rhs_type, &LargeUtf8)
+            {
+                Some(LargeUtf8)
+            } else {
+                None
+            }
+        }
     })
 }
 
