@@ -842,7 +842,7 @@ mod tests {
             schema: Arc::clone(&schema),
             value_subquery: Some(Arc::new(LogicalPlan::EmptyRelation(EmptyRelation {
                 produce_one_row: false,
-                schema:Arc::clone(&schema),
+                schema: Arc::clone(&schema),
             }))),
             default_on_null_expr: None,
         };
