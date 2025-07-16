@@ -2449,6 +2449,32 @@ mod tests {
             DataType::List(Arc::clone(&inner_field))
         );
 
+        // boolean
+        let int_types = vec![
+            DataType::Int8,
+            DataType::Int16,
+            DataType::Int32,
+            DataType::Int64,
+            DataType::UInt8,
+            DataType::UInt16,
+            DataType::UInt32,
+            DataType::UInt64,
+        ];
+        for int_type in int_types {
+            test_coercion_binary_rule!(
+                DataType::Boolean,
+                int_type,
+                Operator::Eq,
+                DataType::Boolean
+            );
+            test_coercion_binary_rule!(
+                int_type,
+                DataType::Boolean,
+                Operator::Eq,
+                DataType::Boolean
+            );
+        }
+
         // Negative test: inner_timestamp_field and inner_field are not compatible because their inner types are not compatible
         let inner_timestamp_field = Arc::new(Field::new_list_field(
             DataType::Timestamp(TimeUnit::Microsecond, None),
