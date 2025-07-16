@@ -1086,7 +1086,7 @@ mod tests {
 
     #[test]
     fn case_test_incompatible() -> Result<()> {
-        // 1 then is int64
+        // 1 then is float64
         // 2 then is boolean
         let batch = case_test_batch()?;
         let schema = batch.schema();
@@ -1098,7 +1098,7 @@ mod tests {
             lit("foo"),
             &batch.schema(),
         )?;
-        let then1 = lit(123i32);
+        let then1 = lit(1.23f64);
         let when2 = binary(
             col("a", &schema)?,
             Operator::Eq,
