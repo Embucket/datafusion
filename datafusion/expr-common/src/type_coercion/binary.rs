@@ -1014,8 +1014,10 @@ fn map_coercion(lhs_type: &DataType, rhs_type: &DataType) -> Option<DataType> {
 fn boolean_coercion(lhs_type: &DataType, rhs_type: &DataType) -> Option<DataType> {
     use arrow::datatypes::DataType::*;
     match (lhs_type, rhs_type) {
-        (Boolean, Int8 | Int16 | Int32 |Int64) |
-        (Int8 | Int16 | Int32 |Int64, Boolean)=> Some(Boolean),
+        (Boolean, Int8 | Int16 | Int32 | Int64 | UInt8 | UInt16 | UInt32 | UInt64)
+        | (Int8 | Int16 | Int32 | Int64 | UInt8 | UInt16 | UInt32 | UInt64, Boolean) => {
+            Some(Boolean)
+        }
         _ => None,
     }
 }
