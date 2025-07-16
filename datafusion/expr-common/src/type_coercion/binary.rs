@@ -28,7 +28,6 @@ use arrow::datatypes::{
     DataType, Field, FieldRef, Fields, TimeUnit, DECIMAL128_MAX_PRECISION,
     DECIMAL128_MAX_SCALE, DECIMAL256_MAX_PRECISION, DECIMAL256_MAX_SCALE,
 };
-use arrow::datatypes::DataType::{Binary, BinaryView, Boolean, Int16, Int32, Int64, Int8, LargeBinary, LargeUtf8, Utf8, Utf8View};
 use datafusion_common::types::NativeType;
 use datafusion_common::{
     exec_err, internal_err, not_impl_err, plan_datafusion_err, plan_err, Diagnostic,
