@@ -28,6 +28,7 @@ use arrow::datatypes::{
     DataType, Field, FieldRef, Fields, TimeUnit, DECIMAL128_MAX_PRECISION,
     DECIMAL128_MAX_SCALE, DECIMAL256_MAX_PRECISION, DECIMAL256_MAX_SCALE,
 };
+use arrow::datatypes::DataType::{Binary, BinaryView, Boolean, Int16, Int32, Int64, Int8, LargeBinary, LargeUtf8, Utf8, Utf8View};
 use datafusion_common::types::NativeType;
 use datafusion_common::{
     exec_err, internal_err, not_impl_err, plan_datafusion_err, plan_err, Diagnostic,
@@ -734,6 +735,7 @@ pub fn comparison_coercion(lhs_type: &DataType, rhs_type: &DataType) -> Option<D
         .or_else(|| binary_coercion(lhs_type, rhs_type))
         .or_else(|| struct_coercion(lhs_type, rhs_type))
         .or_else(|| map_coercion(lhs_type, rhs_type))
+        .or_else(|| boolean_coercion(lhs_type, rhs_type))
 }
 
 /// Similar to [`comparison_coercion`] but prefers numeric if compares with
@@ -1003,6 +1005,18 @@ fn map_coercion(lhs_type: &DataType, rhs_type: &DataType) -> Option<DataType> {
                 },
             )
         }
+        _ => None,
+    }
+}
+
+/// Coercion rules for boolean types: If at least one argument is
+/// a boolean type and both arguments can be coerced into a boolean type, coerce
+/// to boolean type.
+fn boolean_coercion(lhs_type: &DataType, rhs_type: &DataType) -> Option<DataType> {
+    use arrow::datatypes::DataType::*;
+    match (lhs_type, rhs_type) {
+        (Boolean, Int8 | Int16 | Int32 |Int64) |
+        (Int8 | Int16 | Int32 |Int64, Boolean)=> Some(Boolean),
         _ => None,
     }
 }
