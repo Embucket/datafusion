@@ -1572,11 +1572,18 @@ mod test {
         let expected = "Projection: a IS TRUE\n  EmptyRelation";
         assert_analyzed_plan_eq(Arc::new(TypeCoercion::new()), plan, expected)?;
 
-        let empty = empty_with_type(DataType::Int64);
+        let empty = empty_with_type(DataType::Float64);
         let plan = LogicalPlan::Projection(Projection::try_new(vec![expr], empty)?);
         let ret = assert_analyzed_plan_eq(Arc::new(TypeCoercion::new()), plan, "");
         let err = ret.unwrap_err().to_string();
-        assert!(err.contains("Cannot infer common argument type for comparison operation Int64 IS DISTINCT FROM Boolean"), "{err}");
+        assert!(err.contains("Cannot infer common argument type for comparison operation Float64 IS DISTINCT FROM Boolean"), "{err}");
+
+        // integer
+        let expr = col("a").is_true();
+        let empty = empty_with_type(DataType::Int64);
+        let plan = LogicalPlan::Projection(Projection::try_new(vec![expr], empty)?);
+        let expected = "Projection: CAST(a AS Boolean) IS TRUE\n  EmptyRelation";
+        assert_analyzed_plan_eq(Arc::new(TypeCoercion::new()), plan, expected)?;
 
         // is not true
         let expr = col("a").is_not_true();

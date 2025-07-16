@@ -797,12 +797,12 @@ mod tests {
         let pivot = Pivot {
             input: Arc::new(LogicalPlan::EmptyRelation(EmptyRelation {
                 produce_one_row: false,
-                schema: schema.clone(),
+                schema: Arc::clone(&schema),
             })),
             aggregate_expr: Expr::Column(Column::from_name("sum_value")),
             pivot_column: Column::from_name("category"),
             pivot_values,
-            schema: schema.clone(),
+            schema: Arc::clone(&schema),
             value_subquery: None,
             default_on_null_expr: None,
         };
@@ -834,15 +834,15 @@ mod tests {
         let pivot = Pivot {
             input: Arc::new(LogicalPlan::EmptyRelation(EmptyRelation {
                 produce_one_row: false,
-                schema: schema.clone(),
+                schema: Arc::clone(&schema),
             })),
             aggregate_expr: Expr::Column(Column::from_name("sum_value")),
             pivot_column: Column::from_name("category"),
             pivot_values: vec![],
-            schema: schema.clone(),
+            schema: Arc::clone(&schema),
             value_subquery: Some(Arc::new(LogicalPlan::EmptyRelation(EmptyRelation {
                 produce_one_row: false,
-                schema: schema.clone(),
+                schema: Arc::clone(&schema),
             }))),
             default_on_null_expr: None,
         };
