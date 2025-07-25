@@ -367,7 +367,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     let mut projection_exprs = non_pivot_exprs.clone();
 
                     let name_expr =
-                        Expr::Literal(ScalarValue::Utf8(Some(col_name.clone())))
+                        Expr::Literal(ScalarValue::Utf8(Some(col_name.to_uppercase())))
                             .alias(name_column.clone());
 
                     let value_expr =

@@ -39,21 +39,21 @@ SELECT *
     UNPIVOT (sales FOR month IN (jan, feb, mar, apr))
   ORDER BY empid;
 ----
-1 electronics jan 100
-1 electronics feb 200
-1 electronics mar 300
-1 electronics apr 100
-2 clothes jan 100
-2 clothes feb 300
-2 clothes mar 150
-2 clothes apr 200
-3 cars jan 200
-3 cars feb 400
-3 cars mar 100
-3 cars apr 50
-4 appliances jan 100
-4 appliances mar 100
-4 appliances apr 50
+1 electronics JAN 100
+1 electronics FEB 200
+1 electronics MAR 300
+1 electronics APR 100
+2 clothes JAN 100
+2 clothes FEB 300
+2 clothes MAR 150
+2 clothes APR 200
+3 cars JAN 200
+3 cars FEB 400
+3 cars MAR 100
+3 cars APR 50
+4 appliances JAN 100
+4 appliances MAR 100
+4 appliances APR 50
 
 # UNPIVOT with INCLUDE NULLS option
 query ITTI
@@ -62,22 +62,22 @@ SELECT *
     UNPIVOT INCLUDE NULLS (sales FOR month IN (jan, feb, mar, apr))
   ORDER BY empid;
 ----
-1 electronics jan 100
-1 electronics feb 200
-1 electronics mar 300
-1 electronics apr 100
-2 clothes jan 100
-2 clothes feb 300
-2 clothes mar 150
-2 clothes apr 200
-3 cars jan 200
-3 cars feb 400
-3 cars mar 100
-3 cars apr 50
-4 appliances jan 100
-4 appliances feb NULL
-4 appliances mar 100
-4 appliances apr 50
+1 electronics JAN 100
+1 electronics FEB 200
+1 electronics MAR 300
+1 electronics APR 100
+2 clothes JAN 100
+2 clothes FEB 300
+2 clothes MAR 150
+2 clothes APR 200
+3 cars JAN 200
+3 cars FEB 400
+3 cars MAR 100
+3 cars APR 50
+4 appliances JAN 100
+4 appliances FEB NULL
+4 appliances MAR 100
+4 appliances APR 50
 
 query TTI
 SELECT dept, month, sales
@@ -85,21 +85,21 @@ SELECT dept, month, sales
     UNPIVOT (sales FOR month IN (jan, feb, mar, apr))
   ORDER BY dept;
 ----
-appliances jan 100
-appliances mar 100
-appliances apr 50
-cars jan 200
-cars feb 400
-cars mar 100
-cars apr 50
-clothes jan 100
-clothes feb 300
-clothes mar 150
-clothes apr 200
-electronics jan 100
-electronics feb 200
-electronics mar 300
-electronics apr 100
+appliances JAN 100
+appliances MAR 100
+appliances APR 50
+cars JAN 200
+cars FEB 400
+cars MAR 100
+cars APR 50
+clothes JAN 100
+clothes FEB 300
+clothes MAR 150
+clothes APR 200
+electronics JAN 100
+electronics FEB 200
+electronics MAR 300
+electronics APR 100
 
 # UNPIVOT with filtering
 query ITTI
@@ -109,13 +109,13 @@ SELECT *
   WHERE sales > 100
   ORDER BY empid;
 ----
-1 electronics feb 200
-1 electronics mar 300
-2 clothes feb 300
-2 clothes mar 150
-2 clothes apr 200
-3 cars jan 200
-3 cars feb 400
+1 electronics FEB 200
+1 electronics MAR 300
+2 clothes FEB 300
+2 clothes MAR 150
+2 clothes APR 200
+3 cars JAN 200
+3 cars FEB 400
 
 # UNPIVOT with aggregation
 query TI
@@ -125,10 +125,10 @@ SELECT month, SUM(sales) as total_sales
   GROUP BY month
   ORDER BY month;
 ----
-apr 400
-feb 900
-jan 500
-mar 650
+APR 400
+FEB 900
+JAN 500
+MAR 650
 
 # UNPIVOT with JOIN
 query ITTI
@@ -142,9 +142,9 @@ SELECT e.empid, e.dept, u.month, u.sales
   WHERE u.sales > 200
   ORDER BY e.empid, u.month;
 ----
-1 electronics mar 300
-2 clothes feb 300
-3 cars feb 400
+1 electronics MAR 300
+2 clothes FEB 300
+3 cars FEB 400
 
 query ITIITI
 SELECT *
@@ -152,14 +152,14 @@ SELECT *
     UNPIVOT (sales FOR month IN (jan, mar))
   ORDER BY empid;
 ----
-1 electronics 200 100 jan 100
-1 electronics 200 100 mar 300
-2 clothes 300 200 jan 100
-2 clothes 300 200 mar 150
-3 cars 400 50 jan 200
-3 cars 400 50 mar 100
-4 appliances NULL 50 jan 100
-4 appliances NULL 50 mar 100
+1 electronics 200 100 JAN 100
+1 electronics 200 100 MAR 300
+2 clothes 300 200 JAN 100
+2 clothes 300 200 MAR 150
+3 cars 400 50 JAN 200
+3 cars 400 50 MAR 100
+4 appliances NULL 50 JAN 100
+4 appliances NULL 50 MAR 100
 
 # UNPIVOT with HAVING clause
 query TI
@@ -170,9 +170,9 @@ SELECT month, SUM(sales) as total_sales
   HAVING SUM(sales) > 400
   ORDER BY month;
 ----
-feb 900
-jan 500
-mar 650
+FEB 900
+JAN 500
+MAR 650
 
 # UNPIVOT with subquery
 query ITTI
@@ -185,12 +185,12 @@ SELECT *
   UNPIVOT (sales FOR month IN (jan, feb, mar))
   ORDER BY empid;
 ----
-1 electronics jan 100
-1 electronics feb 200
-1 electronics mar 300
-2 clothes jan 100
-2 clothes feb 300
-2 clothes mar 150
+1 electronics JAN 100
+1 electronics FEB 200
+1 electronics MAR 300
+2 clothes JAN 100
+2 clothes FEB 300
+2 clothes MAR 150
 
 # Non-existent column in the column list
 query error DataFusion error: Error during planning: Column 'non_existent' not found in input
@@ -215,12 +215,12 @@ SELECT *
     UNPIVOT (val FOR col_name IN (col1, col2, col3))
   ORDER BY id;
 ----
-1 col1 100
-1 col2 abc
-1 col3 10.5
-2 col1 200
-2 col2 def
-2 col3 20.5
+1 COL1 100
+1 COL2 abc
+1 COL3 10.5
+2 COL1 200
+2 COL2 def
+2 COL3 20.5
 
 # UNPIVOT with CTE
 query ITTI
@@ -232,14 +232,14 @@ SELECT *
     UNPIVOT (sales FOR month IN (jan, feb, mar, apr))
   ORDER BY empid;
 ----
-1 electronics jan 100
-1 electronics feb 200
-1 electronics mar 300
-1 electronics apr 100
-2 clothes jan 100
-2 clothes feb 300
-2 clothes mar 150
-2 clothes apr 200
+1 electronics JAN 100
+1 electronics FEB 200
+1 electronics MAR 300
+1 electronics APR 100
+2 clothes JAN 100
+2 clothes FEB 300
+2 clothes MAR 150
+2 clothes APR 200
 
 # UNPIVOT with UNION
 query ITIITI
@@ -252,18 +252,18 @@ SELECT *
     UNPIVOT (sales FOR month IN (mar, apr))
   ORDER BY empid, month;
 ----
-1 electronics 100 200 apr 100
-1 electronics 300 100 feb 200
-1 electronics 300 100 jan 100
-1 electronics 100 200 mar 300
-2 clothes 100 300 apr 200
-2 clothes 150 200 feb 300
-2 clothes 150 200 jan 100
-2 clothes 100 300 mar 150
-3 cars 200 400 apr 50
-3 cars 100 50 feb 400
-3 cars 100 50 jan 200
-3 cars 200 400 mar 100
-4 appliances 100 NULL apr 50
-4 appliances 100 50 jan 100
-4 appliances 100 NULL mar 100
+1 electronics 100 200 APR 100
+1 electronics 300 100 FEB 200
+1 electronics 300 100 JAN 100
+1 electronics 100 200 MAR 300
+2 clothes 100 300 APR 200
+2 clothes 150 200 FEB 300
+2 clothes 150 200 JAN 100
+2 clothes 100 300 MAR 150
+3 cars 200 400 APR 50
+3 cars 100 50 FEB 400
+3 cars 100 50 JAN 200
+3 cars 200 400 MAR 100
+4 appliances 100 NULL APR 50
+4 appliances 100 50 JAN 100
+4 appliances 100 NULL MAR 100
