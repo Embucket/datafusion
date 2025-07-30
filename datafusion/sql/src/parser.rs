@@ -695,10 +695,14 @@ impl<'a> DFParser<'a> {
 
     /// Parse a SQL `CREATE` statement handling `CREATE EXTERNAL TABLE`
     pub fn parse_create(&mut self) -> Result<Statement, DataFusionError> {
-        if self.parser.parse_keyword(Keyword::EXTERNAL) {
+        if self
+            .parser
+            .parse_keywords(&[Keyword::EXTERNAL, Keyword::TABLE])
+        {
             self.parse_create_external_table(false)
         } else if self.parser.parse_keyword(Keyword::UNBOUNDED) {
-            self.parser.expect_keyword(Keyword::EXTERNAL)?;
+            self.parser
+                .expect_keywords(&[Keyword::EXTERNAL, Keyword::TABLE])?;
             self.parse_create_external_table(true)
         } else {
             // Push back CREATE
@@ -856,7 +860,6 @@ impl<'a> DFParser<'a> {
             .parser
             .parse_one_of_keywords(&[Keyword::TEMP, Keyword::TEMPORARY])
             .is_some();
-        self.parser.expect_keyword(Keyword::TABLE)?;
         let if_not_exists =
             self.parser
                 .parse_keywords(&[Keyword::IF, Keyword::NOT, Keyword::EXISTS]);
@@ -1591,6 +1594,24 @@ mod tests {
         );
         if let Statement::CopyTo(_) = &statements[0] {
             panic!("Expected non COPY TO statement, but was successful: {statements:?}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn skip_external_volume() -> Result<(), DataFusionError> {
+        let sql = "CREATE OR REPLACE EXTERNAL VOLUME exvol STORAGE_LOCATIONS =
+        ((NAME = 's3' STORAGE_PROVIDER = 'S3' STORAGE_BASE_URL = 's3://my-example-bucket/' ))";
+        let dialect = Box::new(SnowflakeDialect);
+        let statements = DFParser::parse_sql_with_dialect(sql, dialect.as_ref())?;
+
+        assert_eq!(
+            statements.len(),
+            1,
+            "Expected to parse exactly one statement"
+        );
+        if let Statement::CreateExternalTable(_) = &statements[0] {
+            panic!("Expected non CREATE EXTERNAL TABLE statement, but was successful: {statements:?}");
         }
         Ok(())
     }
