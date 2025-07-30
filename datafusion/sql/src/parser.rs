@@ -470,6 +470,12 @@ impl<'a> DFParser<'a> {
             Token::Word(w) => {
                 match w.keyword {
                     Keyword::CREATE => {
+                        if let Token::Word(w) = self.parser.peek_nth_token(2).token {
+                            // use native parser for CREATE EXTERNAL VOLUME
+                            if w.keyword == Keyword::VOLUME {
+/                                return self.parse_and_handle_statement();
+                            }
+                        }
                         self.parser.next_token(); // CREATE
                         self.parse_create()
                     }
@@ -695,14 +701,10 @@ impl<'a> DFParser<'a> {
 
     /// Parse a SQL `CREATE` statement handling `CREATE EXTERNAL TABLE`
     pub fn parse_create(&mut self) -> Result<Statement, DataFusionError> {
-        if self
-            .parser
-            .parse_keywords(&[Keyword::EXTERNAL, Keyword::TABLE])
-        {
+        if self.parser.parse_keyword(Keyword::EXTERNAL) {
             self.parse_create_external_table(false)
         } else if self.parser.parse_keyword(Keyword::UNBOUNDED) {
-            self.parser
-                .expect_keywords(&[Keyword::EXTERNAL, Keyword::TABLE])?;
+            self.parser.expect_keyword(Keyword::EXTERNAL)?;
             self.parse_create_external_table(true)
         } else {
             // Push back CREATE
@@ -860,6 +862,7 @@ impl<'a> DFParser<'a> {
             .parser
             .parse_one_of_keywords(&[Keyword::TEMP, Keyword::TEMPORARY])
             .is_some();
+        self.parser.expect_keyword(Keyword::TABLE)?;
         let if_not_exists =
             self.parser
                 .parse_keywords(&[Keyword::IF, Keyword::NOT, Keyword::EXISTS]);
