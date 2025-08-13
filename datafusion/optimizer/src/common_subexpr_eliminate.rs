@@ -220,10 +220,6 @@ impl CommonSubexprEliminate {
                     .into_iter()
                     .zip(window_schemas)
                     .try_rfold(new_input, |plan, (new_window_expr, schema)| {
-                        // Rebuilding with the preserved schema to keep column names stable. 
-                        // If that fails (e.g., due to expr/schema mismatch
-                        // from earlier rewrites), fall back to rebuilding the schema
-                        // from the expressions directly.
                         match Window::try_new_with_schema(
                             new_window_expr.clone(),
                             Arc::new(plan.clone()),
@@ -731,7 +727,6 @@ impl CSEController for ExprCSEController<'_> {
     }
 }
 
-
 impl Default for CommonSubexprEliminate {
     fn default() -> Self {
         Self::new()
@@ -804,11 +799,13 @@ mod test {
 
     use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use datafusion_expr::logical_plan::{table_scan, JoinType};
+    use datafusion_expr::window_frame::WindowFrame;
     use datafusion_expr::{
-        grouping_set, is_null, not, AccumulatorFactoryFunction, AggregateUDF, ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, SimpleAggregateUDF, TableSource, Volatility
+        grouping_set, is_null, not, AccumulatorFactoryFunction, AggregateUDF,
+        ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature,
+        SimpleAggregateUDF, TableSource, Volatility,
     };
     use datafusion_expr::{lit, logical_plan::builder::LogicalPlanBuilder};
-    use datafusion_expr::window_frame::WindowFrame;
     use datafusion_functions_window::row_number::row_number_udwf;
 
     use super::*;
@@ -1710,9 +1707,9 @@ mod test {
             .filter(Expr::BinaryExpr(BinaryExpr {
                 left: Box::new(wnd),
                 op: Operator::Eq,
-                right: Box::new(Expr::Literal(
-                    datafusion_common::ScalarValue::UInt64(Some(1)),
-                )),
+                right: Box::new(Expr::Literal(datafusion_common::ScalarValue::UInt64(
+                    Some(1),
+                ))),
             }))
             .unwrap()
             .project(vec![col("a"), col("b")])

@@ -219,10 +219,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             mut select_exprs_post_aggr,
             having_expr_post_aggr,
             mut qualify_expr_post_aggr,
-        ) = if !group_by_exprs
-            .is_empty()
-            || !aggr_exprs.is_empty()
-        {
+        ) = if !group_by_exprs.is_empty() || !aggr_exprs.is_empty() {
             self.aggregate(
                 &base_plan,
                 &select_exprs,
@@ -252,13 +249,14 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         };
 
         // Process window function
-        let window_search_exprs: Vec<Expr> = if let Some(ref qualify_expr) = qualify_expr_post_aggr {
-            let mut v = select_exprs_post_aggr.clone();
-            v.push(qualify_expr.clone());
-            v
-        } else {
-            select_exprs_post_aggr.clone()
-        };
+        let window_search_exprs: Vec<Expr> =
+            if let Some(ref qualify_expr) = qualify_expr_post_aggr {
+                let mut v = select_exprs_post_aggr.clone();
+                v.push(qualify_expr.clone());
+                v
+            } else {
+                select_exprs_post_aggr.clone()
+            };
         let window_func_exprs = find_window_exprs(&window_search_exprs);
 
         if has_qualify && window_func_exprs.is_empty() {
@@ -280,7 +278,8 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
 
             // Re-write QUALIFY predicate to reference computed window columns
             if let Some(q) = qualify_expr_post_aggr.take() {
-                qualify_expr_post_aggr = Some(rebase_expr(&q, &window_func_exprs, &plan)?);
+                qualify_expr_post_aggr =
+                    Some(rebase_expr(&q, &window_func_exprs, &plan)?);
             }
 
             plan
@@ -288,7 +287,9 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
 
         // Apply QUALIFY filter
         let plan = if let Some(qualify_expr) = qualify_expr_post_aggr {
-            LogicalPlanBuilder::from(plan).filter(qualify_expr)?.build()?
+            LogicalPlanBuilder::from(plan)
+                .filter(qualify_expr)?
+                .build()?
         } else {
             plan
         };
