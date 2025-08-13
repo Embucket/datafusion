@@ -220,12 +220,19 @@ impl CommonSubexprEliminate {
                     .into_iter()
                     .zip(window_schemas)
                     .try_rfold(new_input, |plan, (new_window_expr, schema)| {
-                        Window::try_new_with_schema(
-                            new_window_expr,
-                            Arc::new(plan),
+                        // Rebuilding with the preserved schema to keep column names stable. 
+                        // If that fails (e.g., due to expr/schema mismatch
+                        // from earlier rewrites), fall back to rebuilding the schema
+                        // from the expressions directly.
+                        match Window::try_new_with_schema(
+                            new_window_expr.clone(),
+                            Arc::new(plan.clone()),
                             schema,
-                        )
-                        .map(LogicalPlan::Window)
+                        ) {
+                            Ok(win) => Ok(LogicalPlan::Window(win)),
+                            Err(_) => Window::try_new(new_window_expr, Arc::new(plan))
+                                .map(LogicalPlan::Window),
+                        }
                     })
             }
         })
@@ -724,6 +731,7 @@ impl CSEController for ExprCSEController<'_> {
     }
 }
 
+
 impl Default for CommonSubexprEliminate {
     fn default() -> Self {
         Self::new()
@@ -794,14 +802,14 @@ mod test {
     use std::any::Any;
     use std::iter;
 
-    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use datafusion_expr::logical_plan::{table_scan, JoinType};
     use datafusion_expr::{
-        grouping_set, is_null, not, AccumulatorFactoryFunction, AggregateUDF,
-        ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature,
-        SimpleAggregateUDF, Volatility,
+        grouping_set, is_null, not, AccumulatorFactoryFunction, AggregateUDF, ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, SimpleAggregateUDF, TableSource, Volatility
     };
     use datafusion_expr::{lit, logical_plan::builder::LogicalPlanBuilder};
+    use datafusion_expr::window_frame::WindowFrame;
+    use datafusion_functions_window::row_number::row_number_udwf;
 
     use super::*;
     use crate::optimizer::OptimizerContext;
@@ -1667,6 +1675,56 @@ mod test {
         \n    TableScan: test";
         assert_optimized_plan_eq(expected, plan, None);
         Ok(())
+    }
+
+    #[test]
+    fn test_window_cse_rebuild_preserves_schema() {
+        // Build a plan similar to SELECT ... QUALIFY ROW_NUMBER()
+        let scan = test_table_scan().unwrap();
+        let col0 = col("a");
+        let col1 = col("b");
+
+        let wnd = Expr::WindowFunction(datafusion_expr::expr::WindowFunction {
+            fun: datafusion_expr::expr::WindowFunctionDefinition::WindowUDF(
+                row_number_udwf(),
+            ),
+            params: datafusion_expr::expr::WindowFunctionParams {
+                partition_by: vec![col0.clone()],
+                order_by: vec![col1.clone().sort(true, false)],
+                window_frame: WindowFrame::new(None),
+                args: vec![],
+                null_treatment: None,
+            },
+        });
+
+        let windowed = LogicalPlanBuilder::from(scan)
+            .window(vec![wnd.clone()])
+            .unwrap()
+            .project(vec![col0.clone(), col1.clone(), wnd.clone()])
+            .unwrap()
+            .build()
+            .unwrap();
+
+        // Simulate QUALIFY as a filter on the window output
+        let filtered = LogicalPlanBuilder::from(windowed)
+            .filter(Expr::BinaryExpr(BinaryExpr {
+                left: Box::new(wnd),
+                op: Operator::Eq,
+                right: Box::new(Expr::Literal(
+                    datafusion_common::ScalarValue::UInt64(Some(1)),
+                )),
+            }))
+            .unwrap()
+            .project(vec![col("a"), col("b")])
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let rule = CommonSubexprEliminate::new();
+        let cfg = OptimizerContext::new();
+        let res = rule.rewrite(filtered, &cfg).unwrap();
+
+        assert_fields_eq(&res.data, vec!["a", "b"]);
     }
 
     /// returns a "random" function that is marked volatile (aka each invocation
