@@ -66,9 +66,6 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         if !select.lateral_views.is_empty() {
             return not_impl_err!("LATERAL VIEWS");
         }
-        if select.qualify.is_some() {
-            return not_impl_err!("QUALIFY");
-        }
         if select.top.is_some() {
             return not_impl_err!("TOP");
         }
@@ -148,9 +145,27 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             })
             .transpose()?;
 
+        // Optionally the QUALIFY expression (filters after window functions)
+        let qualify_expr_opt_pre_aggr = select
+            .qualify
+            .map::<Result<Expr>, _>(|qualify_expr| {
+                let qualify_expr = self.sql_expr_to_logical_expr(
+                    qualify_expr,
+                    &combined_schema,
+                    planner_context,
+                )?;
+                let qualify_expr = resolve_aliases_to_exprs(qualify_expr, &alias_map)?;
+                normalize_col(qualify_expr, &projected_plan)
+            })
+            .transpose()?;
+        let has_qualify = qualify_expr_opt_pre_aggr.is_some();
+
         // The outer expressions we will search through for aggregates.
-        // Aggregates may be sourced from the SELECT list or from the HAVING expression.
-        let aggr_expr_haystack = select_exprs.iter().chain(having_expr_opt.iter());
+        // Aggregates may be sourced from the SELECT list, HAVING expression, or QUALIFY expression.
+        let aggr_expr_haystack = select_exprs
+            .iter()
+            .chain(having_expr_opt.iter())
+            .chain(qualify_expr_opt_pre_aggr.iter());
         // All of the aggregate expressions (deduplicated).
         let aggr_exprs = find_aggregate_exprs(aggr_expr_haystack);
 
@@ -198,22 +213,30 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 .collect()
         };
 
-        // Process group by, aggregation or having
-        let (plan, mut select_exprs_post_aggr, having_expr_post_aggr) = if !group_by_exprs
-            .is_empty()
-            || !aggr_exprs.is_empty()
-        {
+        // Process group by, aggregation, having (and prepare qualify for post-aggregation)
+        let (
+            plan,
+            mut select_exprs_post_aggr,
+            having_expr_post_aggr,
+            mut qualify_expr_post_aggr,
+        ) = if !group_by_exprs.is_empty() || !aggr_exprs.is_empty() {
             self.aggregate(
                 &base_plan,
                 &select_exprs,
                 having_expr_opt.as_ref(),
                 &group_by_exprs,
                 &aggr_exprs,
+                qualify_expr_opt_pre_aggr.as_ref(),
             )?
         } else {
             match having_expr_opt {
                 Some(having_expr) => return plan_err!("HAVING clause references: {having_expr} must appear in the GROUP BY clause or be used in an aggregate function"),
-                None => (base_plan.clone(), select_exprs.clone(), having_expr_opt)
+                None => (
+                    base_plan.clone(),
+                    select_exprs.clone(),
+                    having_expr_opt,
+                    qualify_expr_opt_pre_aggr,
+                )
             }
         };
 
@@ -226,7 +249,21 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         };
 
         // Process window function
-        let window_func_exprs = find_window_exprs(&select_exprs_post_aggr);
+        let window_search_exprs: Vec<Expr> =
+            if let Some(ref qualify_expr) = qualify_expr_post_aggr {
+                let mut v = select_exprs_post_aggr.clone();
+                v.push(qualify_expr.clone());
+                v
+            } else {
+                select_exprs_post_aggr.clone()
+            };
+        let window_func_exprs = find_window_exprs(&window_search_exprs);
+
+        if has_qualify && window_func_exprs.is_empty() {
+            return plan_err!(
+                "QUALIFY clause requires at least one window function in the SELECT list or QUALIFY predicate"
+            );
+        }
 
         let plan = if window_func_exprs.is_empty() {
             plan
@@ -239,6 +276,21 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 .map(|expr| rebase_expr(expr, &window_func_exprs, &plan))
                 .collect::<Result<Vec<Expr>>>()?;
 
+            // Re-write QUALIFY predicate to reference computed window columns
+            if let Some(q) = qualify_expr_post_aggr.take() {
+                qualify_expr_post_aggr =
+                    Some(rebase_expr(&q, &window_func_exprs, &plan)?);
+            }
+
+            plan
+        };
+
+        // Apply QUALIFY filter
+        let plan = if let Some(qualify_expr) = qualify_expr_post_aggr {
+            LogicalPlanBuilder::from(plan)
+                .filter(qualify_expr)?
+                .build()?
+        } else {
             plan
         };
 
@@ -782,7 +834,8 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         having_expr_opt: Option<&Expr>,
         group_by_exprs: &[Expr],
         aggr_exprs: &[Expr],
-    ) -> Result<(LogicalPlan, Vec<Expr>, Option<Expr>)> {
+        qualify_expr_opt: Option<&Expr>,
+    ) -> Result<(LogicalPlan, Vec<Expr>, Option<Expr>, Option<Expr>)> {
         // create the aggregate plan
         let options =
             LogicalPlanBuilderOptions::new().with_add_implicit_group_by_exprs(true);
@@ -866,7 +919,21 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             None
         };
 
-        Ok((plan, select_exprs_post_aggr, having_expr_post_aggr))
+        // Rewrite the QUALIFY expression (if any) to use columns produced by the aggregation
+        let qualify_expr_post_aggr = if let Some(qualify_expr) = qualify_expr_opt {
+            let qualify_expr_post_aggr =
+                rebase_expr(qualify_expr, &aggr_projection_exprs, input)?;
+            Some(qualify_expr_post_aggr)
+        } else {
+            None
+        };
+
+        Ok((
+            plan,
+            select_exprs_post_aggr,
+            having_expr_post_aggr,
+            qualify_expr_post_aggr,
+        ))
     }
 
     // If the projection is done over a named window, that window

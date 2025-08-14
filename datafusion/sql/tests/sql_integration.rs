@@ -4207,10 +4207,6 @@ fn test_select_distinct_order_by() {
     "SELECT id, number FROM person LATERAL VIEW explode(numbers) exploded_table AS number",
     "This feature is not implemented: LATERAL VIEWS"
 )]
-#[case::select_qualify_unsupported(
-    "SELECT i, p, o FROM person QUALIFY ROW_NUMBER() OVER (PARTITION BY p ORDER BY o) = 1",
-    "This feature is not implemented: QUALIFY"
-)]
 #[case::select_top_unsupported(
     "SELECT TOP (5) * FROM person",
     "This feature is not implemented: TOP"
