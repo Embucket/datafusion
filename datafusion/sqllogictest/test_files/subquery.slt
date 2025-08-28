@@ -1482,3 +1482,32 @@ logical_plan
 
 statement count 0
 drop table person;
+
+
+# Projection IN (subquery) decorrelation
+query IB rowsort
+WITH t(a) AS (VALUES (1),(2),(3),(4),(5)),
+     u(a) AS (VALUES (2),(4),(6))
+SELECT t.a, (t.a IN (SELECT u.a FROM u)) AS flag FROM t;
+----
+1 false
+2 true
+3 false
+4 true
+5 false
+
+query TT
+EXPLAIN WITH t(a) AS (VALUES (1),(2),(3),(4),(5)),
+     u(a) AS (VALUES (2),(4),(6))
+SELECT t.a, (t.a IN (SELECT u.a FROM u)) AS flag FROM t;
+----
+logical_plan
+01)Projection: t.a, __correlated_sq_1.mark AS flag
+02)--LeftMark Join: t.a = __correlated_sq_1.a
+03)----SubqueryAlias: t
+04)------Projection: column1 AS a
+05)--------Values: (Int64(1)), (Int64(2)), (Int64(3)), (Int64(4)), (Int64(5))
+06)----SubqueryAlias: __correlated_sq_1
+07)------SubqueryAlias: u
+08)--------Projection: column1 AS a
+09)----------Values: (Int64(2)), (Int64(4)), (Int64(6))
