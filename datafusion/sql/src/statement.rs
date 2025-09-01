@@ -536,6 +536,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 temporary,
                 to,
                 params,
+                secure,
             } => {
                 if materialized {
                     return not_impl_err!("Materialized views not supported")?;
@@ -572,6 +573,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     temporary,
                     to,
                     params,
+                    secure,
                 };
                 let sql = stmt.to_string();
                 let Statement::CreateView {
