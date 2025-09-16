@@ -1817,7 +1817,7 @@ mod test {
         let col0 = col("a");
         let col1 = col("b");
 
-        let wnd = Expr::WindowFunction(datafusion_expr::expr::WindowFunction {
+        let wnd = Expr::WindowFunction(Box::new(datafusion_expr::expr::WindowFunction {
             fun: datafusion_expr::expr::WindowFunctionDefinition::WindowUDF(
                 row_number_udwf(),
             ),
@@ -1827,8 +1827,10 @@ mod test {
                 window_frame: WindowFrame::new(None),
                 args: vec![],
                 null_treatment: None,
+                distinct: false,
+                filter: None,
             },
-        });
+        }));
 
         let windowed = LogicalPlanBuilder::from(scan)
             .window(vec![wnd.clone()])
@@ -1843,9 +1845,10 @@ mod test {
             .filter(Expr::BinaryExpr(BinaryExpr {
                 left: Box::new(wnd),
                 op: Operator::Eq,
-                right: Box::new(Expr::Literal(datafusion_common::ScalarValue::UInt64(
-                    Some(1),
-                ))),
+                right: Box::new(Expr::Literal(
+                    datafusion_common::ScalarValue::UInt64(Some(1)),
+                    None,
+                )),
             }))
             .unwrap()
             .project(vec![col("a"), col("b")])

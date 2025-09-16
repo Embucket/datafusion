@@ -510,10 +510,13 @@ impl TableFunctionImpl for GenerateSeriesFuncImpl {
 }
 
 impl GenerateSeriesFuncImpl {
-    fn call_int64(&self, exprs: &[Expr]) -> Result<Arc<dyn TableProvider>> {
+    fn call_int64(
+        &self,
+        exprs: &[(Expr, Option<String>)],
+    ) -> Result<Arc<dyn TableProvider>> {
         let mut normalize_args = Vec::new();
-        for (expr_index, expr, _) in exprs.iter().enumerate() {
-            match expr {
+        for (expr_index, expr) in exprs.iter().enumerate() {
+            match &expr.0 {
                 Expr::Literal(ScalarValue::Null, _) => {}
                 Expr::Literal(ScalarValue::Int64(Some(n)), _) => normalize_args.push(*n),
                 other => {
@@ -565,7 +568,10 @@ impl GenerateSeriesFuncImpl {
         }))
     }
 
-    fn call_timestamp(&self, exprs: &[Expr]) -> Result<Arc<dyn TableProvider>> {
+    fn call_timestamp(
+        &self,
+        exprs: &[(Expr, Option<String>)],
+    ) -> Result<Arc<dyn TableProvider>> {
         if exprs.len() != 3 {
             return plan_err!(
                 "{} function with timestamps requires exactly 3 arguments",
@@ -574,7 +580,7 @@ impl GenerateSeriesFuncImpl {
         }
 
         // Parse start timestamp
-        let (start_ts, tz) = match &exprs[0] {
+        let (start_ts, tz) = match &exprs[0].0 {
             Expr::Literal(ScalarValue::TimestampNanosecond(ts, tz), _) => {
                 (*ts, tz.clone())
             }
@@ -587,7 +593,7 @@ impl GenerateSeriesFuncImpl {
         };
 
         // Parse end timestamp
-        let end_ts = match &exprs[1] {
+        let end_ts = match &exprs[1].0 {
             Expr::Literal(ScalarValue::Null, _) => None,
             Expr::Literal(ScalarValue::TimestampNanosecond(ts, _), _) => *ts,
             other => {
@@ -599,7 +605,7 @@ impl GenerateSeriesFuncImpl {
         };
 
         // Parse step interval
-        let step_interval = match &exprs[2] {
+        let step_interval = match &exprs[2].0 {
             Expr::Literal(ScalarValue::Null, _) => None,
             Expr::Literal(ScalarValue::IntervalMonthDayNano(interval), _) => *interval,
             other => {
@@ -641,7 +647,10 @@ impl GenerateSeriesFuncImpl {
         }))
     }
 
-    fn call_date(&self, exprs: &[Expr]) -> Result<Arc<dyn TableProvider>> {
+    fn call_date(
+        &self,
+        exprs: &[(Expr, Option<String>)],
+    ) -> Result<Arc<dyn TableProvider>> {
         if exprs.len() != 3 {
             return plan_err!(
                 "{} function with dates requires exactly 3 arguments",
@@ -656,7 +665,7 @@ impl GenerateSeriesFuncImpl {
         )]));
 
         // Parse start date
-        let start_date = match &exprs[0] {
+        let start_date = match &exprs[0].0 {
             Expr::Literal(ScalarValue::Date32(Some(date)), _) => *date,
             Expr::Literal(ScalarValue::Date32(None), _)
             | Expr::Literal(ScalarValue::Null, _) => {
@@ -674,7 +683,7 @@ impl GenerateSeriesFuncImpl {
         };
 
         // Parse end date
-        let end_date = match &exprs[1] {
+        let end_date = match &exprs[1].0 {
             Expr::Literal(ScalarValue::Date32(Some(date)), _) => *date,
             Expr::Literal(ScalarValue::Date32(None), _)
             | Expr::Literal(ScalarValue::Null, _) => {
@@ -692,7 +701,7 @@ impl GenerateSeriesFuncImpl {
         };
 
         // Parse step interval
-        let step_interval = match &exprs[2] {
+        let step_interval = match &exprs[2].0 {
             Expr::Literal(ScalarValue::IntervalMonthDayNano(Some(interval)), _) => {
                 *interval
             }

@@ -105,7 +105,6 @@ use datafusion_physical_plan::recursive_query::RecursiveQueryExec;
 use datafusion_physical_plan::unnest::ListUnnest;
 
 use async_trait::async_trait;
-use datafusion_datasource::file_groups::FileGroup;
 use datafusion_expr_common::operator::Operator;
 use datafusion_physical_plan::async_func::{AsyncFuncExec, AsyncMapper};
 use futures::{StreamExt, TryStreamExt};
@@ -2556,8 +2555,6 @@ pub fn create_aggregate_expr_and_maybe_filter(
     )
 }
 
-
-
 /// Transform a PIVOT operation into a more standard Aggregate + Projection plan
 /// For known pivot values, we create a projection that includes "IS NOT DISTINCT FROM" conditions
 ///
@@ -2614,7 +2611,7 @@ pub fn transform_pivot_to_aggregate(
             Box::new(Expr::Column(pivot_column.clone())),
             Operator::IsNotDistinctFrom,
             Box::new(Expr::Cast(Cast::new(
-                Box::new(Expr::Literal(value.clone())),
+                Box::new(Expr::Literal(value.clone(), None)),
                 pivot_col_type.clone(),
             ))),
         ));
@@ -3089,9 +3086,9 @@ impl DefaultPhysicalPlanner {
         if let LogicalPlan::Pivot(pivot) = input.as_ref() {
             if pivot.value_subquery.is_some()
                 && input_exec
-                .as_any()
-                .downcast_ref::<AggregateExec>()
-                .is_some()
+                    .as_any()
+                    .downcast_ref::<AggregateExec>()
+                    .is_some()
             {
                 let agg_exec =
                     input_exec.as_any().downcast_ref::<AggregateExec>().unwrap();
