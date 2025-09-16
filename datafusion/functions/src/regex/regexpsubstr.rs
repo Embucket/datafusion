@@ -33,7 +33,7 @@ use regex::Regex;
 use std::any::Any;
 use std::sync::{Arc, OnceLock};
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub struct RegexpSubstrFunc {
     signature: Signature,
 }
@@ -318,16 +318,15 @@ fn compile_regex(regex: &str, flags: Option<&str>) -> Result<Regex, ArrowError> 
             if flags.is_empty() {
                 regex.to_string()
             } else {
-                format!("(?{}){}", flags, regex)
+                format!("(?{flags}){regex}")
             }
         }
     };
 
     Regex::new(&pattern).map_err(|_| {
-        ArrowError::ComputeError(format!(
-            "Regular expression did not compile: {}",
-            pattern
-        ))
+        ArrowError::ComputeError(
+            format!("Regular expression did not compile: {pattern}",),
+        )
     })
 }
 
@@ -335,7 +334,7 @@ fn compile_regex(regex: &str, flags: Option<&str>) -> Result<Regex, ArrowError> 
 mod tests {
     use crate::regex::regexpsubstr::{regexp_substr, RegexpSubstrFunc};
     use arrow::array::{Array, ArrayRef, Int64Array, LargeStringArray, StringArray};
-    use arrow::datatypes::DataType;
+    use arrow::datatypes::{DataType, Field};
     use datafusion_common::ScalarValue;
     use datafusion_expr::{ScalarFunctionArgs, ScalarUDFImpl};
     use datafusion_expr_common::columnar_value::ColumnarValue;
@@ -371,14 +370,30 @@ mod tests {
                         ScalarValue::LargeUtf8 as fn(Option<String>) -> ScalarValue,
                     ),
                 ] {
+                    let args_vec = vec![
+                        ColumnarValue::Scalar(scalar(Some(value.to_string()))),
+                        ColumnarValue::Scalar(scalar(Some(regex.to_string()))),
+                    ];
+                    let arg_fields = args_vec
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, arg)| {
+                            Field::new(format!("f_{idx}"), arg.data_type(), true).into()
+                        })
+                        .collect();
                     let result =
                         RegexpSubstrFunc::new().invoke_with_args(ScalarFunctionArgs {
-                            args: vec![
-                                ColumnarValue::Scalar(scalar(Some(value.to_string()))),
-                                ColumnarValue::Scalar(scalar(Some(regex.to_string()))),
-                            ],
+                            args: args_vec,
+                            arg_fields,
                             number_rows: 1,
-                            return_type: data_type,
+                            return_field: Arc::new(Field::new(
+                                "f",
+                                data_type.clone(),
+                                true,
+                            )),
+                            config_options: Arc::new(
+                                datafusion_common::config::ConfigOptions::default(),
+                            ),
                         });
                     match result {
                         Ok(ColumnarValue::Scalar(
@@ -422,14 +437,26 @@ mod tests {
                     ),
                     _ => unreachable!(),
                 };
+                let args_vec = vec![
+                    ColumnarValue::Array(Arc::new(array_values)),
+                    ColumnarValue::Scalar(regex),
+                ];
+                let arg_fields = args_vec
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, arg)| {
+                        Field::new(format!("f_{idx}"), arg.data_type(), true).into()
+                    })
+                    .collect();
                 let result =
                     RegexpSubstrFunc::new().invoke_with_args(ScalarFunctionArgs {
-                        args: vec![
-                            ColumnarValue::Array(Arc::new(array_values)),
-                            ColumnarValue::Scalar(regex),
-                        ],
+                        args: args_vec,
+                        arg_fields,
                         number_rows: 1,
-                        return_type: data_type,
+                        return_field: Arc::new(Field::new("f", data_type.clone(), true)),
+                        config_options: Arc::new(
+                            datafusion_common::config::ConfigOptions::default(),
+                        ),
                     });
                 match result {
                     Ok(ColumnarValue::Array(array)) => {
@@ -511,22 +538,34 @@ mod tests {
                         ScalarValue::LargeUtf8 as fn(Option<String>) -> ScalarValue,
                     ),
                 ] {
+                    let args_vec = vec![
+                        ColumnarValue::Scalar(scalar(Some(value.to_string()))),
+                        ColumnarValue::Scalar(scalar(Some(regex.to_string()))),
+                        ColumnarValue::Scalar(ScalarValue::Int64(Some(1))),
+                        ColumnarValue::Scalar(ScalarValue::Int64(Some(1))),
+                        ColumnarValue::Scalar(scalar(Some(flags[spos].to_string()))),
+                        ColumnarValue::Scalar(ScalarValue::Int64(Some(group_num[spos]))),
+                    ];
+                    let arg_fields = args_vec
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, arg)| {
+                            Field::new(format!("f_{idx}"), arg.data_type(), true).into()
+                        })
+                        .collect();
                     let result =
                         RegexpSubstrFunc::new().invoke_with_args(ScalarFunctionArgs {
-                            args: vec![
-                                ColumnarValue::Scalar(scalar(Some(value.to_string()))),
-                                ColumnarValue::Scalar(scalar(Some(regex.to_string()))),
-                                ColumnarValue::Scalar(ScalarValue::Int64(Some(1))),
-                                ColumnarValue::Scalar(ScalarValue::Int64(Some(1))),
-                                ColumnarValue::Scalar(scalar(Some(
-                                    flags[spos].to_string(),
-                                ))),
-                                ColumnarValue::Scalar(ScalarValue::Int64(Some(
-                                    group_num[spos],
-                                ))),
-                            ],
+                            args: args_vec,
+                            arg_fields,
                             number_rows: 1,
-                            return_type: data_type,
+                            return_field: Arc::new(Field::new(
+                                "f",
+                                data_type.clone(),
+                                true,
+                            )),
+                            config_options: Arc::new(
+                                datafusion_common::config::ConfigOptions::default(),
+                            ),
                         });
                     match result {
                         Ok(ColumnarValue::Scalar(

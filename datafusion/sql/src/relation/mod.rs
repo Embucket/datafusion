@@ -77,7 +77,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                                 plan_err!("Unsupported function argument type: {:?}", arg)
                             }
                         })
-                        .collect::<Result<Vec<_>>>()?;
+                        .collect::<Vec<_>>();
                     let provider = self
                         .context_provider
                         .get_table_function_source(&tbl_func_name, args)?;
@@ -182,19 +182,28 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 let func_args = args
                     .into_iter()
                     .map(|arg| match arg {
-                        FunctionArg::Unnamed(FunctionArgExpr::Expr(expr))
-                        | FunctionArg::Named {
+                        FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => {
+                            // No alias
+                            self.sql_expr_to_logical_expr(expr, &schema, planner_context)
+                                .map(|e| (e, None))
+                        }
+                        FunctionArg::Named {
+                            name,
                             arg: FunctionArgExpr::Expr(expr),
                             ..
                         } => {
+                            // Named arg → alias comes from `name.value`
                             self.sql_expr_to_logical_expr(expr, &schema, planner_context)
+                                .map(|e| (e, Some(name.value)))
                         }
                         _ => plan_err!("Unsupported function argument: {arg:?}"),
                     })
-                    .collect::<Result<Vec<Expr>>>()?;
+                    .collect::<Result<Vec<(Expr, Option<String>)>>>()?;
+
                 let provider = self
                     .context_provider
                     .get_table_function_source(tbl_func_ref.table(), func_args)?;
+
                 let plan =
                     LogicalPlanBuilder::scan(tbl_func_ref.table(), provider, None)?
                         .build()?;
@@ -250,7 +259,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                                 )?;
 
                                 match logical_expr {
-                                    Expr::Literal(scalar) => Ok(scalar),
+                                    Expr::Literal(scalar, _) => Ok(scalar),
                                     _ => plan_err!("PIVOT values must be literals"),
                                 }
                             })
@@ -396,9 +405,11 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 for col_name in &unpivot_column_names {
                     let mut projection_exprs = non_pivot_exprs.clone();
 
-                    let name_expr =
-                        Expr::Literal(ScalarValue::Utf8(Some(col_name.to_uppercase())))
-                            .alias(name_column.clone());
+                    let name_expr = Expr::Literal(
+                        ScalarValue::Utf8(Some(col_name.to_uppercase())),
+                        None,
+                    )
+                    .alias(name_column.clone());
 
                     let value_expr =
                         Expr::Column(Column::new(None::<&str>, col_name.clone()))

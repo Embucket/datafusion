@@ -1870,7 +1870,7 @@ mod test {
         let plan = LogicalPlan::Projection(Projection::try_new(vec![expr], empty)?);
         assert_type_coercion_error(
             plan,
-            "Cannot infer common argument type for comparison operation Int64 IS DISTINCT FROM Boolean"
+            "Cannot infer common argument type for comparison operation Float64 IS DISTINCT FROM Boolean"
         )?;
 
         // is not true

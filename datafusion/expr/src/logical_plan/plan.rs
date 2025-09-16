@@ -2444,7 +2444,7 @@ fn pivot_schema(
     }
 
     for pivot_value in pivot_values {
-        let field_name = format!("{}", pivot_value);
+        let field_name = format!("{pivot_value}");
         let data_type = aggregate_expr.get_type(input_schema)?;
         fields.push(Arc::new(Field::new(field_name, data_type, true)));
     }

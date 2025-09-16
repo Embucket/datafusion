@@ -274,6 +274,8 @@ impl Session for SessionState {
 }
 
 impl SessionState {
+    /// Resolve a [`TableReference`] into a [`ResolvedTableReference`] using
+    /// the session's configured default catalog and schema.
     pub fn resolve_table_ref(
         &self,
         table_ref: impl Into<TableReference>,

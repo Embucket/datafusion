@@ -759,8 +759,8 @@ impl<'n> TreeNodeVisitor<'n> for PgJsonVisitor<'_, '_> {
 mod tests {
     use crate::EmptyRelation;
     use arrow::datatypes::{DataType, Field, Schema};
-    use insta::assert_snapshot;
     use datafusion_common::{Column, DFSchema, ScalarValue};
+    use insta::assert_snapshot;
     use std::sync::Arc;
 
     use super::*;
