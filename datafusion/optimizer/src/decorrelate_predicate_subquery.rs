@@ -136,7 +136,7 @@ impl OptimizerRule for DecorrelatePredicateSubquery {
                         Some(new_predicate),
                         join.join_type,
                         join.join_constraint,
-                        join.null_equals_null,
+                        join.null_equality,
                     )?;
                     return Ok(Transformed::yes(LogicalPlan::Join(new_join)));
                 }
@@ -718,9 +718,18 @@ mod tests {
             .build()?;
 
         // We expect a LeftMark join inserted and the projection keeps columns
-        let expected = "Projection: a, __correlated_sq_1.mark AS flag [a:Int32;N, flag:Boolean]\n  LeftMark Join:  Filter: a = __correlated_sq_1.ua [a:Int32;N, mark:Boolean]\n    Projection: column1 AS a [a:Int32;N]\n      Values: (Int32(1)), (Int32(2)) [column1:Int32;N]\n    SubqueryAlias: __correlated_sq_1 [ua:Int32;N]\n      Projection: column1 AS ua [ua:Int32;N]\n        Values: (Int32(2)) [column1:Int32;N]";
-
-        assert_optimized_plan_equal(plan, expected)
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Projection: a, __correlated_sq_1.mark AS flag [a:Int32;N, flag:Boolean]
+          LeftMark Join:  Filter: a = __correlated_sq_1.ua [a:Int32;N, mark:Boolean]
+            Projection: column1 AS a [a:Int32;N]
+              Values: (Int32(1)), (Int32(2)) [column1:Int32;N]
+            SubqueryAlias: __correlated_sq_1 [ua:Int32;N]
+              Projection: column1 AS ua [ua:Int32;N]
+                Values: (Int32(2)) [column1:Int32;N]
+        "
+        )
     }
 
     /// Test multiple correlated subqueries

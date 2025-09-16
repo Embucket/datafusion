@@ -133,7 +133,8 @@ struct LocalCsvTableFunc {}
 
 impl TableFunctionImpl for LocalCsvTableFunc {
     fn call(&self, exprs: &[(Expr, Option<String>)]) -> Result<Arc<dyn TableProvider>> {
-        let Some((Expr::Literal(ScalarValue::Utf8(Some(ref path)), _), _)) = exprs.first()
+        let Some((Expr::Literal(ScalarValue::Utf8(Some(ref path)), _), _)) =
+            exprs.first()
         else {
             return plan_err!("read_csv requires at least one string argument");
         };

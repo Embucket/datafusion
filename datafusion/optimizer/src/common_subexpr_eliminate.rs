@@ -797,13 +797,13 @@ mod test {
     use std::any::Any;
     use std::iter;
 
-    use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+    use arrow::datatypes::{DataType, Field, Schema};
     use datafusion_expr::logical_plan::{table_scan, JoinType};
     use datafusion_expr::window_frame::WindowFrame;
     use datafusion_expr::{
         grouping_set, is_null, not, AccumulatorFactoryFunction, AggregateUDF,
         ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature,
-        SimpleAggregateUDF, TableSource, Volatility,
+        SimpleAggregateUDF, Volatility,
     };
     use datafusion_expr::{lit, logical_plan::builder::LogicalPlanBuilder};
     use datafusion_functions_window::row_number::row_number_udwf;
@@ -1777,7 +1777,7 @@ mod test {
         let col0 = col("a");
         let col1 = col("b");
 
-        let wnd = Expr::WindowFunction(datafusion_expr::expr::WindowFunction {
+        let wnd = Expr::WindowFunction(Box::new(datafusion_expr::expr::WindowFunction {
             fun: datafusion_expr::expr::WindowFunctionDefinition::WindowUDF(
                 row_number_udwf(),
             ),
@@ -1787,8 +1787,10 @@ mod test {
                 window_frame: WindowFrame::new(None),
                 args: vec![],
                 null_treatment: None,
+                distinct: false,
+                filter: None,
             },
-        });
+        }));
 
         let windowed = LogicalPlanBuilder::from(scan)
             .window(vec![wnd.clone()])
@@ -1803,9 +1805,10 @@ mod test {
             .filter(Expr::BinaryExpr(BinaryExpr {
                 left: Box::new(wnd),
                 op: Operator::Eq,
-                right: Box::new(Expr::Literal(datafusion_common::ScalarValue::UInt64(
-                    Some(1),
-                ))),
+                right: Box::new(Expr::Literal(
+                    datafusion_common::ScalarValue::UInt64(Some(1)),
+                    None,
+                )),
             }))
             .unwrap()
             .project(vec![col("a"), col("b")])

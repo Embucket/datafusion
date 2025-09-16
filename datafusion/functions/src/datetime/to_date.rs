@@ -462,18 +462,14 @@ mod tests {
         ];
         for scalar in test_cases {
             let timestamp_to_date_result =
-                ToDateFunc::new().invoke_with_args(datafusion_expr::ScalarFunctionArgs {
-                    args: vec![ColumnarValue::Scalar(scalar.clone())],
-                    number_rows: 1,
-                    return_type: &DataType::Date32,
-                });
+                invoke_to_date_with_args(vec![ColumnarValue::Scalar(scalar.clone())], 1);
 
             match timestamp_to_date_result {
                 Ok(ColumnarValue::Scalar(ScalarValue::Date32(date_val))) => {
                     let expected = Date32Type::parse_formatted("2025-01-13", "%Y-%m-%d");
                     assert_eq!(date_val, expected, "to_date created wrong value");
                 }
-                _ => panic!("Conversion of {}", scalar),
+                _ => panic!("Conversion of {scalar}"),
             }
         }
     }

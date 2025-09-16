@@ -322,9 +322,13 @@ pub struct ParquetMetadataFunc {}
 
 impl TableFunctionImpl for ParquetMetadataFunc {
     fn call(&self, exprs: &[(Expr, Option<String>)]) -> Result<Arc<dyn TableProvider>> {
+        if exprs.is_empty() {
+            return plan_err!("parquet_metadata requires string argument as its input");
+        }
+
         let filename = match exprs.first() {
             Some((Expr::Literal(ScalarValue::Utf8(Some(s)), _), _)) => s, // single quote: parquet_metadata('x.parquet')
-            Some(Expr::Column(Column { name, .. })) => name, // double quote: parquet_metadata("x.parquet")
+            Some((Expr::Column(Column { name, .. }), _)) => name, // double quote: parquet_metadata("x.parquet")
             _ => {
                 return plan_err!(
                     "parquet_metadata requires string argument as its input"
@@ -510,7 +514,7 @@ impl MetadataCacheFunc {
 }
 
 impl TableFunctionImpl for MetadataCacheFunc {
-    fn call(&self, exprs: &[Expr]) -> Result<Arc<dyn TableProvider>> {
+    fn call(&self, exprs: &[(Expr, Option<String>)]) -> Result<Arc<dyn TableProvider>> {
         if !exprs.is_empty() {
             return plan_err!("metadata_cache should have no arguments");
         }
