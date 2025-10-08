@@ -160,6 +160,10 @@ impl SharedBoundsAccumulator {
             PartitionMode::Partitioned => {
                 left_child.output_partitioning().partition_count()
             }
+            // For partitioned spillable, use the same logic as regular partitioned
+            PartitionMode::PartitionedSpillable => {
+                left_child.output_partitioning().partition_count()
+            }
             // Default value, will be resolved during optimization (does not exist once `execute()` is called; will be replaced by one of the other two)
             PartitionMode::Auto => unreachable!("PartitionMode::Auto should not be present at execution time. This is a bug in DataFusion, please report it!"),
         };

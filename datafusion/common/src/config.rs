@@ -761,6 +761,11 @@ config_namespace! {
         /// using the provided `target_partitions` level
         pub repartition_joins: bool, default = true
 
+        /// Should DataFusion use spillable partitioned hash joins instead of regular partitioned joins
+        /// when repartitioning is enabled. This allows handling larger datasets by spilling to disk
+        /// when memory pressure occurs during join execution.
+        pub enable_spillable_hash_join: bool, default = false
+
         /// Should DataFusion allow symmetric hash joins for unbounded data sources even when
         /// its inputs do not have any ordering or filtering If the flag is not enabled,
         /// the SymmetricHashJoin operator will be unable to prune its internal buffers,

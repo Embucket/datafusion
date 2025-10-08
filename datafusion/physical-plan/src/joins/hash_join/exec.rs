@@ -36,6 +36,7 @@ use crate::joins::utils::{
     update_hash, OnceAsync, OnceFut,
 };
 use crate::joins::{JoinOn, JoinOnRef, PartitionMode, SharedBitmapBuilder};
+use crate::coalesce_partitions::CoalescePartitionsExec;
 use crate::projection::{
     try_embed_projection, try_pushdown_through_join, EmbeddedProjection, JoinData,
     ProjectionExec,
@@ -592,6 +593,10 @@ impl HashJoinExec {
             PartitionMode::Partitioned => {
                 symmetric_join_output_partitioning(left, right, &join_type)?
             }
+            PartitionMode::PartitionedSpillable => {
+                // For partitioned spillable, use the same partitioning as regular partitioned
+                symmetric_join_output_partitioning(left, right, &join_type)?
+            }
         };
 
         let emission_type = if left.boundedness().is_unbounded() {
@@ -797,6 +802,18 @@ impl ExecutionPlan for HashJoinExec {
                 Distribution::UnspecifiedDistribution,
                 Distribution::UnspecifiedDistribution,
             ],
+            PartitionMode::PartitionedSpillable => {
+                // For partitioned spillable, use the same distribution as regular partitioned
+                let (left_expr, right_expr) = self
+                    .on
+                    .iter()
+                    .map(|(l, r)| (Arc::clone(l), Arc::clone(r)))
+                    .unzip();
+                vec![
+                    Distribution::HashPartitioned(left_expr),
+                    Distribution::HashPartitioned(right_expr),
+                ]
+            }
         }
     }
 
@@ -888,6 +905,7 @@ impl ExecutionPlan for HashJoinExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
+        println!("Executing HashJoinExec");
         let on_left = self
             .on
             .iter()
@@ -955,6 +973,80 @@ impl ExecutionPlan for HashJoinExec {
                     "Invalid HashJoinExec, unsupported PartitionMode {:?} in execute()",
                     PartitionMode::Auto
                 );
+            }
+            PartitionMode::PartitionedSpillable => {
+                // For partitioned spillable mode, we need to collect the left side
+                // and then create a partitioned hash join stream
+                println!("PartitionedSpillable mode");
+                // Coalesce left partitions to get the full build side in a single stream
+                let left_plan: Arc<dyn ExecutionPlan> = if self.left.output_partitioning().partition_count() == 1 {
+                    Arc::clone(&self.left)
+                } else {
+                    Arc::new(CoalescePartitionsExec::new(Arc::clone(&self.left)))
+                };
+                let left_stream = left_plan.execute(0, Arc::clone(&context))?;
+                let reservation = MemoryConsumer::new("HashJoinInput").register(context.memory_pool());
+                
+                let left_fut = self.left_fut.try_once(|| {
+                    Ok(collect_left_input(
+                        self.random_state.clone(),
+                        left_stream,
+                        on_left.clone(),
+                        join_metrics.clone(),
+                        reservation,
+                        need_produce_result_in_final(self.join_type),
+                        self.right().output_partitioning().partition_count(),
+                        enable_dynamic_filter_pushdown,
+                    ))
+                })?;
+                
+                // Re-enable spillable stream with single-partition direct-probe for now
+                use crate::joins::hash_join::partitioned::PartitionedHashJoinStream;
+                let right_stream = self.right.execute(partition, Arc::clone(&context))?;
+                let column_indices_after_projection = match &self.projection {
+                    Some(projection) => projection
+                        .iter()
+                        .map(|i| self.column_indices[*i].clone())
+                        .collect(),
+                    None => self.column_indices.clone(),
+                };
+                let on_right = self
+                    .on
+                    .iter()
+                    .map(|(_, right_expr)| Arc::clone(right_expr))
+                    .collect::<Vec<_>>();
+                let batch_size = context.session_config().batch_size();
+                let num_partitions = 1; // Start with single partition correctness
+                let memory_threshold = {
+                    let bytes = context
+                        .session_config()
+                        .options()
+                        .execution
+                        .sort_spill_reservation_bytes;
+                    if bytes == 0 { 1024 * 1024 * 1024 } else { bytes }
+                };
+                let partitioned_reservation = MemoryConsumer::new("PartitionedHashJoin")
+                    .register(context.memory_pool());
+                let partitioned_stream = PartitionedHashJoinStream::new(
+                    partition,
+                    self.schema(),
+                    on_left,
+                    on_right,
+                    self.filter.clone(),
+                    self.join_type,
+                    right_stream,
+                    left_fut,
+                    self.random_state.clone(),
+                    join_metrics,
+                    column_indices_after_projection,
+                    self.null_equality,
+                    batch_size,
+                    num_partitions,
+                    memory_threshold,
+                    partitioned_reservation,
+                    context.runtime_env(),
+                )?;
+                return Ok(Box::pin(partitioned_stream));
             }
         };
 
@@ -1638,6 +1730,10 @@ mod tests {
             PartitionMode::Auto => {
                 return internal_err!("Unexpected PartitionMode::Auto in join tests")
             }
+            PartitionMode::PartitionedSpillable => Arc::new(RepartitionExec::try_new(
+                left,
+                Partitioning::Hash(left_expr, partition_count),
+            )?),
         };
 
         let right_repartitioned: Arc<dyn ExecutionPlan> = match partition_mode {
@@ -1659,6 +1755,10 @@ mod tests {
             PartitionMode::Auto => {
                 return internal_err!("Unexpected PartitionMode::Auto in join tests")
             }
+            PartitionMode::PartitionedSpillable => Arc::new(RepartitionExec::try_new(
+                right,
+                Partitioning::Hash(right_expr, partition_count),
+            )?),
         };
 
         let join = HashJoinExec::try_new(
@@ -1785,6 +1885,62 @@ mod tests {
 
         assert_join_metrics!(metrics, 3);
 
+        Ok(())
+    }
+
+    #[apply(batch_sizes)]
+    #[tokio::test]
+    async fn partitioned_spillable_join_inner_one(batch_size: usize) -> Result<()> {
+        // Configure tiny spill reservation to force spill and 4 partitions
+        let session_config = SessionConfig::default()
+            .with_batch_size(batch_size)
+            .with_target_partitions(4)
+            .with_sort_spill_reservation_bytes(1)
+            .with_spill_compression(datafusion_common::config::SpillCompression::Uncompressed);
+        let task_ctx = Arc::new(TaskContext::default().with_session_config(session_config));
+
+        let left = build_table(
+            ("a1", &vec![1, 2, 3]),
+            ("b1", &vec![4, 5, 5]), // repetition
+            ("c1", &vec![7, 8, 9]),
+        );
+        let right = build_table(
+            ("a2", &vec![10, 20, 30]),
+            ("b1", &vec![4, 5, 6]),
+            ("c2", &vec![70, 80, 90]),
+        );
+        let on = vec![
+            (
+                Arc::new(Column::new_with_schema("b1", &left.schema())?) as _,
+                Arc::new(Column::new_with_schema("b1", &right.schema())?) as _,
+            ),
+        ];
+
+        let (columns, batches, metrics) = join_collect_with_partition_mode(
+            Arc::clone(&left),
+            Arc::clone(&right),
+            on,
+            &JoinType::Inner,
+            PartitionMode::PartitionedSpillable,
+            NullEquality::NullEqualsNothing,
+            task_ctx,
+        )
+        .await?;
+
+        assert_eq!(columns, vec!["a1", "b1", "c1", "a2", "b1", "c2"]);
+
+        let expected = [
+            "+----+----+----+----+----+----+",
+            "| a1 | b1 | c1 | a2 | b1 | c2 |",
+            "+----+----+----+----+----+----+",
+            "| 1  | 4  | 7  | 10 | 4  | 70 |",
+            "| 2  | 5  | 8  | 20 | 5  | 80 |",
+            "| 3  | 5  | 9  | 20 | 5  | 80 |",
+            "+----+----+----+----+----+----+",
+        ];
+        assert_batches_sorted_eq!(expected, &batches);
+
+        assert_join_metrics!(metrics, 3);
         Ok(())
     }
 

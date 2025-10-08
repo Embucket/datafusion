@@ -2202,6 +2202,7 @@ impl protobuf::PhysicalPlanNode {
             PartitionMode::CollectLeft => protobuf::PartitionMode::CollectLeft,
             PartitionMode::Partitioned => protobuf::PartitionMode::Partitioned,
             PartitionMode::Auto => protobuf::PartitionMode::Auto,
+            PartitionMode::PartitionedSpillable => protobuf::PartitionMode::Partitioned,
         };
 
         Ok(protobuf::PhysicalPlanNode {

@@ -348,6 +348,33 @@ pub fn adjust_input_keys_ordering(
                 // Can not satisfy, clear the current requirements and generate new empty requirements
                 requirements.data.clear();
             }
+            PartitionMode::PartitionedSpillable => {
+                // For partitioned spillable, use the same logic as regular partitioned
+                let join_constructor = |new_conditions: (
+                    Vec<(PhysicalExprRef, PhysicalExprRef)>,
+                    Vec<SortOptions>,
+                )| {
+                    HashJoinExec::try_new(
+                        Arc::clone(left),
+                        Arc::clone(right),
+                        new_conditions.0,
+                        filter.clone(),
+                        join_type,
+                        // TODO: although projection is not used in the join here, because projection pushdown is after enforce_distribution. Maybe we need to handle it later. Same as filter.
+                        projection.clone(),
+                        PartitionMode::PartitionedSpillable,
+                        *null_equality,
+                    )
+                    .map(|e| Arc::new(e) as _)
+                };
+                return reorder_partitioned_join_keys(
+                    requirements,
+                    on,
+                    &[],
+                    &join_constructor,
+                )
+                .map(Transformed::yes);
+            }
         }
     } else if let Some(CrossJoinExec { left, .. }) =
         plan.as_any().downcast_ref::<CrossJoinExec>()

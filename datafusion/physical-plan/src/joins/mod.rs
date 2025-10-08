@@ -56,6 +56,8 @@ pub enum PartitionMode {
     /// mode(Partitioned/CollectLeft) is optimal based on statistics. It will
     /// also consider swapping the left and right inputs for the Join
     Auto,
+    /// Partitioned hash join that can spill to disk for large datasets
+    PartitionedSpillable,
 }
 
 /// Partitioning mode to use for symmetric hash join
