@@ -298,6 +298,7 @@ impl PartitionedHashJoinStream {
         left_fut: OnceFut<JoinLeftData>,
         random_state: RandomState,
         join_metrics: BuildProbeJoinMetrics,
+        spill_metrics: SpillMetrics,
         column_indices: Vec<ColumnIndex>,
         null_equality: NullEquality,
         batch_size: usize,
@@ -306,7 +307,6 @@ impl PartitionedHashJoinStream {
         memory_reservation: MemoryReservation,
         runtime_env: Arc<RuntimeEnv>,
     ) -> Result<Self> {
-        let spill_metrics = SpillMetrics::new(&ExecutionPlanMetricsSet::new(), partition);
         let spill_manager = SpillManager::new(
             runtime_env.clone(),
             spill_metrics,

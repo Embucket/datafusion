@@ -50,7 +50,7 @@ use crate::{
         need_produce_result_in_final, symmetric_join_output_partitioning,
         BuildProbeJoinMetrics, ColumnIndex, JoinFilter, JoinHashMapType,
     },
-    metrics::{ExecutionPlanMetricsSet, MetricsSet},
+    metrics::{ExecutionPlanMetricsSet, MetricsSet, SpillMetrics},
     DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, Partitioning,
     PlanProperties, SendableRecordBatchStream, Statistics,
 };
@@ -594,8 +594,9 @@ impl HashJoinExec {
                 symmetric_join_output_partitioning(left, right, &join_type)?
             }
             PartitionMode::PartitionedSpillable => {
-                // For partitioned spillable, use the same partitioning as regular partitioned
-                symmetric_join_output_partitioning(left, right, &join_type)?
+                // While stabilizing spillable join, advertise single output partition to
+                // match the current execution behavior and avoid downstream partition fanout.
+                Partitioning::UnknownPartitioning(1)
             }
         };
 
@@ -802,18 +803,11 @@ impl ExecutionPlan for HashJoinExec {
                 Distribution::UnspecifiedDistribution,
                 Distribution::UnspecifiedDistribution,
             ],
-            PartitionMode::PartitionedSpillable => {
-                // For partitioned spillable, use the same distribution as regular partitioned
-                let (left_expr, right_expr) = self
-                    .on
-                    .iter()
-                    .map(|(l, r)| (Arc::clone(l), Arc::clone(r)))
-                    .unzip();
-                vec![
-                    Distribution::HashPartitioned(left_expr),
-                    Distribution::HashPartitioned(right_expr),
-                ]
-            }
+            PartitionMode::PartitionedSpillable => vec![
+                // While stabilizing, do not require specific input distributions
+                Distribution::UnspecifiedDistribution,
+                Distribution::UnspecifiedDistribution,
+            ],
         }
     }
 
@@ -1027,6 +1021,8 @@ impl ExecutionPlan for HashJoinExec {
                 };
                 let partitioned_reservation = MemoryConsumer::new("PartitionedHashJoin")
                     .register(context.memory_pool());
+                // Reuse this operator's metrics set for spill metrics visibility
+                let spill_metrics = SpillMetrics::new(&self.metrics, partition);
                 let partitioned_stream = PartitionedHashJoinStream::new(
                     partition,
                     self.schema(),
@@ -1038,6 +1034,7 @@ impl ExecutionPlan for HashJoinExec {
                     left_fut,
                     self.random_state.clone(),
                     join_metrics,
+                    spill_metrics,
                     column_indices_after_projection,
                     self.null_equality,
                     batch_size,
@@ -4655,5 +4652,69 @@ mod tests {
     /// Returns the column names on the schema
     fn columns(schema: &Schema) -> Vec<String> {
         schema.fields().iter().map(|f| f.name().clone()).collect()
+    }
+
+    #[tokio::test]
+    async fn partitioned_spillable_spills_to_disk() -> Result<()> {
+        use datafusion_execution::runtime_env::RuntimeEnvBuilder;
+        // Force spilling with very low reservation; single partition correctness path
+        let session_config = SessionConfig::default()
+            .with_batch_size(1024)
+            .with_target_partitions(1)
+            .with_sort_spill_reservation_bytes(1)
+            .with_spill_compression(datafusion_common::config::SpillCompression::Uncompressed);
+        let runtime = RuntimeEnvBuilder::new().build_arc()?;
+        let task_ctx = Arc::new(TaskContext::default()
+            .with_session_config(session_config)
+            .with_runtime(runtime));
+
+        // Build left/right to ensure build side has more than 1 row to trigger spill partitioning
+        let left = build_table(
+            ("a1", &vec![1, 2, 3, 4, 5, 6, 7, 8]),
+            ("b1", &vec![1, 1, 1, 1, 1, 1, 1, 1]),
+            ("c1", &vec![0, 0, 0, 0, 0, 0, 0, 0]),
+        );
+        let right = build_table(
+            ("a2", &vec![10, 20, 30, 40]),
+            ("b1", &vec![1, 1, 1, 2]),
+            ("c2", &vec![0, 0, 0, 0]),
+        );
+        let on = vec![
+            (
+                Arc::new(Column::new_with_schema("b1", &left.schema())?) as _,
+                Arc::new(Column::new_with_schema("b1", &right.schema())?) as _,
+            ),
+        ];
+
+        // Execute with PartitionedSpillable
+        let join = HashJoinExec::try_new(
+            Arc::clone(&left),
+            Arc::clone(&right),
+            on,
+            None,
+            &JoinType::Inner,
+            None,
+            PartitionMode::PartitionedSpillable,
+            NullEquality::NullEqualsNothing,
+        )?;
+
+        let stream = join.execute(0, Arc::clone(&task_ctx))?;
+        // Collect all batches to drive execution and spill
+        let _ = common::collect(stream).await?;
+
+        // Assert that spilling occurred by inspecting metrics on the operator
+        let metrics = join.metrics().unwrap();
+        // Find any spill metrics in the tree and ensure spilled_rows > 0
+        let mut spilled_any = false;
+        for m in metrics.iter() {
+            let name = m.value().name();
+            let v = m.value().as_usize();
+            if (name == "spilled_rows" || name == "spilled_bytes" || name == "spill_count") && v > 0 {
+                spilled_any = true;
+                break;
+            }
+        }
+        assert!(spilled_any, "expected spilling to occur in PartitionedSpillable mode");
+        Ok(())
     }
 }
