@@ -54,12 +54,12 @@ use crate::joins::utils::{
     need_produce_result_in_final, BuildProbeJoinMetrics, ColumnIndex, JoinFilter,
     OnceFut, StatefulStreamResult,
 };
-use crate::metrics::{ExecutionPlanMetricsSet, SpillMetrics};
+use crate::metrics::{SpillMetrics};
 use crate::spill::spill_manager::SpillManager;
 use crate::{RecordBatchStream, SendableRecordBatchStream};
 
 use arrow::array::{Array, ArrayRef, BooleanBufferBuilder, UInt32Array, UInt64Array};
-use arrow::compute::take;
+use arrow::compute::{take, concat_batches};
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use datafusion_common::{
@@ -217,74 +217,97 @@ pub(super) struct PartitionedHashJoinStream {
     pub probes_buffered: bool,
     /// Current read position per partition within buffered probe batches
     pub probe_batch_positions: Vec<usize>,
+    /// Pending async spill reload stream for build partitions
+    pub pending_reload_stream: Option<SendableRecordBatchStream>,
+    /// Accumulated batches for pending reload
+    pub pending_reload_batches: Vec<RecordBatch>,
+    /// Target partition id for pending reload
+    pub pending_reload_partition: Option<usize>,
 }
 
 impl PartitionedHashJoinStream {
     /// Ensure the build partition is loaded in-memory (reload if spilled)
-    fn ensure_build_partition_loaded(&mut self, part_id: usize) -> Result<()> {
+    fn ensure_build_partition_loaded(&mut self, cx: &mut Context<'_>, part_id: usize) -> Poll<Result<()>> {
         let needs_reload = matches!(
             self.build_partitions.get(part_id),
             Some(BuildPartition::Spilled { .. })
         );
         if !needs_reload {
-            return Ok(());
+            return Poll::Ready(Ok(()));
         }
 
-        if let Some(BuildPartition::Spilled { spill_file, .. }) =
-            self.build_partitions.get_mut(part_id)
-        {
-            let spill_file = spill_file
-                .take()
-                .ok_or_else(|| internal_datafusion_err!("spill file already consumed for this partition"))?;
-
-            let mut stream = self.spill_manager.read_spill_as_stream(spill_file)?;
-            let batch = futures::executor::block_on(async {
-                use futures::StreamExt;
-                stream.next().await.transpose()
-            })?
-            .ok_or_else(|| internal_datafusion_err!("empty spilled partition"))?;
-
-            println!(
-                "Reloaded spilled build partition {} for probing (rows={})",
-                part_id,
-                batch.num_rows()
-            );
-
-            // Reconstruct join values from on_left expressions
-            let mut values: Vec<ArrayRef> = Vec::with_capacity(self.on_left.len());
-            for c in &self.on_left {
-                values.push(c.evaluate(&batch)?.into_array(batch.num_rows())?);
+        // Kick off reload if needed
+        if self.pending_reload_partition.is_none() {
+            if let Some(BuildPartition::Spilled { spill_file, .. }) = self.build_partitions.get_mut(part_id) {
+                let spill_file = spill_file.take().ok_or_else(|| internal_datafusion_err!("spill file already consumed for this partition"))?;
+                let stream = self.spill_manager.read_spill_as_stream(spill_file)?;
+                self.pending_reload_stream = Some(stream);
+                self.pending_reload_batches.clear();
+                self.pending_reload_partition = Some(part_id);
             }
-
-            // Rebuild the hash map from the reloaded batch
-            let mut hash_map: Box<dyn JoinHashMapType> = Box::new(
-                crate::joins::join_hash_map::JoinHashMapU32::with_capacity(batch.num_rows()),
-            );
-            self.hashes_buffer.clear();
-            self.hashes_buffer.resize(batch.num_rows(), 0);
-            crate::joins::utils::update_hash(
-                &self.on_left,
-                &batch,
-                &mut *hash_map,
-                0,
-                &self.random_state,
-                &mut self.hashes_buffer,
-                0,
-                true,
-            )?;
-
-            let new_reservation = MemoryConsumer::new("partition_reload")
-                .with_can_spill(true)
-                .register(&self.runtime_env.memory_pool);
-
-            self.build_partitions[part_id] = BuildPartition::InMemory {
-                hash_map,
-                batch,
-                values,
-                reservation: new_reservation,
-            };
         }
-        Ok(())
+
+        // Drive stream forward
+        if self.pending_reload_partition == Some(part_id) {
+            if let Some(stream) = self.pending_reload_stream.as_mut() {
+                match stream.poll_next_unpin(cx) {
+                    Poll::Ready(Some(Ok(batch))) => {
+                        self.pending_reload_batches.push(batch);
+                        return Poll::Pending;
+                    }
+                    Poll::Ready(Some(Err(e))) => return Poll::Ready(Err(e)),
+                    Poll::Ready(None) => {
+                        // Concatenate
+                        let first_schema = self.pending_reload_batches.get(0)
+                            .ok_or_else(|| internal_datafusion_err!("empty spilled partition"))?
+                            .schema();
+                        let concatenated = concat_batches(&first_schema, self.pending_reload_batches.as_slice())
+                            .map_err(DataFusionError::from)?;
+
+                        println!("Reloaded spilled build partition {} for probing (rows={})", part_id, concatenated.num_rows());
+
+                        // Recompute values and hashmap
+                        let mut values: Vec<ArrayRef> = Vec::with_capacity(self.on_left.len());
+                        for c in &self.on_left {
+                            values.push(c.evaluate(&concatenated)?.into_array(concatenated.num_rows())?);
+                        }
+
+                        let mut hash_map: Box<dyn JoinHashMapType> = Box::new(
+                            crate::joins::join_hash_map::JoinHashMapU32::with_capacity(concatenated.num_rows()),
+                        );
+                        self.hashes_buffer.clear();
+                        self.hashes_buffer.resize(concatenated.num_rows(), 0);
+                        crate::joins::utils::update_hash(
+                            &self.on_left,
+                            &concatenated,
+                            &mut *hash_map,
+                            0,
+                            &self.random_state,
+                            &mut self.hashes_buffer,
+                            0,
+                            true,
+                        )?;
+
+                        let new_reservation = MemoryConsumer::new("partition_reload").with_can_spill(true).register(&self.runtime_env.memory_pool);
+
+                        self.build_partitions[part_id] = BuildPartition::InMemory {
+                            hash_map,
+                            batch: concatenated,
+                            values,
+                            reservation: new_reservation,
+                        };
+
+                        self.pending_reload_stream = None;
+                        self.pending_reload_batches.clear();
+                        self.pending_reload_partition = None;
+                        return Poll::Ready(Ok(()));
+                    }
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+        }
+
+        Poll::Pending
     }
     /// Create a new partitioned hash join stream
     pub fn new(
@@ -355,6 +378,9 @@ impl PartitionedHashJoinStream {
             unmatched_offset: 0,
             probes_buffered: false,
             probe_batch_positions: vec![],
+            pending_reload_stream: None,
+            pending_reload_batches: Vec::new(),
+            pending_reload_partition: None,
         })
     }
 
@@ -710,7 +736,11 @@ impl PartitionedHashJoinStream {
         // (Build partition will be immutably borrowed later within a narrower scope)
 
         // Ensure the build partition is ready (reload if spilled) BEFORE any immutable borrows
-        self.ensure_build_partition_loaded(partition_state.partition_id)?;
+        match self.ensure_build_partition_loaded(cx, partition_state.partition_id) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            Poll::Pending => return Poll::Pending,
+        }
 
         // If only 1 partition, stream the probe side directly (simpler and correct across executor partitions)
         if self.num_partitions == 1 {
@@ -906,11 +936,11 @@ impl PartitionedHashJoinStream {
         Poll::Ready(Ok(StatefulStreamResult::Ready(Some(result))))
     }
 
-    /// Handle unmatched rows for outer joins
-    fn handle_unmatched_rows(&mut self) -> Result<StatefulStreamResult<Option<RecordBatch>>> {
+    /// Handle unmatched rows for outer joins (poll-based, non-blocking spill reload)
+    fn handle_unmatched_rows(&mut self, cx: &mut Context<'_>) -> Poll<Result<StatefulStreamResult<Option<RecordBatch>>>> {
         if !need_produce_result_in_final(self.join_type) {
             self.state = PartitionedHashJoinState::Completed;
-            return Ok(StatefulStreamResult::Ready(None));
+            return Poll::Ready(Ok(StatefulStreamResult::Ready(None)));
         }
 
         // If we have cached unmatched indices for current partition, emit them chunk-by-chunk
@@ -943,7 +973,7 @@ impl PartitionedHashJoinStream {
                     BuildPartition::InMemory { batch, .. } => batch,
                     BuildPartition::Spilled { .. } => {
                         // Should not happen because we only cache after loading InMemory indices
-                        return Ok(StatefulStreamResult::Continue);
+                        return Poll::Ready(Ok(StatefulStreamResult::Continue));
                     }
                 };
 
@@ -979,7 +1009,7 @@ impl PartitionedHashJoinStream {
                     self.unmatched_partition += 1;
                 }
 
-                return Ok(StatefulStreamResult::Ready(Some(result)));
+                return Poll::Ready(Ok(StatefulStreamResult::Ready(Some(result))));
             } else {
                 // Safety: should not reach here; reset caches
                 self.unmatched_left_indices_cache = None;
@@ -994,7 +1024,7 @@ impl PartitionedHashJoinStream {
                 .ok_or_else(|| internal_datafusion_err!("missing build partition during unmatched processing"))?;
 
             match partition {
-                BuildPartition::InMemory { batch, .. } => {
+                BuildPartition::InMemory { batch: _batch, .. } => {
                     // Get unmatched indices for this partition using its bitmap
                     let (left_indices, right_indices) = if let Some(bitmap) = self.matched_build_rows_per_partition.get(self.unmatched_partition) {
                         get_final_indices_from_bit_map(
@@ -1004,7 +1034,7 @@ impl PartitionedHashJoinStream {
                     } else {
                         // If no bitmap, skip this partition
                         self.unmatched_partition += 1;
-                        return Ok(StatefulStreamResult::Continue);
+                        return Poll::Ready(Ok(StatefulStreamResult::Continue));
                     };
                     
                     println!(
@@ -1019,59 +1049,84 @@ impl PartitionedHashJoinStream {
                         self.unmatched_right_indices_cache = Some(right_indices.clone());
                         self.unmatched_offset = 0;
                         // Fall-through into cached emission on next invocation
-                        return Ok(StatefulStreamResult::Continue);
+                        return Poll::Ready(Ok(StatefulStreamResult::Continue));
                     } else {
                         // No unmatched rows in this partition, move to next
                         self.unmatched_partition += 1;
-                        return Ok(StatefulStreamResult::Continue);
+                        return Poll::Ready(Ok(StatefulStreamResult::Continue));
                     }
                 }
                 BuildPartition::Spilled { spill_file, .. } => {
-                    // Reload the spilled partition to produce unmatched rows
-                    let spill_file = spill_file.take().ok_or_else(|| internal_datafusion_err!("spill file already consumed for unmatched"))?;
-
-                    let mut stream = self.spill_manager.read_spill_as_stream(spill_file)?;
-                    let batch = futures::executor::block_on(async {
-                        use futures::StreamExt;
-                        stream.next().await.transpose()
-                    })?
-                    .ok_or_else(|| internal_datafusion_err!("empty spilled partition for unmatched"))?;
-
-                    println!(
-                        "Reloaded spilled build partition {} for unmatched rows (rows={})",
-                        self.unmatched_partition,
-                        batch.num_rows()
-                    );
-
-                    // Replace with in-memory (no need to rebuild hash map here)
-                    let new_reservation = MemoryConsumer::new("partition_reload_unmatched")
-                        .with_can_spill(true)
-                        .register(&self.runtime_env.memory_pool);
-                    let mut values: Vec<ArrayRef> = Vec::with_capacity(self.on_left.len());
-                    for c in &self.on_left {
-                        values.push(c.evaluate(&batch)?.into_array(batch.num_rows())?);
+                    // Non-blocking reload of spilled partition for unmatched rows
+                    if self.pending_reload_partition.is_none() {
+                        let taken = spill_file.take().ok_or_else(|| internal_datafusion_err!("spill file already consumed for unmatched"))?;
+                        let stream = self.spill_manager.read_spill_as_stream(taken)?;
+                        self.pending_reload_stream = Some(stream);
+                        self.pending_reload_batches.clear();
+                        self.pending_reload_partition = Some(self.unmatched_partition);
                     }
-                    let hash_map: Box<dyn JoinHashMapType> = Box::new(
-                        crate::joins::join_hash_map::JoinHashMapU32::with_capacity(batch.num_rows()),
-                    );
-                    self.build_partitions[self.unmatched_partition] = BuildPartition::InMemory {
-                        hash_map,
-                        batch,
-                        values,
-                        reservation: new_reservation,
-                    };
-                    println!(
-                        "Prepared spilled partition {} as InMemory for unmatched emission",
-                        self.unmatched_partition
-                    );
-                    // Continue; next iteration will handle InMemory branch to emit unmatched
-                    return Ok(StatefulStreamResult::Continue);
+
+                    if self.pending_reload_partition == Some(self.unmatched_partition) {
+                        if let Some(stream) = self.pending_reload_stream.as_mut() {
+                            match stream.poll_next_unpin(cx) {
+                                Poll::Ready(Some(Ok(batch))) => {
+                                    self.pending_reload_batches.push(batch);
+                                    return Poll::Pending;
+                                }
+                                Poll::Ready(Some(Err(e))) => return Poll::Ready(Err(e)),
+                                Poll::Ready(None) => {
+                                    let first_schema = self.pending_reload_batches.get(0)
+                                        .ok_or_else(|| internal_datafusion_err!("empty spilled partition for unmatched"))?
+                                        .schema();
+                                    let concatenated = concat_batches(&first_schema, self.pending_reload_batches.as_slice())
+                                        .map_err(DataFusionError::from)?;
+
+                                    println!(
+                                        "Reloaded spilled build partition {} for unmatched rows (rows={})",
+                                        self.unmatched_partition,
+                                        concatenated.num_rows()
+                                    );
+
+                                    let new_reservation = MemoryConsumer::new("partition_reload_unmatched")
+                                        .with_can_spill(true)
+                                        .register(&self.runtime_env.memory_pool);
+                                    let mut values: Vec<ArrayRef> = Vec::with_capacity(self.on_left.len());
+                                    for c in &self.on_left {
+                                        values.push(c.evaluate(&concatenated)?.into_array(concatenated.num_rows())?);
+                                    }
+                                    let hash_map: Box<dyn JoinHashMapType> = Box::new(
+                                        crate::joins::join_hash_map::JoinHashMapU32::with_capacity(concatenated.num_rows()),
+                                    );
+                                    self.build_partitions[self.unmatched_partition] = BuildPartition::InMemory {
+                                        hash_map,
+                                        batch: concatenated,
+                                        values,
+                                        reservation: new_reservation,
+                                    };
+                                    println!(
+                                        "Prepared spilled partition {} as InMemory for unmatched emission",
+                                        self.unmatched_partition
+                                    );
+
+                                    // Clear pending
+                                    self.pending_reload_stream = None;
+                                    self.pending_reload_batches.clear();
+                                    self.pending_reload_partition = None;
+
+                                    // Continue; next iteration will handle InMemory branch
+                                    return Poll::Ready(Ok(StatefulStreamResult::Continue));
+                                }
+                                Poll::Pending => return Poll::Pending,
+                            }
+                        }
+                    }
+                    Poll::Pending
                 }
             }
         } else {
             // All partitions processed
             self.state = PartitionedHashJoinState::Completed;
-            return Ok(StatefulStreamResult::Ready(None));
+            return Poll::Ready(Ok(StatefulStreamResult::Ready(None)));
         }
     }
 }
@@ -1130,21 +1185,22 @@ impl Stream for PartitionedHashJoinStream {
                     }
                 }
                 PartitionedHashJoinState::HandleUnmatchedRows => {
-                    match self.handle_unmatched_rows() {
-                        Ok(StatefulStreamResult::Ready(Some(batch))) => {
+                    match self.handle_unmatched_rows(cx) {
+                        Poll::Ready(Ok(StatefulStreamResult::Ready(Some(batch)))) => {
                             println!(
                                 "[spill-join] poll_next yielding unmatched batch: rows={}",
                                 batch.num_rows()
                             );
                             return Poll::Ready(Some(Ok(batch)));
                         }
-                        Ok(StatefulStreamResult::Ready(None)) => {
+                        Poll::Ready(Ok(StatefulStreamResult::Ready(None))) => {
                             return Poll::Ready(None);
                         }
-                        Ok(StatefulStreamResult::Continue) => {
+                        Poll::Ready(Ok(StatefulStreamResult::Continue)) => {
                             continue;
                         }
-                        Err(e) => return Poll::Ready(Some(Err(e))),
+                        Poll::Ready(Err(e)) => return Poll::Ready(Some(Err(e))),
+                        Poll::Pending => return Poll::Pending,
                     }
                 }
                 PartitionedHashJoinState::Completed => return Poll::Ready(None),
