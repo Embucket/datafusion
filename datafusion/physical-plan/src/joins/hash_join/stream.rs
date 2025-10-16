@@ -556,6 +556,17 @@ impl HashJoinStream {
             last_joined_right_idx.map_or(0, |v| v + 1)
         };
 
+        if matches!(self.join_type, JoinType::RightSemi | JoinType::RightAnti | JoinType::RightMark) {
+            println!(
+                "[hash-join] Align {:?}: pre-adjust right_indices={}, range={}..{} (next_offset_present={})",
+                self.join_type,
+                right_indices.len(),
+                index_alignment_range_start,
+                index_alignment_range_end,
+                next_offset.is_some()
+            );
+        }
+
         let (left_indices, right_indices) = adjust_indices_by_join_type(
             left_indices,
             right_indices,
@@ -564,7 +575,39 @@ impl HashJoinStream {
             self.right_side_ordered,
         )?;
 
+        if matches!(self.join_type, JoinType::RightSemi | JoinType::RightAnti | JoinType::RightMark) {
+            println!(
+                "[hash-join] Align {:?}: post-adjust unique_right_indices={} (range={}..{})",
+                self.join_type,
+                right_indices.len(),
+                index_alignment_range_start,
+                index_alignment_range_end
+            );
+        }
+
+        if matches!(self.join_type, JoinType::RightSemi | JoinType::RightAnti) {
+            println!(
+                "[hash-join] Right {:?}: probe_batch_rows={}, unique_matched_right_indices={} (range={}..{})",
+                self.join_type,
+                state.batch.num_rows(),
+                right_indices.len(),
+                index_alignment_range_start,
+                index_alignment_range_end
+            );
+        }
+
         let result = if self.join_type == JoinType::RightMark {
+            build_batch_from_indices(
+                &self.schema,
+                &state.batch,
+                build_side.left_data.batch(),
+                &left_indices,
+                &right_indices,
+                &self.column_indices,
+                JoinSide::Right,
+            )?
+        } else if matches!(self.join_type, JoinType::RightSemi | JoinType::RightAnti) {
+            // Emit probe-side rows for right-oriented joins
             build_batch_from_indices(
                 &self.schema,
                 &state.batch,

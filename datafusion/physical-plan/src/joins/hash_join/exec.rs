@@ -594,8 +594,7 @@ impl HashJoinExec {
                 symmetric_join_output_partitioning(left, right, &join_type)?
             }
             PartitionMode::PartitionedSpillable => {
-                // While stabilizing spillable join, advertise single output partition to
-                // match the current execution behavior and avoid downstream partition fanout.
+                // Stabilize: single output partition to avoid downstream fanout and repartition panics
                 Partitioning::UnknownPartitioning(1)
             }
         };
@@ -969,10 +968,32 @@ impl ExecutionPlan for HashJoinExec {
                 );
             }
             PartitionMode::PartitionedSpillable => {
-                // For partitioned spillable mode, we need to collect the left side
-                // and then create a partitioned hash join stream
                 println!("PartitionedSpillable mode");
-                // Coalesce left partitions to get the full build side in a single stream
+                let enable_spillable = context
+                    .session_config()
+                    .options()
+                    .optimizer
+                    .enable_spillable_hash_join;
+                if !enable_spillable {
+                    println!(
+                        "PartitionedSpillable disabled by optimizer.enable_spillable_hash_join=false; using legacy Partitioned semantics"
+                    );
+                    // Legacy fallback: behave like Partitioned
+                    let left_stream = self.left.execute(partition, Arc::clone(&context))?;
+                    let reservation = MemoryConsumer::new(format!("HashJoinInput[{partition}]"))
+                        .register(context.memory_pool());
+                    OnceFut::new(collect_left_input(
+                        self.random_state.clone(),
+                        left_stream,
+                        on_left.clone(),
+                        join_metrics.clone(),
+                        reservation,
+                        need_produce_result_in_final(self.join_type),
+                        1,
+                        enable_dynamic_filter_pushdown,
+                    ))
+                } else {
+                // Spillable enabled: coalesce left to a single stream
                 let left_plan: Arc<dyn ExecutionPlan> = if self.left.output_partitioning().partition_count() == 1 {
                     Arc::clone(&self.left)
                 } else {
@@ -980,7 +1001,6 @@ impl ExecutionPlan for HashJoinExec {
                 };
                 let left_stream = left_plan.execute(0, Arc::clone(&context))?;
                 let reservation = MemoryConsumer::new("HashJoinInput").register(context.memory_pool());
-                
                 let left_fut = self.left_fut.try_once(|| {
                     Ok(collect_left_input(
                         self.random_state.clone(),
@@ -993,10 +1013,58 @@ impl ExecutionPlan for HashJoinExec {
                         enable_dynamic_filter_pushdown,
                     ))
                 })?;
+                // For Right-side oriented joins, fall back to standard HashJoinStream for correctness
+                if matches!(self.join_type, JoinType::RightSemi | JoinType::RightAnti | JoinType::RightMark) {
+                    // Fall back to standard HashJoinStream but ensure the probe side is a single coalesced stream
+                    let right_plan: Arc<dyn ExecutionPlan> = if self.right.output_partitioning().partition_count() == 1 {
+                        Arc::clone(&self.right)
+                    } else {
+                        Arc::new(CoalescePartitionsExec::new(Arc::clone(&self.right)))
+                    };
+                    let right_stream = right_plan.execute(0, Arc::clone(&context))?;
+                    let column_indices_after_projection = match &self.projection {
+                        Some(projection) => projection
+                            .iter()
+                            .map(|i| self.column_indices[*i].clone())
+                            .collect(),
+                        None => self.column_indices.clone(),
+                    };
+                    let on_right = self
+                        .on
+                        .iter()
+                        .map(|(_, right_expr)| Arc::clone(right_expr))
+                        .collect::<Vec<_>>();
+                    // Classic HashJoinStream constructor
+                    return Ok(Box::pin(HashJoinStream::new(
+                        partition,
+                        self.schema(),
+                        on_right,
+                        self.filter.clone(),
+                        self.join_type,
+                        right_stream,
+                        self.random_state.clone(),
+                        join_metrics,
+                        column_indices_after_projection,
+                        self.null_equality,
+                        HashJoinStreamState::WaitBuildSide,
+                        BuildSide::Initial(
+                        BuildSideInitialState { left_fut }
+                        ),
+                        context.session_config().batch_size(),
+                        vec![],
+                        self.right.output_ordering().is_some(),
+                        None,
+                    )));
+                }
                 
-                // Re-enable spillable stream with single-partition direct-probe for now
+                // Enable spillable stream; coalesce right to a single stream to avoid downstream fanout
                 use crate::joins::hash_join::partitioned::PartitionedHashJoinStream;
-                let right_stream = self.right.execute(partition, Arc::clone(&context))?;
+                let right_plan: Arc<dyn ExecutionPlan> = if self.right.output_partitioning().partition_count() == 1 {
+                    Arc::clone(&self.right)
+                } else {
+                    Arc::new(CoalescePartitionsExec::new(Arc::clone(&self.right)))
+                };
+                let right_stream = right_plan.execute(0, Arc::clone(&context))?;
                 let column_indices_after_projection = match &self.projection {
                     Some(projection) => projection
                         .iter()
@@ -1010,7 +1078,8 @@ impl ExecutionPlan for HashJoinExec {
                     .map(|(_, right_expr)| Arc::clone(right_expr))
                     .collect::<Vec<_>>();
                 let batch_size = context.session_config().batch_size();
-                let num_partitions = 1; // Start with single partition correctness
+                // Single output partition execution
+                let num_partitions = 1;
                 let memory_threshold = {
                     let bytes = context
                         .session_config()
@@ -1044,6 +1113,7 @@ impl ExecutionPlan for HashJoinExec {
                     context.runtime_env(),
                 )?;
                 return Ok(Box::pin(partitioned_stream));
+                }
             }
         };
 
@@ -1075,7 +1145,7 @@ impl ExecutionPlan for HashJoinExec {
 
         // we have the batches and the hash map with their keys. We can how create a stream
         // over the right that uses this information to issue new batches.
-        let right_stream = self.right.execute(partition, context)?;
+        let right_stream = self.right.execute(partition, Arc::clone(&context))?;
 
         // update column indices to reflect the projection
         let column_indices_after_projection = match &self.projection {
