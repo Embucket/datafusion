@@ -626,11 +626,6 @@ impl<'graph> PrecedenceTreeNode<'graph> {
             let next_schema = next_plan.schema();
 
             let join_order_swapped = if !edge.join.on.is_empty() {
-                // Extract columns from the first join condition
-                let (left_expr, right_expr) = &edge.join.on[0];
-                let left_columns = left_expr.column_refs();
-                let right_columns = right_expr.column_refs();
-
                 // Helper to check if a qualified column exists in a schema
                 let column_in_schema = |col: &datafusion_common::Column,
                                          schema: &datafusion_common::DFSchema|
@@ -646,15 +641,24 @@ impl<'graph> PrecedenceTreeNode<'graph> {
                     }
                 };
 
+                // Collect all columns from all join conditions
+                let mut all_left_columns = vec![];
+                let mut all_right_columns = vec![];
+
+                for (left_expr, right_expr) in &edge.join.on {
+                    all_left_columns.extend(left_expr.column_refs());
+                    all_right_columns.extend(right_expr.column_refs());
+                }
+
                 // Check which schema each expression's columns belong to
                 let left_in_current =
-                    left_columns.iter().all(|c| column_in_schema(c, current_schema.as_ref()));
+                    all_left_columns.iter().all(|c| column_in_schema(c, current_schema.as_ref()));
                 let right_in_next =
-                    right_columns.iter().all(|c| column_in_schema(c, next_schema.as_ref()));
+                    all_right_columns.iter().all(|c| column_in_schema(c, next_schema.as_ref()));
                 let left_in_next =
-                    left_columns.iter().all(|c| column_in_schema(c, next_schema.as_ref()));
+                    all_left_columns.iter().all(|c| column_in_schema(c, next_schema.as_ref()));
                 let right_in_current =
-                    right_columns.iter().all(|c| column_in_schema(c, current_schema.as_ref()));
+                    all_right_columns.iter().all(|c| column_in_schema(c, current_schema.as_ref()));
 
                 // Determine swap based on where the qualified columns are found
                 if left_in_current && right_in_next {
