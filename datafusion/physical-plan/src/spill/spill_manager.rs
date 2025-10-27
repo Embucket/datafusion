@@ -21,15 +21,17 @@ use arrow::array::StringViewArray;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use datafusion_execution::runtime_env::RuntimeEnv;
+use std::slice;
 use std::sync::Arc;
 
-use datafusion_common::{config::SpillCompression, Result};
+use datafusion_common::{config::SpillCompression, DataFusionError, Result};
 use datafusion_execution::disk_manager::RefCountedTempFile;
 use datafusion_execution::SendableRecordBatchStream;
 
 use super::{in_progress_spill_file::InProgressSpillFile, SpillReaderStream};
 use crate::coop::cooperative;
 use crate::{common::spawn_buffered, metrics::SpillMetrics};
+use crate::spill::in_memory_spill_buffer::InMemorySpillBuffer;
 
 /// The `SpillManager` is responsible for the following tasks:
 /// - Reading and writing `RecordBatch`es to raw files based on the provided configurations.
@@ -168,6 +170,43 @@ impl SpillManager {
         Ok(file.map(|f| (f, max_record_batch_size)))
     }
 
+    pub(crate) fn spill_batch_auto(&self, batch: &RecordBatch, request_msg: &str) -> Result<SpillLocation> {
+        let size = batch.get_sliced_size()?;
+
+        // check pool limit
+        let used = self.env.memory_pool.reserved();
+        let limit = match self.env.memory_pool.memory_limit() {
+            datafusion_execution::memory_pool::MemoryLimit::Finite(l) => l,
+            _ => usize::MAX,
+        };
+
+        if used + size * 3 / 2 <= limit {
+            let buf = Arc::new(InMemorySpillBuffer::from_batch(batch)?);
+            self.metrics.spilled_bytes.add(size);
+            self.metrics.spilled_rows.add(batch.num_rows());
+            Ok(SpillLocation::Memory(buf))
+        } else {
+            let Some(file) = self.spill_record_batch_and_finish(slice::from_ref(batch), request_msg)? else {
+                return Err(DataFusionError::Execution(
+                    "failed to spill batch to disk".into(),
+                ));
+            };
+            Ok(SpillLocation::Disk(file))
+        }
+    }
+
+    pub fn spill_batches_auto(
+        &self,
+        batches: &[RecordBatch],
+        request_msg: &str,
+    ) -> Result<Vec<SpillLocation>> {
+        let mut result = Vec::with_capacity(batches.len());
+        for batch in batches {
+            result.push(self.spill_batch_auto(batch, request_msg)?);
+        }
+        Ok(result)
+    }
+
     /// Reads a spill file as a stream. The file must be created by the current `SpillManager`.
     /// This method will generate output in FIFO order: the batch appended first
     /// will be read first.
@@ -182,7 +221,24 @@ impl SpillManager {
 
         Ok(spawn_buffered(stream, self.batch_read_buffer_capacity))
     }
+
+    pub fn load_spilled_batch(
+        &self,
+        spill: SpillLocation,
+    ) -> Result<SendableRecordBatchStream> {
+        match spill {
+            SpillLocation::Memory(buf) => Ok(buf.as_stream(Arc::clone(&self.schema))?),
+            SpillLocation::Disk(file) => self.read_spill_as_stream(file),
+        }
+    }
 }
+
+#[derive(Debug)]
+pub enum SpillLocation {
+    Memory(Arc<InMemorySpillBuffer>),
+    Disk(RefCountedTempFile),
+}
+
 
 pub(crate) trait GetSlicedSize {
     /// Returns the size of the `RecordBatch` when sliced.
