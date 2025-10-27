@@ -32,7 +32,6 @@ impl InMemorySpillBuffer {
         })
     }
 
-    /// return FIFO stream of batches
     pub fn as_stream(
         self: Arc<Self>,
         schema: Arc<arrow_schema::Schema>,
