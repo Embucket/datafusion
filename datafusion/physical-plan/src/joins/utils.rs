@@ -1663,7 +1663,7 @@ pub fn update_hash(
     hashes_buffer: &mut Vec<u64>,
     deleted_offset: usize,
     fifo_hashmap: bool,
-) -> Result<()> {
+) -> Result<Vec<ArrayRef>> {
     // evaluate the keys
     let keys_values = on
         .iter()
@@ -1688,7 +1688,7 @@ pub fn update_hash(
         hash_map.update_from_iter(Box::new(hash_values_iter), deleted_offset);
     }
 
-    Ok(())
+    Ok(keys_values)
 }
 
 pub(super) fn equal_rows_arr(

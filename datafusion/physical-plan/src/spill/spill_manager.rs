@@ -173,30 +173,37 @@ impl SpillManager {
     /// Automatically decides whether to spill the given RecordBatch to memory or disk,
     /// depending on available memory pool capacity.
     pub(crate) fn spill_batch_auto(&self, batch: &RecordBatch, request_msg: &str) -> Result<SpillLocation> {
-        let size = batch.get_sliced_size()?;
-
-        // Check current memory usage and total limit from the runtime memory pool
-        let used = self.env.memory_pool.reserved();
-        let limit = match self.env.memory_pool.memory_limit() {
-            datafusion_execution::memory_pool::MemoryLimit::Finite(l) => l,
-            _ => usize::MAX,
+        let Some(file) = self.spill_record_batch_and_finish(slice::from_ref(batch), request_msg)? else {
+            return Err(DataFusionError::Execution(
+                "failed to spill batch to disk".into(),
+            ));
         };
-
-        // If there's enough memory (with a small safety margin), keep it in memory
-        if used + size * 3 / 2 <= limit {
-            let buf = Arc::new(InMemorySpillBuffer::from_batch(batch)?);
-            self.metrics.spilled_bytes.add(size);
-            self.metrics.spilled_rows.add(batch.num_rows());
-            Ok(SpillLocation::Memory(buf))
-        } else {
-            // Otherwise spill to disk using the existing SpillManager logic
-            let Some(file) = self.spill_record_batch_and_finish(slice::from_ref(batch), request_msg)? else {
-                return Err(DataFusionError::Execution(
-                    "failed to spill batch to disk".into(),
-                ));
-            };
-            Ok(SpillLocation::Disk(file))
-        }
+        Ok(SpillLocation::Disk(Arc::new(file)))
+        //
+        // let size = batch.get_sliced_size()?;
+        //
+        // // Check current memory usage and total limit from the runtime memory pool
+        // let used = self.env.memory_pool.reserved();
+        // let limit = match self.env.memory_pool.memory_limit() {
+        //     datafusion_execution::memory_pool::MemoryLimit::Finite(l) => l,
+        //     _ => usize::MAX,
+        // };
+        //
+        // // If there's enough memory (with a small safety margin), keep it in memory
+        // if used + size * 3 / 2 <= limit {
+        //     let buf = Arc::new(InMemorySpillBuffer::from_batch(batch)?);
+        //     self.metrics.spilled_bytes.add(size);
+        //     self.metrics.spilled_rows.add(batch.num_rows());
+        //     Ok(SpillLocation::Memory(buf))
+        // } else {
+        //     // Otherwise spill to disk using the existing SpillManager logic
+        //     let Some(file) = self.spill_record_batch_and_finish(slice::from_ref(batch), request_msg)? else {
+        //         return Err(DataFusionError::Execution(
+        //             "failed to spill batch to disk".into(),
+        //         ));
+        //     };
+        //     Ok(SpillLocation::Disk(Arc::new(file)))
+        // }
     }
 
     pub fn spill_batches_auto(
@@ -226,21 +233,33 @@ impl SpillManager {
         Ok(spawn_buffered(stream, self.batch_read_buffer_capacity))
     }
 
+    pub fn read_spill_as_stream_ref(
+        &self,
+        spill_file_path: &RefCountedTempFile,
+    ) -> Result<SendableRecordBatchStream> {
+        let stream = Box::pin(cooperative(SpillReaderStream::new(
+            Arc::clone(&self.schema),
+            spill_file_path.clone_refcounted()?,
+        )));
+
+        Ok(spawn_buffered(stream, self.batch_read_buffer_capacity))
+    }
+
     pub fn load_spilled_batch(
         &self,
-        spill: SpillLocation,
+        spill: &SpillLocation,
     ) -> Result<SendableRecordBatchStream> {
         match spill {
-            SpillLocation::Memory(buf) => Ok(buf.as_stream(Arc::clone(&self.schema))?),
-            SpillLocation::Disk(file) => self.read_spill_as_stream(file),
+            SpillLocation::Memory(buf) => Ok(Arc::clone(&buf).as_stream(Arc::clone(&self.schema))?),
+            SpillLocation::Disk(file) => self.read_spill_as_stream_ref(file),
         }
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum SpillLocation {
     Memory(Arc<InMemorySpillBuffer>),
-    Disk(RefCountedTempFile),
+    Disk(Arc<RefCountedTempFile>),
 }
 
 

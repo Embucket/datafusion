@@ -478,7 +478,7 @@ mod tests {
         assert_eq!(spilled_rows, num_rows);
 
         for spill in results {
-            let stream = spill_manager.load_spilled_batch(spill)?;
+            let stream = spill_manager.load_spilled_batch(&spill)?;
             let collected = collect(stream).await?;
             assert!(!collected.is_empty());
             assert_eq!(collected[0].schema(), schema);
