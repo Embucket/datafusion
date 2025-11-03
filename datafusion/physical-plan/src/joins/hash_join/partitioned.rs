@@ -1666,6 +1666,14 @@ impl PartitionedHashJoinStream {
             probe_indices = filtered_probe_indices;
         }
 
+        // Capture matched build indices prior to alignment so we can mark bitmaps even if
+        // the join type drops them (e.g. LeftAnti emits matches only in the final phase).
+        let build_indices_for_marking = if need_produce_result_in_final(self.join_type) {
+            Some(build_indices.clone())
+        } else {
+            None
+        };
+
         // Log sample matches even if no residual filter remains, to debug equality behavior
         if !self.filter_debug_once_per_part[partition_state.partition_id]
             || build_indices.len() != probe_indices.len()
@@ -1784,20 +1792,11 @@ impl PartitionedHashJoinStream {
                 .matched_rows_per_part[partition_state.partition_id]
                 .saturating_add(build_indices.len());
 
-            // Only apply alignment to right-oriented joins (RightSemi/RightAnti/RightMark)
-            let needs_alignment = matches!(
-                self.join_type,
-                JoinType::RightSemi | JoinType::RightAnti | JoinType::RightMark
-            );
-
-            // Compute alignment window and adjust indices if needed
-            let (build_indices, probe_indices, last_joined_right_idx) = if needs_alignment
-            {
-                // Compute last joined probe idx from matched pairs BEFORE alignment adjustments
-                let last_joined_right_idx = match probe_indices.len() {
-                    0 => None,
-                    n => Some(probe_indices.value(n - 1) as usize),
-                };
+            // Compute alignment window (used by adjust_indices for all join types)
+            let last_joined_right_idx = match probe_indices.len() {
+                0 => None,
+                n => Some(probe_indices.value(n - 1) as usize),
+            };
             let probe_num_rows = probe_batch.num_rows();
             let mut index_alignment_range_start =
                 self.joined_probe_idx.map_or(0, |v| v + 1);
@@ -1816,28 +1815,31 @@ impl PartitionedHashJoinStream {
             if index_alignment_range_end < index_alignment_range_start {
                 index_alignment_range_end = index_alignment_range_start;
             }
-                let (build_indices, probe_indices) = adjust_indices_by_join_type(
-                    build_indices,
-                    probe_indices,
-                    index_alignment_range_start..index_alignment_range_end,
-                    self.join_type,
-                    self.right_side_ordered,
-                )?;
-                (build_indices, probe_indices, last_joined_right_idx)
-            } else {
-                // Skip alignment for INNER/LEFT (and others not listed above)
-                (build_indices, probe_indices, None)
-            };
 
-            // Debug counter: after alignment (or skipped)
-            println!(
-                "[spill-join] After alignment{}: {}",
-                if needs_alignment { "" } else { " (skipped)" },
-                build_indices.len()
+            let (build_indices, probe_indices) = adjust_indices_by_join_type(
+                build_indices,
+                probe_indices,
+                index_alignment_range_start..index_alignment_range_end,
+                self.join_type,
+                self.right_side_ordered,
+            )?;
+
+            // Only right-oriented joins need to preserve alignment state across batches
+            let needs_alignment = matches!(
+                self.join_type,
+                JoinType::RightSemi | JoinType::RightAnti | JoinType::RightMark
             );
 
-            // Prepare ids for marking after we release borrows
-            let build_ids_to_mark: Vec<u64> = build_indices.values().to_vec();
+            // Debug counter: after alignment (or effective no-op for other join types)
+            println!("[spill-join] After alignment: {}", build_indices.len());
+
+            // Prepare ids for marking after we release borrows. Prefer the pre-alignment
+            // matches (for join types like LeftAnti) so bitmap tracking remains accurate.
+            let build_ids_to_mark: Vec<u64> = if let Some(indices) = build_indices_for_marking {
+                indices.values().to_vec()
+            } else {
+                build_indices.values().to_vec()
+            };
             // Track last joined probe row only for right-oriented joins; otherwise clear it
             self.joined_probe_idx = if needs_alignment && next_offset.is_some() {
                 last_joined_right_idx
