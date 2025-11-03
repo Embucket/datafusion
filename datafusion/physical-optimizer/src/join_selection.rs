@@ -240,7 +240,7 @@ pub(crate) fn partitioned_hash_join(
     } else {
         PartitionMode::Partitioned
     };
-    
+
     if hash_join.join_type().supports_swap() && should_swap_join_order(&**left, &**right)?
     {
         hash_join.swap_inputs(partition_mode)

@@ -290,6 +290,50 @@ pub(super) fn lookup_join_hashmap(
         null_equality,
     )?;
 
+    // Shadow verify for two-key INNER joins to catch coercion issues in classic path
+    if build_side_values.len() == 2 && probe_side_values.len() == 2 {
+        use std::collections::HashMap;
+        let mut map: HashMap<String, usize> = HashMap::new();
+        let max_b = build_side_values[0].len().min(50_000);
+        for i in 0..max_b {
+            let k0 = arrow::util::display::array_value_to_string(
+                build_side_values[0].as_ref(),
+                i,
+            )
+            .unwrap_or_else(|_| "<err>".to_string());
+            let k1 = arrow::util::display::array_value_to_string(
+                build_side_values[1].as_ref(),
+                i,
+            )
+            .unwrap_or_else(|_| "<err>".to_string());
+            let key = format!("{}|{}", k0, k1);
+            *map.entry(key).or_insert(0) += 1;
+        }
+        let mut expect = 0usize;
+        let max_p = probe_side_values[0].len().min(50_000);
+        for i in 0..max_p {
+            let k0 = arrow::util::display::array_value_to_string(
+                probe_side_values[0].as_ref(),
+                i,
+            )
+            .unwrap_or_else(|_| "<err>".to_string());
+            let k1 = arrow::util::display::array_value_to_string(
+                probe_side_values[1].as_ref(),
+                i,
+            )
+            .unwrap_or_else(|_| "<err>".to_string());
+            let key = format!("{}|{}", k0, k1);
+            if let Some(&c) = map.get(&key) {
+                expect += c;
+            }
+        }
+        println!(
+            "[hash-join][verify2] expect_pairs~{} vs actual_after_eq={}",
+            expect,
+            build_indices.len()
+        );
+    }
+
     Ok((build_indices, probe_indices, next_offset))
 }
 
@@ -556,7 +600,10 @@ impl HashJoinStream {
             last_joined_right_idx.map_or(0, |v| v + 1)
         };
 
-        if matches!(self.join_type, JoinType::RightSemi | JoinType::RightAnti | JoinType::RightMark) {
+        if matches!(
+            self.join_type,
+            JoinType::RightSemi | JoinType::RightAnti | JoinType::RightMark
+        ) {
             println!(
                 "[hash-join] Align {:?}: pre-adjust right_indices={}, range={}..{} (next_offset_present={})",
                 self.join_type,
@@ -575,7 +622,10 @@ impl HashJoinStream {
             self.right_side_ordered,
         )?;
 
-        if matches!(self.join_type, JoinType::RightSemi | JoinType::RightAnti | JoinType::RightMark) {
+        if matches!(
+            self.join_type,
+            JoinType::RightSemi | JoinType::RightAnti | JoinType::RightMark
+        ) {
             println!(
                 "[hash-join] Align {:?}: post-adjust unique_right_indices={} (range={}..{})",
                 self.join_type,
@@ -593,6 +643,125 @@ impl HashJoinStream {
                 right_indices.len(),
                 index_alignment_range_start,
                 index_alignment_range_end
+            );
+        }
+
+        // Log some matched pairs for debugging
+        let build_schema = build_side.left_data.batch().schema();
+        let probe_schema = state.batch.schema();
+
+        let sample = left_indices.len().min(5);
+        if sample > 0 {
+            for i in 0..sample {
+                let build_row = left_indices.value(i) as usize;
+                let probe_row = right_indices.value(i) as usize;
+
+                let build_vals = (0..build_schema.fields().len())
+                    .map(|col| {
+                        let name = build_schema.field(col).name();
+                        let value = arrow::util::display::array_value_to_string(
+                            build_side.left_data.batch().column(col).as_ref(),
+                            build_row,
+                        )
+                        .unwrap_or_else(|_| "<err>".to_string());
+                        format!("{}={}", name, value)
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+
+                let probe_vals = (0..probe_schema.fields().len())
+                    .map(|col| {
+                        let name = probe_schema.field(col).name();
+                        let value = arrow::util::display::array_value_to_string(
+                            state.batch.column(col).as_ref(),
+                            probe_row,
+                        )
+                        .unwrap_or_else(|_| "<err>".to_string());
+                        format!("{}={}", name, value)
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+
+                println!(
+                    "[hash-join][match-debug] partition={} pair {} build {{{}}} probe {{{}}}",
+                    self.partition,
+                    i,
+                    build_vals,
+                    probe_vals
+                );
+            }
+        }
+
+        let build_supply_idx = build_schema
+            .fields()
+            .iter()
+            .enumerate()
+            .find_map(|(idx, f)| {
+                if f.name().to_ascii_lowercase().contains("ps_supplycost") {
+                    Some(idx)
+                } else {
+                    None
+                }
+            });
+
+        let probe_min_idx = probe_schema
+            .fields()
+            .iter()
+            .enumerate()
+            .find_map(|(idx, f)| {
+                if f.name().to_ascii_lowercase().contains("min(")
+                    || f.name().to_ascii_lowercase().contains("min_")
+                {
+                    Some(idx)
+                } else {
+                    None
+                }
+            });
+
+        if let (Some(build_supply_idx), Some(probe_min_idx)) = (build_supply_idx, probe_min_idx) {
+            let build_array = build_side.left_data.batch().column(build_supply_idx);
+            let probe_array = state.batch.column(probe_min_idx);
+
+            for j in 0..left_indices.len() {
+                let build_row = left_indices.value(j) as usize;
+                let probe_row = right_indices.value(j) as usize;
+
+                let build_value = arrow::util::display::array_value_to_string(
+                    build_array.as_ref(),
+                    build_row,
+                )
+                .unwrap_or_else(|_| "<err>".to_string());
+                let probe_value = arrow::util::display::array_value_to_string(
+                    probe_array.as_ref(),
+                    probe_row,
+                )
+                .unwrap_or_else(|_| "<err>".to_string());
+
+                if build_value != probe_value {
+                    println!(
+                        "[hash-join][mismatch] partition={} build_row={} ps_supplycost={} min_cost={}",
+                        self.partition,
+                        build_row,
+                        build_value,
+                        probe_value
+                    );
+                    break;
+                }
+            }
+        } else {
+            println!(
+                "[hash-join][mismatch-debug] partition={} build_fields={:?} probe_fields={:?}",
+                self.partition,
+                build_schema
+                    .fields()
+                    .iter()
+                    .map(|f| f.name().clone())
+                    .collect::<Vec<_>>(),
+                probe_schema
+                    .fields()
+                    .iter()
+                    .map(|f| f.name().clone())
+                    .collect::<Vec<_>>()
             );
         }
 

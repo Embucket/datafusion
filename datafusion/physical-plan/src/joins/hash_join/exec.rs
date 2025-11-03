@@ -21,6 +21,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::{any::Any, vec};
 
+use crate::coalesce_partitions::CoalescePartitionsExec;
 use crate::execution_plan::{boundedness_from_children, EmissionType};
 use crate::filter_pushdown::{
     ChildPushdownResult, FilterDescription, FilterPushdownPhase,
@@ -36,7 +37,6 @@ use crate::joins::utils::{
     update_hash, OnceAsync, OnceFut,
 };
 use crate::joins::{JoinOn, JoinOnRef, PartitionMode, SharedBitmapBuilder};
-use crate::coalesce_partitions::CoalescePartitionsExec;
 use crate::projection::{
     try_embed_projection, try_pushdown_through_join, EmbeddedProjection, JoinData,
     ProjectionExec,
@@ -572,13 +572,19 @@ impl HashJoinExec {
         mode: PartitionMode,
         projection: Option<&Vec<usize>>,
     ) -> Result<PlanProperties> {
-        // Calculate equivalence properties:
+        // Calculate equivalence properties. For the spillable path, do not claim
+        // any input order preservation to avoid incorrect planner assumptions
+        // (e.g., SortPreservingMerge) when the operator may perturb order.
+        let maintains = match mode {
+            PartitionMode::PartitionedSpillable => vec![false, false],
+            _ => Self::maintains_input_order(join_type),
+        };
         let mut eq_properties = join_equivalence_properties(
             left.equivalence_properties().clone(),
             right.equivalence_properties().clone(),
             &join_type,
             Arc::clone(&schema),
-            &Self::maintains_input_order(join_type),
+            &maintains,
             Some(Self::probe_side()),
             on,
         )?;
@@ -594,7 +600,8 @@ impl HashJoinExec {
                 symmetric_join_output_partitioning(left, right, &join_type)?
             }
             PartitionMode::PartitionedSpillable => {
-                // Stabilize: single output partition to avoid downstream fanout and repartition panics
+                // Report output partitions consistent with the right side to enable
+                // proper upstream planning (e.g., repartitioning and aggregations)
                 Partitioning::UnknownPartitioning(1)
             }
         };
@@ -968,20 +975,19 @@ impl ExecutionPlan for HashJoinExec {
                 );
             }
             PartitionMode::PartitionedSpillable => {
-                println!("PartitionedSpillable mode");
                 let enable_spillable = context
                     .session_config()
                     .options()
                     .optimizer
                     .enable_spillable_hash_join;
+
                 if !enable_spillable {
-                    println!(
-                        "PartitionedSpillable disabled by optimizer.enable_spillable_hash_join=false; using legacy Partitioned semantics"
-                    );
                     // Legacy fallback: behave like Partitioned
-                    let left_stream = self.left.execute(partition, Arc::clone(&context))?;
-                    let reservation = MemoryConsumer::new(format!("HashJoinInput[{partition}]"))
-                        .register(context.memory_pool());
+                    let left_stream =
+                        self.left.execute(partition, Arc::clone(&context))?;
+                    let reservation =
+                        MemoryConsumer::new(format!("HashJoinInput[{partition}]"))
+                            .register(context.memory_pool());
                     OnceFut::new(collect_left_input(
                         self.random_state.clone(),
                         left_stream,
@@ -993,35 +999,111 @@ impl ExecutionPlan for HashJoinExec {
                         enable_dynamic_filter_pushdown,
                     ))
                 } else {
-                // Spillable enabled: coalesce left to a single stream
-                let left_plan: Arc<dyn ExecutionPlan> = if self.left.output_partitioning().partition_count() == 1 {
-                    Arc::clone(&self.left)
-                } else {
-                    Arc::new(CoalescePartitionsExec::new(Arc::clone(&self.left)))
-                };
-                let left_stream = left_plan.execute(0, Arc::clone(&context))?;
-                let reservation = MemoryConsumer::new("HashJoinInput").register(context.memory_pool());
-                let left_fut = self.left_fut.try_once(|| {
-                    Ok(collect_left_input(
-                        self.random_state.clone(),
-                        left_stream,
-                        on_left.clone(),
-                        join_metrics.clone(),
-                        reservation,
-                        need_produce_result_in_final(self.join_type),
-                        self.right().output_partitioning().partition_count(),
-                        enable_dynamic_filter_pushdown,
-                    ))
-                })?;
-                // For Right-side oriented joins, fall back to standard HashJoinStream for correctness
-                if matches!(self.join_type, JoinType::RightSemi | JoinType::RightAnti | JoinType::RightMark) {
-                    // Fall back to standard HashJoinStream but ensure the probe side is a single coalesced stream
-                    let right_plan: Arc<dyn ExecutionPlan> = if self.right.output_partitioning().partition_count() == 1 {
-                        Arc::clone(&self.right)
-                    } else {
-                        Arc::new(CoalescePartitionsExec::new(Arc::clone(&self.right)))
+                    // Spillable enabled: coalesce left to a single stream
+                    let left_plan: Arc<dyn ExecutionPlan> =
+                        if self.left.output_partitioning().partition_count() == 1 {
+                            Arc::clone(&self.left)
+                        } else {
+                            Arc::new(CoalescePartitionsExec::new(Arc::clone(&self.left)))
+                        };
+                    let build_schema = left_plan.schema();
+                    let left_stream = left_plan.execute(0, Arc::clone(&context))?;
+                    let reservation = MemoryConsumer::new("HashJoinInput")
+                        .register(context.memory_pool());
+                    let left_fut = self.left_fut.try_once(|| {
+                        Ok(collect_left_input(
+                            self.random_state.clone(),
+                            left_stream,
+                            on_left.clone(),
+                            join_metrics.clone(),
+                            reservation,
+                            need_produce_result_in_final(self.join_type),
+                            self.right().output_partitioning().partition_count(),
+                            enable_dynamic_filter_pushdown,
+                        ))
+                    })?;
+
+                    let make_bounds_accumulator = |right_plan: &Arc<dyn ExecutionPlan>| {
+                        if enable_dynamic_filter_pushdown {
+                            self.dynamic_filter.as_ref().map(|df| {
+                                let filter = Arc::clone(&df.filter);
+                                let on_right = self
+                                    .on
+                                    .iter()
+                                    .map(|(_, right_expr)| Arc::clone(right_expr))
+                                    .collect::<Vec<_>>();
+                                Arc::clone(df.bounds_accumulator.get_or_init(|| {
+                                    Arc::new(SharedBoundsAccumulator::new_from_partition_mode(
+                                        self.mode,
+                                        left_plan.as_ref(),
+                                        right_plan.as_ref(),
+                                        filter,
+                                        on_right,
+                                    ))
+                                }))
+                            })
+                        } else {
+                            None
+                        }
                     };
+
+                    // For Right-side oriented joins, fall back to standard HashJoinStream for correctness
+                    if matches!(
+                        self.join_type,
+                        JoinType::RightSemi | JoinType::RightAnti | JoinType::RightMark
+                    ) {
+                        let right_plan: Arc<dyn ExecutionPlan> =
+                            if self.right.output_partitioning().partition_count() == 1 {
+                                Arc::clone(&self.right)
+                            } else {
+                                Arc::new(CoalescePartitionsExec::new(Arc::clone(
+                                    &self.right,
+                                )))
+                            };
+                        let right_stream = right_plan.execute(0, Arc::clone(&context))?;
+                        let shared_bounds_accumulator = make_bounds_accumulator(&right_plan);
+                        let column_indices_after_projection = match &self.projection {
+                            Some(projection) => projection
+                                .iter()
+                                .map(|i| self.column_indices[*i].clone())
+                                .collect(),
+                            None => self.column_indices.clone(),
+                        };
+                        let on_right = self
+                            .on
+                            .iter()
+                            .map(|(_, right_expr)| Arc::clone(right_expr))
+                            .collect::<Vec<_>>();
+                        return Ok(Box::pin(HashJoinStream::new(
+                            partition,
+                            self.schema(),
+                            on_right,
+                            self.filter.clone(),
+                            self.join_type,
+                            right_stream,
+                            self.random_state.clone(),
+                            join_metrics,
+                            column_indices_after_projection,
+                            self.null_equality,
+                            HashJoinStreamState::WaitBuildSide,
+                            BuildSide::Initial(BuildSideInitialState { left_fut }),
+                            context.session_config().batch_size(),
+                            vec![],
+                            self.right.output_ordering().is_some(),
+                            shared_bounds_accumulator,
+                        )));
+                    }
+
+                    use crate::joins::hash_join::partitioned::PartitionedHashJoinStream;
+                    let right_plan: Arc<dyn ExecutionPlan> =
+                        if self.right.output_partitioning().partition_count() == 1 {
+                            Arc::clone(&self.right)
+                        } else {
+                            Arc::new(CoalescePartitionsExec::new(Arc::clone(&self.right)))
+                        };
                     let right_stream = right_plan.execute(0, Arc::clone(&context))?;
+                    let shared_bounds_accumulator = make_bounds_accumulator(&right_plan);
+                    let probe_schema = right_plan.schema();
                     let column_indices_after_projection = match &self.projection {
                         Some(projection) => projection
                             .iter()
@@ -1034,85 +1116,58 @@ impl ExecutionPlan for HashJoinExec {
                         .iter()
                         .map(|(_, right_expr)| Arc::clone(right_expr))
                         .collect::<Vec<_>>();
-                    // Classic HashJoinStream constructor
-                    return Ok(Box::pin(HashJoinStream::new(
+                    let batch_size = context.session_config().batch_size();
+                    let mut num_partitions = context.session_config().target_partitions();
+                    if num_partitions == 0 {
+                        num_partitions = 1;
+                    }
+                    let np2 = num_partitions.next_power_of_two();
+                    let num_partitions = np2.max(1);
+                    let memory_threshold = {
+                        let bytes = context
+                            .session_config()
+                            .options()
+                            .execution
+                            .sort_spill_reservation_bytes;
+                        if bytes == 0 {
+                            1024 * 1024 * 1024
+                        } else {
+                            bytes
+                        }
+                    };
+                    let partitioned_reservation =
+                        MemoryConsumer::new("PartitionedHashJoin")
+                            .register(context.memory_pool());
+                    let probe_spill_metrics =
+                        SpillMetrics::new(&self.metrics, partition);
+                    let build_spill_metrics =
+                        SpillMetrics::new(&self.metrics, partition);
+                    let partitioned_stream = PartitionedHashJoinStream::new(
                         partition,
                         self.schema(),
+                        on_left.clone(),
                         on_right,
                         self.filter.clone(),
                         self.join_type,
                         right_stream,
+                        left_fut,
                         self.random_state.clone(),
                         join_metrics,
+                        probe_spill_metrics,
+                        build_spill_metrics,
                         column_indices_after_projection,
                         self.null_equality,
-                        HashJoinStreamState::WaitBuildSide,
-                        BuildSide::Initial(
-                        BuildSideInitialState { left_fut }
-                        ),
-                        context.session_config().batch_size(),
-                        vec![],
+                        batch_size,
+                        num_partitions,
+                        memory_threshold,
+                        partitioned_reservation,
+                        context.runtime_env(),
+                        build_schema,
+                        probe_schema,
                         self.right.output_ordering().is_some(),
-                        None,
-                    )));
-                }
-                
-                // Enable spillable stream; coalesce right to a single stream to avoid downstream fanout
-                use crate::joins::hash_join::partitioned::PartitionedHashJoinStream;
-                let right_plan: Arc<dyn ExecutionPlan> = if self.right.output_partitioning().partition_count() == 1 {
-                    Arc::clone(&self.right)
-                } else {
-                    Arc::new(CoalescePartitionsExec::new(Arc::clone(&self.right)))
-                };
-                let right_stream = right_plan.execute(0, Arc::clone(&context))?;
-                let column_indices_after_projection = match &self.projection {
-                    Some(projection) => projection
-                        .iter()
-                        .map(|i| self.column_indices[*i].clone())
-                        .collect(),
-                    None => self.column_indices.clone(),
-                };
-                let on_right = self
-                    .on
-                    .iter()
-                    .map(|(_, right_expr)| Arc::clone(right_expr))
-                    .collect::<Vec<_>>();
-                let batch_size = context.session_config().batch_size();
-                // Single output partition execution
-                let num_partitions = 1;
-                let memory_threshold = {
-                    let bytes = context
-                        .session_config()
-                        .options()
-                        .execution
-                        .sort_spill_reservation_bytes;
-                    if bytes == 0 { 1024 * 1024 * 1024 } else { bytes }
-                };
-                let partitioned_reservation = MemoryConsumer::new("PartitionedHashJoin")
-                    .register(context.memory_pool());
-                // Reuse this operator's metrics set for spill metrics visibility
-                let spill_metrics = SpillMetrics::new(&self.metrics, partition);
-                let partitioned_stream = PartitionedHashJoinStream::new(
-                    partition,
-                    self.schema(),
-                    on_left,
-                    on_right,
-                    self.filter.clone(),
-                    self.join_type,
-                    right_stream,
-                    left_fut,
-                    self.random_state.clone(),
-                    join_metrics,
-                    spill_metrics,
-                    column_indices_after_projection,
-                    self.null_equality,
-                    batch_size,
-                    num_partitions,
-                    memory_threshold,
-                    partitioned_reservation,
-                    context.runtime_env(),
-                )?;
-                return Ok(Box::pin(partitioned_stream));
+                        shared_bounds_accumulator,
+                    )?;
+                    return Ok(Box::pin(partitioned_stream));
                 }
             }
         };
@@ -1963,8 +2018,11 @@ mod tests {
             .with_batch_size(batch_size)
             .with_target_partitions(4)
             .with_sort_spill_reservation_bytes(1)
-            .with_spill_compression(datafusion_common::config::SpillCompression::Uncompressed);
-        let task_ctx = Arc::new(TaskContext::default().with_session_config(session_config));
+            .with_spill_compression(
+                datafusion_common::config::SpillCompression::Uncompressed,
+            );
+        let task_ctx =
+            Arc::new(TaskContext::default().with_session_config(session_config));
 
         let left = build_table(
             ("a1", &vec![1, 2, 3]),
@@ -1976,12 +2034,10 @@ mod tests {
             ("b1", &vec![4, 5, 6]),
             ("c2", &vec![70, 80, 90]),
         );
-        let on = vec![
-            (
-                Arc::new(Column::new_with_schema("b1", &left.schema())?) as _,
-                Arc::new(Column::new_with_schema("b1", &right.schema())?) as _,
-            ),
-        ];
+        let on = vec![(
+            Arc::new(Column::new_with_schema("b1", &left.schema())?) as _,
+            Arc::new(Column::new_with_schema("b1", &right.schema())?) as _,
+        )];
 
         let (columns, batches, metrics) = join_collect_with_partition_mode(
             Arc::clone(&left),
@@ -4732,11 +4788,15 @@ mod tests {
             .with_batch_size(1024)
             .with_target_partitions(1)
             .with_sort_spill_reservation_bytes(1)
-            .with_spill_compression(datafusion_common::config::SpillCompression::Uncompressed);
+            .with_spill_compression(
+                datafusion_common::config::SpillCompression::Uncompressed,
+            );
         let runtime = RuntimeEnvBuilder::new().build_arc()?;
-        let task_ctx = Arc::new(TaskContext::default()
-            .with_session_config(session_config)
-            .with_runtime(runtime));
+        let task_ctx = Arc::new(
+            TaskContext::default()
+                .with_session_config(session_config)
+                .with_runtime(runtime),
+        );
 
         // Build left/right to ensure build side has more than 1 row to trigger spill partitioning
         let left = build_table(
@@ -4749,12 +4809,10 @@ mod tests {
             ("b1", &vec![1, 1, 1, 2]),
             ("c2", &vec![0, 0, 0, 0]),
         );
-        let on = vec![
-            (
-                Arc::new(Column::new_with_schema("b1", &left.schema())?) as _,
-                Arc::new(Column::new_with_schema("b1", &right.schema())?) as _,
-            ),
-        ];
+        let on = vec![(
+            Arc::new(Column::new_with_schema("b1", &left.schema())?) as _,
+            Arc::new(Column::new_with_schema("b1", &right.schema())?) as _,
+        )];
 
         // Execute with PartitionedSpillable
         let join = HashJoinExec::try_new(
@@ -4779,12 +4837,19 @@ mod tests {
         for m in metrics.iter() {
             let name = m.value().name();
             let v = m.value().as_usize();
-            if (name == "spilled_rows" || name == "spilled_bytes" || name == "spill_count") && v > 0 {
+            if (name == "spilled_rows"
+                || name == "spilled_bytes"
+                || name == "spill_count")
+                && v > 0
+            {
                 spilled_any = true;
                 break;
             }
         }
-        assert!(spilled_any, "expected spilling to occur in PartitionedSpillable mode");
+        assert!(
+            spilled_any,
+            "expected spilling to occur in PartitionedSpillable mode"
+        );
         Ok(())
     }
 }
