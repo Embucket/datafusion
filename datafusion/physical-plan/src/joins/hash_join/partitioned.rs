@@ -52,7 +52,8 @@ use crate::joins::join_hash_map::JoinHashMapType;
 use crate::joins::utils::{
     adjust_indices_by_join_type, apply_join_filter_to_indices, build_batch_from_indices,
     equal_rows_arr, get_final_indices_from_bit_map, need_produce_result_in_final,
-    BuildProbeJoinMetrics, ColumnIndex, JoinFilter, OnceFut, StatefulStreamResult,
+    uint32_to_uint64_indices, BuildProbeJoinMetrics, ColumnIndex, JoinFilter, OnceFut,
+    StatefulStreamResult,
 };
 use crate::metrics::SpillMetrics;
 use crate::spill::in_progress_spill_file::InProgressSpillFile;
@@ -1797,13 +1798,24 @@ impl PartitionedHashJoinStream {
                     0 => None,
                     n => Some(probe_indices.value(n - 1) as usize),
                 };
-                let index_alignment_range_start =
-                    self.joined_probe_idx.map_or(0, |v| v + 1);
-                let index_alignment_range_end = if next_offset.is_none() {
-                    probe_batch.num_rows()
-                } else {
-                    last_joined_right_idx.map_or(index_alignment_range_start, |v| v + 1)
-                };
+            let probe_num_rows = probe_batch.num_rows();
+            let mut index_alignment_range_start =
+                self.joined_probe_idx.map_or(0, |v| v + 1);
+            let mut index_alignment_range_end = if next_offset.is_none() {
+                probe_num_rows
+            } else {
+                last_joined_right_idx.map_or(index_alignment_range_start, |v| v + 1)
+            };
+
+            if index_alignment_range_start > probe_num_rows {
+                index_alignment_range_start = probe_num_rows;
+            }
+            if index_alignment_range_end > probe_num_rows {
+                index_alignment_range_end = probe_num_rows;
+            }
+            if index_alignment_range_end < index_alignment_range_start {
+                index_alignment_range_end = index_alignment_range_start;
+            }
                 let (build_indices, probe_indices) = adjust_indices_by_join_type(
                     build_indices,
                     probe_indices,
@@ -1834,28 +1846,24 @@ impl PartitionedHashJoinStream {
             };
 
             // Build output batch depending on join side semantics
-            let result = if matches!(self.join_type, JoinType::RightMark) {
-                println!("[spill-join] Building output with JoinSide::Right (RightMark)");
+            let result = if matches!(
+                self.join_type,
+                JoinType::RightMark | JoinType::RightSemi | JoinType::RightAnti
+            ) {
+                if matches!(self.join_type, JoinType::RightMark) {
+                    println!("[spill-join] Building output with JoinSide::Right (RightMark)");
+                } else {
+                    println!(
+                        "[spill-join] Building output with JoinSide::Right ({:?})",
+                        self.join_type
+                    );
+                }
+                let right_indices_u64 = uint32_to_uint64_indices(&probe_indices);
                 build_batch_from_indices(
                     &self.schema,
                     probe_batch,
                     build_batch,
-                    &build_indices,
-                    &probe_indices,
-                    &self.column_indices,
-                    JoinSide::Right,
-                )?
-            } else if matches!(self.join_type, JoinType::RightSemi | JoinType::RightAnti)
-            {
-                println!(
-                    "[spill-join] Building output with JoinSide::Right ({:?})",
-                    self.join_type
-                );
-                build_batch_from_indices(
-                    &self.schema,
-                    probe_batch,
-                    build_batch,
-                    &build_indices,
+                    &right_indices_u64,
                     &probe_indices,
                     &self.column_indices,
                     JoinSide::Right,

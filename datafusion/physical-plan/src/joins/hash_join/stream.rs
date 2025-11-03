@@ -35,8 +35,8 @@ use crate::{
     joins::utils::{
         adjust_indices_by_join_type, apply_join_filter_to_indices,
         build_batch_empty_build_side, build_batch_from_indices,
-        need_produce_result_in_final, BuildProbeJoinMetrics, ColumnIndex, JoinFilter,
-        JoinHashMapType, StatefulStreamResult,
+        need_produce_result_in_final, uint32_to_uint64_indices, BuildProbeJoinMetrics,
+        ColumnIndex, JoinFilter, JoinHashMapType, StatefulStreamResult,
     },
     RecordBatchStream, SendableRecordBatchStream,
 };
@@ -593,12 +593,23 @@ impl HashJoinStream {
 
         // Calculate range and perform alignment.
         // In case probe batch has been processed -- align all remaining rows.
-        let index_alignment_range_start = state.joined_probe_idx.map_or(0, |v| v + 1);
-        let index_alignment_range_end = if next_offset.is_none() {
-            state.batch.num_rows()
+        let batch_num_rows = state.batch.num_rows();
+        let mut index_alignment_range_start = state.joined_probe_idx.map_or(0, |v| v + 1);
+        let mut index_alignment_range_end = if next_offset.is_none() {
+            batch_num_rows
         } else {
             last_joined_right_idx.map_or(0, |v| v + 1)
         };
+
+        if index_alignment_range_start > batch_num_rows {
+            index_alignment_range_start = batch_num_rows;
+        }
+        if index_alignment_range_end > batch_num_rows {
+            index_alignment_range_end = batch_num_rows;
+        }
+        if index_alignment_range_end < index_alignment_range_start {
+            index_alignment_range_end = index_alignment_range_start;
+        }
 
         if matches!(
             self.join_type,
@@ -765,23 +776,16 @@ impl HashJoinStream {
             );
         }
 
-        let result = if self.join_type == JoinType::RightMark {
+        let result = if matches!(
+            self.join_type,
+            JoinType::RightSemi | JoinType::RightAnti | JoinType::RightMark
+        ) {
+            let right_indices_u64 = uint32_to_uint64_indices(&right_indices);
             build_batch_from_indices(
                 &self.schema,
                 &state.batch,
                 build_side.left_data.batch(),
-                &left_indices,
-                &right_indices,
-                &self.column_indices,
-                JoinSide::Right,
-            )?
-        } else if matches!(self.join_type, JoinType::RightSemi | JoinType::RightAnti) {
-            // Emit probe-side rows for right-oriented joins
-            build_batch_from_indices(
-                &self.schema,
-                &state.batch,
-                build_side.left_data.batch(),
-                &left_indices,
+                &right_indices_u64,
                 &right_indices,
                 &self.column_indices,
                 JoinSide::Right,

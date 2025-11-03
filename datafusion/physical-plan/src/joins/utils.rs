@@ -1230,6 +1230,22 @@ where
     )
 }
 
+pub(crate) fn uint32_to_uint64_indices(indices: &UInt32Array) -> UInt64Array {
+    if indices.null_count() == 0 {
+        UInt64Array::from_iter_values(indices.values().iter().map(|v| *v as u64))
+    } else {
+        let mut builder = UInt64Builder::with_capacity(indices.len());
+        for i in 0..indices.len() {
+            if indices.is_null(i) {
+                builder.append_null();
+            } else {
+                builder.append_value(indices.value(i) as u64);
+            }
+        }
+        builder.finish()
+    }
+}
+
 fn build_range_bitmap<T: ArrowPrimitiveType>(
     range: &Range<usize>,
     input: &PrimitiveArray<T>,
