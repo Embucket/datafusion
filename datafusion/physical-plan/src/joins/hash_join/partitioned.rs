@@ -1370,7 +1370,7 @@ impl PartitionedHashJoinStream {
                     }
                 };
             // Debug: log ON expressions and output mapping once we have both sides
-           /* let on_left_desc = self
+            /* let on_left_desc = self
                 .on_left
                 .iter()
                 .map(|e| format!("{}", e))
@@ -1547,7 +1547,7 @@ impl PartitionedHashJoinStream {
             let mut probe_indices = probe_indices;
             if let Some(filter) = &self.filter {
                 let before_len = build_indices.len();
-               // let before_build_indices = build_indices.clone();
+                // let before_build_indices = build_indices.clone();
                 //let before_probe_indices = probe_indices.clone();
 
                 let (filtered_build_indices, filtered_probe_indices) =

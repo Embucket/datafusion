@@ -1023,19 +1023,18 @@ impl ExecutionPlan for HashJoinExec {
                         ))
                     })?;
 
-                    let make_bounds_accumulator = |right_plan: &Arc<
-                        dyn ExecutionPlan,
-                    >| {
-                        if enable_dynamic_filter_pushdown {
-                            self.dynamic_filter.as_ref().map(|df| {
-                                let filter = Arc::clone(&df.filter);
-                                let on_right = self
-                                    .on
-                                    .iter()
-                                    .map(|(_, right_expr)| Arc::clone(right_expr))
-                                    .collect::<Vec<_>>();
-                                Arc::clone(df.bounds_accumulator.get_or_init(|| {
-                                    Arc::new(
+                    let make_bounds_accumulator =
+                        |right_plan: &Arc<dyn ExecutionPlan>| {
+                            if enable_dynamic_filter_pushdown {
+                                self.dynamic_filter.as_ref().map(|df| {
+                                    let filter = Arc::clone(&df.filter);
+                                    let on_right = self
+                                        .on
+                                        .iter()
+                                        .map(|(_, right_expr)| Arc::clone(right_expr))
+                                        .collect::<Vec<_>>();
+                                    Arc::clone(df.bounds_accumulator.get_or_init(|| {
+                                        Arc::new(
                                         SharedBoundsAccumulator::new_from_partition_mode(
                                             self.mode,
                                             left_plan.as_ref(),
@@ -1044,12 +1043,12 @@ impl ExecutionPlan for HashJoinExec {
                                             on_right,
                                         ),
                                     )
-                                }))
-                            })
-                        } else {
-                            None
-                        }
-                    };
+                                    }))
+                                })
+                            } else {
+                                None
+                            }
+                        };
 
                     // For Right-side oriented joins, fall back to standard HashJoinStream for correctness
                     if matches!(
