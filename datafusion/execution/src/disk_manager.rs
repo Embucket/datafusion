@@ -35,7 +35,7 @@ const DEFAULT_MAX_TEMP_DIRECTORY_SIZE: u64 = 100 * 1024 * 1024 * 1024; // 100GB
 /// Builder pattern for the [DiskManager] structure
 #[derive(Clone, Debug)]
 pub struct DiskManagerBuilder {
-/// The storage mode of the disk manager
+    /// The storage mode of the disk manager
     mode: DiskManagerMode,
     /// The maximum amount of data (in bytes) stored inside the temporary directories.
     /// Default to 100GB

@@ -905,7 +905,7 @@ impl ExecutionPlan for HashJoinExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        println!("Executing HashJoinExec");
+        //println!("Executing HashJoinExec");
         let on_left = self
             .on
             .iter()
@@ -1023,7 +1023,9 @@ impl ExecutionPlan for HashJoinExec {
                         ))
                     })?;
 
-                    let make_bounds_accumulator = |right_plan: &Arc<dyn ExecutionPlan>| {
+                    let make_bounds_accumulator = |right_plan: &Arc<
+                        dyn ExecutionPlan,
+                    >| {
                         if enable_dynamic_filter_pushdown {
                             self.dynamic_filter.as_ref().map(|df| {
                                 let filter = Arc::clone(&df.filter);
@@ -1033,13 +1035,15 @@ impl ExecutionPlan for HashJoinExec {
                                     .map(|(_, right_expr)| Arc::clone(right_expr))
                                     .collect::<Vec<_>>();
                                 Arc::clone(df.bounds_accumulator.get_or_init(|| {
-                                    Arc::new(SharedBoundsAccumulator::new_from_partition_mode(
-                                        self.mode,
-                                        left_plan.as_ref(),
-                                        right_plan.as_ref(),
-                                        filter,
-                                        on_right,
-                                    ))
+                                    Arc::new(
+                                        SharedBoundsAccumulator::new_from_partition_mode(
+                                            self.mode,
+                                            left_plan.as_ref(),
+                                            right_plan.as_ref(),
+                                            filter,
+                                            on_right,
+                                        ),
+                                    )
                                 }))
                             })
                         } else {
@@ -1061,7 +1065,8 @@ impl ExecutionPlan for HashJoinExec {
                                 )))
                             };
                         let right_stream = right_plan.execute(0, Arc::clone(&context))?;
-                        let shared_bounds_accumulator = make_bounds_accumulator(&right_plan);
+                        let shared_bounds_accumulator =
+                            make_bounds_accumulator(&right_plan);
                         let column_indices_after_projection = match &self.projection {
                             Some(projection) => projection
                                 .iter()
@@ -1138,10 +1143,8 @@ impl ExecutionPlan for HashJoinExec {
                     let partitioned_reservation =
                         MemoryConsumer::new("PartitionedHashJoin")
                             .register(context.memory_pool());
-                    let probe_spill_metrics =
-                        SpillMetrics::new(&self.metrics, partition);
-                    let build_spill_metrics =
-                        SpillMetrics::new(&self.metrics, partition);
+                    let probe_spill_metrics = SpillMetrics::new(&self.metrics, partition);
+                    let build_spill_metrics = SpillMetrics::new(&self.metrics, partition);
                     let partitioned_stream = PartitionedHashJoinStream::new(
                         partition,
                         self.schema(),

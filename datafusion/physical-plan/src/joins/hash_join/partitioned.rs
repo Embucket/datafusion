@@ -290,36 +290,34 @@ impl PartitionedHashJoinStream {
     ) -> Poll<Result<()>> {
         if let Some(ref accumulator) = self.bounds_accumulator {
             if self.bounds_waiter.is_none() {
-                println!(
-                    "[spill-join] partition={} reporting build bounds (rows={})",
-                    self.partition,
-                    build_data.batch().num_rows()
-                );
+                // println!(
+                //     "[spill-join] partition={} reporting build bounds (rows={})",
+                //     self.partition,
+                //     build_data.batch().num_rows()
+                // );
                 let accumulator = Arc::clone(accumulator);
                 let partition = self.partition;
                 let bounds = build_data.bounds.clone();
                 self.bounds_waiter = Some(OnceFut::new(async move {
-                    accumulator
-                        .report_partition_bounds(partition, bounds)
-                        .await
+                    accumulator.report_partition_bounds(partition, bounds).await
                 }));
             }
 
             if let Some(waiter) = self.bounds_waiter.as_mut() {
                 match waiter.get(cx) {
                     Poll::Ready(Ok(_)) => {
-                        println!(
-                            "[spill-join] partition={} build bounds reported",
-                            self.partition
-                        );
+                        // println!(
+                        //     "[spill-join] partition={} build bounds reported",
+                        //     self.partition
+                        // );
                         self.bounds_waiter = None;
                     }
                     Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                     Poll::Pending => {
-                        println!(
-                            "[spill-join] partition={} waiting on shared bounds barrier",
-                            self.partition
-                        );
+                        // println!(
+                        //     "[spill-join] partition={} waiting on shared bounds barrier",
+                        //     self.partition
+                        // );
                         return Poll::Pending;
                     }
                 }
@@ -357,10 +355,10 @@ impl PartitionedHashJoinStream {
                 self.pending_reload_stream = Some(stream);
                 self.pending_reload_batches.clear();
                 self.pending_reload_partition = Some(part_id);
-                println!(
-                    "[spill-join][reload] start partition {}",
-                    part_id
-                );
+                // println!(
+                //     "[spill-join][reload] start partition {}",
+                //     part_id
+                // );
             }
         }
 
@@ -369,14 +367,14 @@ impl PartitionedHashJoinStream {
             if let Some(stream) = self.pending_reload_stream.as_mut() {
                 match stream.poll_next_unpin(cx) {
                     Poll::Ready(Some(Ok(batch))) => {
-                        println!(
-                            "[spill-join][reload] partition {} batch rows={}",
-                            part_id,
-                            batch.num_rows()
-                        );
+                        // println!(
+                        //     "[spill-join][reload] partition {} batch rows={}",
+                        //     part_id,
+                        //     batch.num_rows()
+                        // );
                         self.pending_reload_batches.push(batch);
                         return Poll::Pending;
-                    },
+                    }
                     Poll::Ready(Some(Err(e))) => return Poll::Ready(Err(e)),
                     Poll::Ready(None) => {
                         // Concatenate
@@ -393,11 +391,11 @@ impl PartitionedHashJoinStream {
                         )
                         .map_err(DataFusionError::from)?;
 
-                        println!(
-                            "Reloaded spilled build partition {} for probing (rows={})",
-                            part_id,
-                            concatenated.num_rows()
-                        );
+                        // println!(
+                        //     "Reloaded spilled build partition {} for probing (rows={})",
+                        //     part_id,
+                        //     concatenated.num_rows()
+                        // );
 
                         // Grow global reservation conservatively by concatenated batch size
                         let concat_size = concatenated.get_array_memory_size();
@@ -442,17 +440,17 @@ impl PartitionedHashJoinStream {
                             reservation: new_reservation,
                         };
 
-                        if let Some(BuildPartition::InMemory {
+                        /*if let Some(BuildPartition::InMemory {
                             hash_map, batch, ..
                         }) = self.build_partitions.get(part_id)
                         {
-                            println!(
-                                "Reloaded partition {} hashmap empty? {} rows={}",
-                                part_id,
-                                hash_map.is_empty(),
-                                batch.num_rows()
-                            );
-                        }
+                            // println!(
+                            //     "Reloaded partition {} hashmap empty? {} rows={}",
+                            //     part_id,
+                            //     hash_map.is_empty(),
+                            //     batch.num_rows()
+                            // );
+                        }*/
 
                         self.pending_reload_stream = None;
                         self.pending_reload_batches.clear();
@@ -462,11 +460,11 @@ impl PartitionedHashJoinStream {
                         return Poll::Ready(Ok(()));
                     }
                     Poll::Pending => {
-                        println!(
-                            "[spill-join][reload] partition {} pending batches={}",
-                            part_id,
-                            self.pending_reload_batches.len()
-                        );
+                        // println!(
+                        //     "[spill-join][reload] partition {} pending batches={}",
+                        //     part_id,
+                        //     self.pending_reload_batches.len()
+                        // );
                         return Poll::Pending;
                     }
                 }
@@ -592,11 +590,11 @@ impl PartitionedHashJoinStream {
             match self.right.poll_next_unpin(cx) {
                 Poll::Ready(Some(Ok(batch))) => {
                     // Compute ON values for the full batch (once)
-                    println!(
-                        "[spill-join] probe batch rows={} schema={:?}",
-                        batch.num_rows(),
-                        batch.schema().fields().len()
-                    );
+                    // println!(
+                    //     "[spill-join] probe batch rows={} schema={:?}",
+                    //     batch.num_rows(),
+                    //     batch.schema().fields().len()
+                    // );
                     let mut keys_values: Vec<ArrayRef> =
                         Vec::with_capacity(self.on_right.len());
                     for c in &self.on_right {
@@ -623,11 +621,11 @@ impl PartitionedHashJoinStream {
                         }
                         let indices_arr: UInt32Array = part_indices.clone().into();
                         if self.probe_partitions[part_id].batches.is_empty() {
-                            println!(
-                                "[spill-join] probe partition {} first rows {:?}",
-                                part_id,
-                                &part_indices[..part_indices.len().min(10)]
-                            );
+                            // println!(
+                            //     "[spill-join] probe partition {} first rows {:?}",
+                            //     part_id,
+                            //     &part_indices[..part_indices.len().min(10)]
+                            // );
                         }
 
                         // Take data columns
@@ -676,11 +674,11 @@ impl PartitionedHashJoinStream {
                                     self.probe_spill_in_progress[part_id]
                                 {
                                     ipf.append_batch(&filtered_batch)?;
-                                    println!(
-                                        "[spill-join][probe-spill] write partition={} rows={}",
-                                        part_id,
-                                        filtered_batch.num_rows()
-                                    );
+                                    // println!(
+                                    //     "[spill-join][probe-spill] write partition={} rows={}",
+                                    //     part_id,
+                                    //     filtered_batch.num_rows()
+                                    // );
                                 }
                                 self.probe_spilled_rows_per_part[part_id] +=
                                     filtered_batch.num_rows();
@@ -713,25 +711,25 @@ impl PartitionedHashJoinStream {
                     // Finished buffering
                     self.probes_buffered = true;
                     self.probe_batch_positions = vec![0; self.num_partitions];
-                    println!(
-                        "[spill-join] probe buffered rows per partition = {:?}",
-                        self.probe_partitions
-                            .iter()
-                            .enumerate()
-                            .map(|(i, p)| (i, p.batches.iter().map(|b| b.num_rows()).sum::<usize>()))
-                            .collect::<Vec<_>>()
-                    );
+                    // println!(
+                    //     "[spill-join] probe buffered rows per partition = {:?}",
+                    //     self.probe_partitions
+                    //         .iter()
+                    //         .enumerate()
+                    //         .map(|(i, p)| (i, p.batches.iter().map(|b| b.num_rows()).sum::<usize>()))
+                    //         .collect::<Vec<_>>()
+                    // );
                     // Finalize any in-progress probe spill files
                     for part_id in 0..self.num_partitions {
                         if let Some(mut ipf) =
                             self.probe_spill_in_progress[part_id].take()
                         {
                             if let Some(file) = ipf.finish()? {
-                                    println!(
-                                        "[spill-join][probe-spill] finalize partition={} rows_spilled={}",
-                                        part_id,
-                                        self.probe_spilled_rows_per_part[part_id]
-                                    );
+                                // println!(
+                                //     "[spill-join][probe-spill] finalize partition={} rows_spilled={}",
+                                //     part_id,
+                                //     self.probe_spilled_rows_per_part[part_id]
+                                // );
                                 self.probe_spill_files[part_id] = Some(file);
                             }
                         }
@@ -739,13 +737,13 @@ impl PartitionedHashJoinStream {
                     return Poll::Ready(Ok(()));
                 }
                 Poll::Pending => {
-                    println!(
-                        "[spill-join][probe-buffer] pending batches buffered={:?} spilled_rows={:?}",
-                        self.probe_buffered_rows_per_part,
-                        self.probe_spilled_rows_per_part
-                    );
+                    // println!(
+                    //     "[spill-join][probe-buffer] pending batches buffered={:?} spilled_rows={:?}",
+                    //     self.probe_buffered_rows_per_part,
+                    //     self.probe_spilled_rows_per_part
+                    // );
                     return Poll::Pending;
-                },
+                }
             }
         }
     }
@@ -755,10 +753,10 @@ impl PartitionedHashJoinStream {
         &mut self,
         build_data: Arc<JoinLeftData>,
     ) -> Result<StatefulStreamResult<Option<RecordBatch>>> {
-        println!(
-            "Partitioning build side data into {} partitions",
-            self.num_partitions
-        );
+        // println!(
+        //     "Partitioning build side data into {} partitions",
+        //     self.num_partitions
+        // );
         // Metrics: record build input
         self.join_metrics.build_input_batches.add(1);
         self.join_metrics
@@ -784,10 +782,10 @@ impl PartitionedHashJoinStream {
         for (row_idx, &hash) in hashes.iter().enumerate() {
             let partition_id = self.partition_for_hash(hash);
             if row_idx < 10 {
-                println!(
-                    "[spill-join] build row {} hash={} -> partition {}",
-                    row_idx, hash, partition_id
-                );
+                // println!(
+                //     "[spill-join] build row {} hash={} -> partition {}",
+                //     row_idx, hash, partition_id
+                // );
             }
             partition_batches[partition_id].push(row_idx);
         }
@@ -854,13 +852,13 @@ impl PartitionedHashJoinStream {
             }
 
             if will_spill && self.runtime_env.disk_manager.tmp_files_enabled() {
-                println!(
-                    "Spilling build partition {} (rows={}) due to memory threshold (threshold={} bytes, current={})",
-                    partition_id,
-                    row_indices.len(),
-                    self.memory_threshold,
-                    self.memory_reservation.size()
-                );
+                // println!(
+                //     "Spilling build partition {} (rows={}) due to memory threshold (threshold={} bytes, current={})",
+                //     partition_id,
+                //     row_indices.len(),
+                //     self.memory_threshold,
+                //     self.memory_reservation.size()
+                // );
                 // Spill this partition to disk and do not keep it in memory
                 let spill_file = self
                     .build_spill_manager
@@ -906,11 +904,11 @@ impl PartitionedHashJoinStream {
             let iter = self.hashes_buffer.iter().enumerate().map(|(i, h)| (i, h));
             partition_hash_map.update_from_iter(Box::new(iter), 0);
 
-            println!(
-                "Built in-memory hash map for partition {} (rows={})",
-                partition_id,
-                row_indices.len()
-            );
+            // println!(
+            //     "Built in-memory hash map for partition {} (rows={})",
+            //     partition_id,
+            //     row_indices.len()
+            // );
             // Metrics: approximate build memory used (batch + values)
             let approx = partition_batch.get_array_memory_size()
                 + partition_values
@@ -931,11 +929,11 @@ impl PartitionedHashJoinStream {
                 .with_can_spill(true)
                 .register(&self.runtime_env.memory_pool);
 
-            let is_empty_after = partition_hash_map.is_empty();
-            println!(
-                "Partition {} hashmap empty after build? {}",
-                partition_id, is_empty_after
-            );
+            //let is_empty_after = partition_hash_map.is_empty();
+            // println!(
+            //     "Partition {} hashmap empty after build? {}",
+            //     partition_id, is_empty_after
+            // );
 
             self.build_partitions.push(BuildPartition::InMemory {
                 hash_map: partition_hash_map,
@@ -949,10 +947,10 @@ impl PartitionedHashJoinStream {
         // This ensures a single stream can process all partitions when the
         // operator reports a single output partition.
         let start_partition = 0;
-        println!(
-            "Partitioning complete. Created {} partitions. Starting to process partition {}",
-            self.build_partitions.len(), start_partition
-        );
+        // println!(
+        //     "Partitioning complete. Created {} partitions. Starting to process partition {}",
+        //     self.build_partitions.len(), start_partition
+        // );
 
         self.state = PartitionedHashJoinState::ProcessPartition(ProcessPartitionState {
             partition_id: start_partition,
@@ -1078,12 +1076,12 @@ impl PartitionedHashJoinStream {
             self.state = PartitionedHashJoinState::HandleUnmatchedRows;
             return Poll::Ready(Ok(StatefulStreamResult::Continue));
         }
-        println!(
-            "Processing partition {} (total_partitions={}), build_partitions.len()={}",
-            partition_state.partition_id,
-            partition_state.total_partitions,
-            self.build_partitions.len()
-        );
+        // println!(
+        //     "Processing partition {} (total_partitions={}), build_partitions.len()={}",
+        //     partition_state.partition_id,
+        //     partition_state.total_partitions,
+        //     self.build_partitions.len()
+        // );
 
         // Do not buffer probe side here; selection happens below depending on num_partitions
 
@@ -1167,10 +1165,10 @@ impl PartitionedHashJoinStream {
                         self.pending_probe_partition = Some(partition_state.partition_id);
                     } else {
                         // Spilled probe indicated but file not yet finalized: wait
-                        println!(
-                            "[spill-join] Waiting for spilled probe file for partition {}",
-                            partition_state.partition_id
-                        );
+                        // println!(
+                        //     "[spill-join] Waiting for spilled probe file for partition {}",
+                        //     partition_state.partition_id
+                        // );
                         return Poll::Pending;
                     }
                 }
@@ -1205,34 +1203,34 @@ impl PartitionedHashJoinStream {
                                         [partition_state.partition_id]
                                         .saturating_add(b.num_rows());
                                 }
-                                println!(
-                                    "[spill-join][probe-spill] partition={} batch rows={}",
-                                    partition_state.partition_id,
-                                    self.current_probe_batch
-                                        .as_ref()
-                                        .map(|b| b.num_rows())
-                                        .unwrap_or(0)
-                                );
+                                // println!(
+                                //     "[spill-join][probe-spill] partition={} batch rows={}",
+                                //     partition_state.partition_id,
+                                //     self.current_probe_batch
+                                //         .as_ref()
+                                //         .map(|b| b.num_rows())
+                                //         .unwrap_or(0)
+                                // );
                             }
                             Poll::Ready(Some(Err(e))) => return Poll::Ready(Err(e)),
                             Poll::Ready(None) => {
                                 // Finished probe for this partition; advance
                                 self.pending_probe_stream = None;
                                 self.pending_probe_partition = None;
-                                println!(
-                                    "[spill-join][summary] part={} buffered={} spilled={} consumed={} candidates={} matched={} emitted={}",
-                                    partition_state.partition_id,
-                                    self.probe_buffered_rows_per_part[partition_state.partition_id],
-                                    self.probe_spilled_rows_per_part[partition_state.partition_id],
-                                    self.probe_consumed_rows_per_part[partition_state.partition_id],
-                                    self.candidate_pairs_per_part[partition_state.partition_id],
-                                    self.matched_rows_per_part[partition_state.partition_id],
-                                    self.emitted_rows_per_part[partition_state.partition_id]
-                                );
-                                println!(
-                                    "[spill-join][probe-spill] partition={} stream complete",
-                                    partition_state.partition_id
-                                );
+                                // println!(
+                                //     "[spill-join][summary] part={} buffered={} spilled={} consumed={} candidates={} matched={} emitted={}",
+                                //     partition_state.partition_id,
+                                //     self.probe_buffered_rows_per_part[partition_state.partition_id],
+                                //     self.probe_spilled_rows_per_part[partition_state.partition_id],
+                                //     self.probe_consumed_rows_per_part[partition_state.partition_id],
+                                //     self.candidate_pairs_per_part[partition_state.partition_id],
+                                //     self.matched_rows_per_part[partition_state.partition_id],
+                                //     self.emitted_rows_per_part[partition_state.partition_id]
+                                // );
+                                // println!(
+                                //     "[spill-join][probe-spill] partition={} stream complete",
+                                //     partition_state.partition_id
+                                // );
                                 self.release_partition_resources(
                                     partition_state.partition_id,
                                 );
@@ -1263,16 +1261,16 @@ impl PartitionedHashJoinStream {
                         // No stream available; nothing to read, advance
                         self.pending_probe_stream = None;
                         self.pending_probe_partition = None;
-                        println!(
-                            "[spill-join][summary] part={} buffered={} spilled={} consumed={} candidates={} matched={} emitted={}",
-                            partition_state.partition_id,
-                            self.probe_buffered_rows_per_part[partition_state.partition_id],
-                            self.probe_spilled_rows_per_part[partition_state.partition_id],
-                            self.probe_consumed_rows_per_part[partition_state.partition_id],
-                            self.candidate_pairs_per_part[partition_state.partition_id],
-                            self.matched_rows_per_part[partition_state.partition_id],
-                            self.emitted_rows_per_part[partition_state.partition_id]
-                        );
+                        // println!(
+                        //     "[spill-join][summary] part={} buffered={} spilled={} consumed={} candidates={} matched={} emitted={}",
+                        //     partition_state.partition_id,
+                        //     self.probe_buffered_rows_per_part[partition_state.partition_id],
+                        //     self.probe_spilled_rows_per_part[partition_state.partition_id],
+                        //     self.probe_consumed_rows_per_part[partition_state.partition_id],
+                        //     self.candidate_pairs_per_part[partition_state.partition_id],
+                        //     self.matched_rows_per_part[partition_state.partition_id],
+                        //     self.emitted_rows_per_part[partition_state.partition_id]
+                        // );
                         self.release_partition_resources(partition_state.partition_id);
                         if partition_state.is_last_partition {
                             self.state = PartitionedHashJoinState::HandleUnmatchedRows;
@@ -1291,16 +1289,16 @@ impl PartitionedHashJoinStream {
                 }
             } else {
                 // Neither spilled nor buffered probe for this partition: advance
-                println!(
-                    "[spill-join][summary] part={} buffered={} spilled={} consumed={} candidates={} matched={} emitted={}",
-                    partition_state.partition_id,
-                    self.probe_buffered_rows_per_part[partition_state.partition_id],
-                    self.probe_spilled_rows_per_part[partition_state.partition_id],
-                    self.probe_consumed_rows_per_part[partition_state.partition_id],
-                    self.candidate_pairs_per_part[partition_state.partition_id],
-                    self.matched_rows_per_part[partition_state.partition_id],
-                    self.emitted_rows_per_part[partition_state.partition_id]
-                );
+                // println!(
+                //     "[spill-join][summary] part={} buffered={} spilled={} consumed={} candidates={} matched={} emitted={}",
+                //     partition_state.partition_id,
+                //     self.probe_buffered_rows_per_part[partition_state.partition_id],
+                //     self.probe_spilled_rows_per_part[partition_state.partition_id],
+                //     self.probe_consumed_rows_per_part[partition_state.partition_id],
+                //     self.candidate_pairs_per_part[partition_state.partition_id],
+                //     self.matched_rows_per_part[partition_state.partition_id],
+                //     self.emitted_rows_per_part[partition_state.partition_id]
+                // );
                 self.release_partition_resources(partition_state.partition_id);
                 if partition_state.is_last_partition {
                     self.state = PartitionedHashJoinState::HandleUnmatchedRows;
@@ -1320,16 +1318,16 @@ impl PartitionedHashJoinStream {
 
         // If no probe batch selected, advance to next partition (no probe rows here)
         if self.current_probe_batch.is_none() {
-            println!(
-                "[spill-join][summary] part={} buffered={} spilled={} consumed={} candidates={} matched={} emitted={}",
-                partition_state.partition_id,
-                self.probe_buffered_rows_per_part[partition_state.partition_id],
-                self.probe_spilled_rows_per_part[partition_state.partition_id],
-                self.probe_consumed_rows_per_part[partition_state.partition_id],
-                self.candidate_pairs_per_part[partition_state.partition_id],
-                self.matched_rows_per_part[partition_state.partition_id],
-                self.emitted_rows_per_part[partition_state.partition_id]
-            );
+            // println!(
+            //     "[spill-join][summary] part={} buffered={} spilled={} consumed={} candidates={} matched={} emitted={}",
+            //     partition_state.partition_id,
+            //     self.probe_buffered_rows_per_part[partition_state.partition_id],
+            //     self.probe_spilled_rows_per_part[partition_state.partition_id],
+            //     self.probe_consumed_rows_per_part[partition_state.partition_id],
+            //     self.candidate_pairs_per_part[partition_state.partition_id],
+            //     self.matched_rows_per_part[partition_state.partition_id],
+            //     self.emitted_rows_per_part[partition_state.partition_id]
+            // );
             self.release_partition_resources(partition_state.partition_id);
             if partition_state.is_last_partition {
                 self.state = PartitionedHashJoinState::HandleUnmatchedRows;
@@ -1372,7 +1370,7 @@ impl PartitionedHashJoinStream {
                     }
                 };
             // Debug: log ON expressions and output mapping once we have both sides
-            let on_left_desc = self
+           /* let on_left_desc = self
                 .on_left
                 .iter()
                 .map(|e| format!("{}", e))
@@ -1396,14 +1394,14 @@ impl PartitionedHashJoinStream {
                     format!("{}@{}", side, ci.index)
                 })
                 .collect::<Vec<_>>()
-                .join(", ");
-            println!(
-                "[spill-join] ON build=[{}] | probe=[{}] | out=[{}]",
-                on_left_desc, on_right_desc, mapping_desc
-            );
+                .join(", ");*/
+            // println!(
+            //     "[spill-join] ON build=[{}] | probe=[{}] | out=[{}]",
+            //     on_left_desc, on_right_desc, mapping_desc
+            // );
 
             // Log resolved output column names for the current mapping
-            let out_names = self
+            /*let out_names = self
                 .column_indices
                 .iter()
                 .map(|ci| match ci.side {
@@ -1417,13 +1415,13 @@ impl PartitionedHashJoinStream {
                 })
                 .collect::<Vec<_>>()
                 .join(", ");
-            println!("[spill-join] OUT columns: {}", out_names);
+            // println!("[spill-join] OUT columns: {}", out_names);
 
-            println!(
-                "[spill-join] Partition {} build hashmap empty? {}",
-                partition_state.partition_id,
-                build_hashmap.is_empty()
-            );
+            // println!(
+            //     "[spill-join] Partition {} build hashmap empty? {}",
+            //     partition_state.partition_id,
+            //     build_hashmap.is_empty()
+            // );*/
 
             // Lookup against hash map with limit
             let (probe_indices, build_indices, next_offset) = build_hashmap
@@ -1440,13 +1438,13 @@ impl PartitionedHashJoinStream {
             self.candidate_pairs_per_part[partition_state.partition_id] = self
                 .candidate_pairs_per_part[partition_state.partition_id]
                 .saturating_add(build_indices.len());
-            println!(
-                "[spill-join] Candidates before equality: build_ids={}, probe_ids={}, build_rows={}, probe_rows={}",
-                build_indices.len(),
-                probe_indices.len(),
-                build_batch.num_rows(),
-                probe_batch.num_rows()
-            );
+            // println!(
+            //     "[spill-join] Candidates before equality: build_ids={}, probe_ids={}, build_rows={}, probe_rows={}",
+            //     build_indices.len(),
+            //     probe_indices.len(),
+            //     build_batch.num_rows(),
+            //     probe_batch.num_rows()
+            // );
 
             // Resolve hash collisions
             let (build_indices, probe_indices) = equal_rows_arr(
@@ -1458,7 +1456,7 @@ impl PartitionedHashJoinStream {
             )?;
 
             // Shadow verify on INNER join with single Int64 key (first 50k rows)
-            if matches!(self.join_type, JoinType::Inner)
+            /*if matches!(self.join_type, JoinType::Inner)
                 && build_values.len() == 1
                 && self.current_probe_values.len() == 1
                 && build_values[0].data_type() == &arrow::datatypes::DataType::Int64
@@ -1485,7 +1483,7 @@ impl PartitionedHashJoinStream {
                     let k = bcol.value(i);
                     *map.entry(k).or_insert(0) += 1;
                 }
-                let mut expect = 0usize;
+                /*let mut expect = 0usize;
                 let max_p = pcol.len().min(50_000);
                 for i in 0..max_p {
                     if pcol.is_null(i) {
@@ -1496,18 +1494,18 @@ impl PartitionedHashJoinStream {
                         expect += c;
                     }
                 }
-                println!(
-                    "[spill-join][verify] part={} expect_pairs~{} vs actual_after_eq={}",
-                    partition_state.partition_id,
-                    expect,
-                    build_indices.len()
-                );
+                // println!(
+                //     "[spill-join][verify] part={} expect_pairs~{} vs actual_after_eq={}",
+                //     partition_state.partition_id,
+                //     expect,
+                //     build_indices.len()
+                // );*/
                 self.verify_once_per_part[partition_state.partition_id] = true;
-            }
+            }*/
 
             // Debug: log key data types and sample matched pairs
-            if !build_indices.is_empty() {
-                let build_types = build_values
+            /*if !build_indices.is_empty() {
+                /*let build_types = build_values
                     .iter()
                     .map(|a| format!("{:?}", a.data_type()))
                     .collect::<Vec<_>>()
@@ -1517,11 +1515,11 @@ impl PartitionedHashJoinStream {
                     .iter()
                     .map(|a| format!("{:?}", a.data_type()))
                     .collect::<Vec<_>>()
-                    .join(", ");
-                println!(
-                    "[spill-join] Key types: build=[{}], probe=[{}], null_equality={:?}",
-                    build_types, probe_types, self.null_equality
-                );
+                    .join(", ");*/
+                // println!(
+                //     "[spill-join] Key types: build=[{}], probe=[{}], null_equality={:?}",
+                //     build_types, probe_types, self.null_equality
+                // );
                 let sample = build_indices.len().min(5);
                 let mut pairs = Vec::new();
                 for i in 0..sample {
@@ -1536,85 +1534,46 @@ impl PartitionedHashJoinStream {
                         .unwrap_or_else(|_| "<err>".to_string());
                     pairs.push(format!("({},{})", bv, pv));
                 }
-                println!(
-                    "[spill-join] Sample key pairs {} -> {}: {}",
-                    sample,
-                    build_indices.len(),
-                    pairs.join(", ")
-                );
-            }
+                // println!(
+                //     "[spill-join] Sample key pairs {} -> {}: {}",
+                //     sample,
+                //     build_indices.len(),
+                //     pairs.join(", ")
+                // );
+            }*/
 
             // Apply residual join filter if present
-        let mut build_indices = build_indices;
-        let mut probe_indices = probe_indices;
-        if let Some(filter) = &self.filter {
-            let before_len = build_indices.len();
-            let before_build_indices = build_indices.clone();
-            let before_probe_indices = probe_indices.clone();
+            let mut build_indices = build_indices;
+            let mut probe_indices = probe_indices;
+            if let Some(filter) = &self.filter {
+                let before_len = build_indices.len();
+               // let before_build_indices = build_indices.clone();
+                //let before_probe_indices = probe_indices.clone();
 
-            let (filtered_build_indices, filtered_probe_indices) =
-                apply_join_filter_to_indices(
-                    build_batch,
-                    probe_batch,
-                    build_indices,
-                    probe_indices,
-                    filter,
-                    JoinSide::Left,
-                    None,
-                )?;
+                let (filtered_build_indices, filtered_probe_indices) =
+                    apply_join_filter_to_indices(
+                        build_batch,
+                        probe_batch,
+                        build_indices,
+                        probe_indices,
+                        filter,
+                        JoinSide::Left,
+                        None,
+                    )?;
 
-            if !self.filter_debug_once_per_part[partition_state.partition_id] {
-                println!(
-                    "[spill-join][filter-debug] part={} filter_before={} filter_after={}",
-                    partition_state.partition_id,
-                    before_len,
-                    filtered_build_indices.len()
-                );
+                if !self.filter_debug_once_per_part[partition_state.partition_id] {
+                    /*
+                    // println!(
+                    //     "[spill-join][filter-debug] part={} filter_before={} filter_after={}",
+                    //     partition_state.partition_id,
+                    //     before_len,
+                    //     filtered_build_indices.len()
+                    // );
 
-                let sample = filtered_build_indices.len().min(5);
-                for i in 0..sample {
-                    let build_row = filtered_build_indices.value(i) as usize;
-                    let probe_row = filtered_probe_indices.value(i) as usize;
-
-                    let build_schema = build_batch.schema();
-                    let build_vals = (0..build_batch.num_columns())
-                        .map(|col| {
-                            let name = build_schema.field(col).name();
-                            let value = arrow::util::display::array_value_to_string(
-                                build_batch.column(col).as_ref(),
-                                build_row,
-                            )
-                            .unwrap_or_else(|_| "<err>".to_string());
-                            format!("{}={}", name, value)
-                        })
-                        .collect::<Vec<_>>()
-                        .join(", ");
-
-                    let probe_schema = probe_batch.schema();
-                    let probe_vals = (0..probe_batch.num_columns())
-                        .map(|col| {
-                            let name = probe_schema.field(col).name();
-                            let value = arrow::util::display::array_value_to_string(
-                                probe_batch.column(col).as_ref(),
-                                probe_row,
-                            )
-                            .unwrap_or_else(|_| "<err>".to_string());
-                            format!("{}={}", name, value)
-                        })
-                        .collect::<Vec<_>>()
-                        .join(", ");
-
-                    println!(
-                        "[spill-join][filter-debug] sample {} build {{{}}} probe {{{}}}",
-                        i, build_vals, probe_vals
-                    );
-                }
-
-                if filtered_build_indices.len() == 0 {
-                    let sample_removed = before_build_indices.len().min(5);
-                    for i in 0..sample_removed {
-                        let build_row = before_build_indices.value(i) as usize;
-                        let probe_row = before_probe_indices.value(i) as usize;
+                    let sample = filtered_build_indices.len().min(5);
+                    for i in 0..sample {
+                        let build_row = filtered_build_indices.value(i) as usize;
+                        let probe_row = filtered_probe_indices.value(i) as usize;
 
                         let build_schema = build_batch.schema();
                         let build_vals = (0..build_batch.num_columns())
@@ -1644,102 +1603,145 @@ impl PartitionedHashJoinStream {
                             .collect::<Vec<_>>()
                             .join(", ");
 
-                        println!(
-                            "[spill-join][filter-debug] removed sample {} build {{{}}} probe {{{}}}",
-                            i, build_vals, probe_vals
-                        );
+                        // println!(
+                        //     "[spill-join][filter-debug] sample {} build {{{}}} probe {{{}}}",
+                        //     i, build_vals, probe_vals
+                        // );
                     }
+
+                    if filtered_build_indices.len() == 0 {
+                        let sample_removed = before_build_indices.len().min(5);
+                        for i in 0..sample_removed {
+                            let build_row = before_build_indices.value(i) as usize;
+                            let probe_row = before_probe_indices.value(i) as usize;
+
+                            let build_schema = build_batch.schema();
+                            let build_vals = (0..build_batch.num_columns())
+                                .map(|col| {
+                                    let name = build_schema.field(col).name();
+                                    let value =
+                                        arrow::util::display::array_value_to_string(
+                                            build_batch.column(col).as_ref(),
+                                            build_row,
+                                        )
+                                        .unwrap_or_else(|_| "<err>".to_string());
+                                    format!("{}={}", name, value)
+                                })
+                                .collect::<Vec<_>>()
+                                .join(", ");
+
+                            let probe_schema = probe_batch.schema();
+                            /*let probe_vals = (0..probe_batch.num_columns())
+                                .map(|col| {
+                                    let name = probe_schema.field(col).name();
+                                    let value =
+                                        arrow::util::display::array_value_to_string(
+                                            probe_batch.column(col).as_ref(),
+                                            probe_row,
+                                        )
+                                        .unwrap_or_else(|_| "<err>".to_string());
+                                    format!("{}={}", name, value)
+                                })
+                                .collect::<Vec<_>>()
+                                .join(", ");*/
+
+                            // println!(
+                            //     "[spill-join][filter-debug] removed sample {} build {{{}}} probe {{{}}}",
+                            //     i, build_vals, probe_vals
+                            // );
+                        }
+                    }*/
+
+                    self.filter_debug_once_per_part[partition_state.partition_id] = true;
+                }
+
+                if before_len != filtered_build_indices.len() {
+                    // println!(
+                    //     "[spill-join][filter-debug] part={} filter removed {} rows",
+                    //     partition_state.partition_id,
+                    //     before_len - filtered_build_indices.len()
+                    // );
+                }
+
+                build_indices = filtered_build_indices;
+                probe_indices = filtered_probe_indices;
+            }
+
+            // Capture matched build indices prior to alignment so we can mark bitmaps even if
+            // the join type drops them (e.g. LeftAnti emits matches only in the final phase).
+            let build_indices_for_marking =
+                if need_produce_result_in_final(self.join_type) {
+                    Some(build_indices.clone())
+                } else {
+                    None
+                };
+
+            // Log sample matches even if no residual filter remains, to debug equality behavior
+            /*if !self.filter_debug_once_per_part[partition_state.partition_id]
+                || build_indices.len() != probe_indices.len()
+            {
+                let sample = build_indices.len().min(5);
+                for i in 0..sample {
+                    let build_row = build_indices.value(i) as usize;
+                    let probe_row = probe_indices.value(i) as usize;
+
+                    let build_schema = build_batch.schema();
+                    let build_vals = (0..build_batch.num_columns())
+                        .map(|col| {
+                            let name = build_schema.field(col).name();
+                            let value = arrow::util::display::array_value_to_string(
+                                build_batch.column(col).as_ref(),
+                                build_row,
+                            )
+                            .unwrap_or_else(|_| "<err>".to_string());
+                            format!("{}={}", name, value)
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+
+                    let probe_schema = probe_batch.schema();
+                   /* let probe_vals = (0..probe_batch.num_columns())
+                        .map(|col| {
+                            let name = probe_schema.field(col).name();
+                            let value = arrow::util::display::array_value_to_string(
+                                probe_batch.column(col).as_ref(),
+                                probe_row,
+                            )
+                            .unwrap_or_else(|_| "<err>".to_string());
+                            format!("{}={}", name, value)
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");*/
+
+                    // println!(
+                    //     "[spill-join][match-debug] part={} pair {} build {{{}}} probe {{{}}}",
+                    //     partition_state.partition_id,
+                    //     i,
+                    //     build_vals,
+                    //     probe_vals
+                    // );
+                }
+
+                if build_indices.len() != probe_indices.len() {
+                    // println!(
+                    //     "[spill-join][match-debug] part={} MISMATCH len build={} probe={}",
+                    //     partition_state.partition_id,
+                    //     build_indices.len(),
+                    //     probe_indices.len()
+                    // );
                 }
 
                 self.filter_debug_once_per_part[partition_state.partition_id] = true;
-            }
-
-            if before_len != filtered_build_indices.len() {
-                println!(
-                    "[spill-join][filter-debug] part={} filter removed {} rows",
-                    partition_state.partition_id,
-                    before_len - filtered_build_indices.len()
-                );
-            }
-
-            build_indices = filtered_build_indices;
-            probe_indices = filtered_probe_indices;
-        }
-
-        // Capture matched build indices prior to alignment so we can mark bitmaps even if
-        // the join type drops them (e.g. LeftAnti emits matches only in the final phase).
-        let build_indices_for_marking = if need_produce_result_in_final(self.join_type) {
-            Some(build_indices.clone())
-        } else {
-            None
-        };
-
-        // Log sample matches even if no residual filter remains, to debug equality behavior
-        if !self.filter_debug_once_per_part[partition_state.partition_id]
-            || build_indices.len() != probe_indices.len()
-        {
-            let sample = build_indices.len().min(5);
-            for i in 0..sample {
-                let build_row = build_indices.value(i) as usize;
-                let probe_row = probe_indices.value(i) as usize;
-
-                let build_schema = build_batch.schema();
-                let build_vals = (0..build_batch.num_columns())
-                    .map(|col| {
-                        let name = build_schema.field(col).name();
-                        let value = arrow::util::display::array_value_to_string(
-                            build_batch.column(col).as_ref(),
-                            build_row,
-                        )
-                        .unwrap_or_else(|_| "<err>".to_string());
-                        format!("{}={}", name, value)
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ");
-
-                let probe_schema = probe_batch.schema();
-                let probe_vals = (0..probe_batch.num_columns())
-                    .map(|col| {
-                        let name = probe_schema.field(col).name();
-                        let value = arrow::util::display::array_value_to_string(
-                            probe_batch.column(col).as_ref(),
-                            probe_row,
-                        )
-                        .unwrap_or_else(|_| "<err>".to_string());
-                        format!("{}={}", name, value)
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ");
-
-                println!(
-                    "[spill-join][match-debug] part={} pair {} build {{{}}} probe {{{}}}",
-                    partition_state.partition_id,
-                    i,
-                    build_vals,
-                    probe_vals
-                );
-            }
-
-            if build_indices.len() != probe_indices.len() {
-                println!(
-                    "[spill-join][match-debug] part={} MISMATCH len build={} probe={}",
-                    partition_state.partition_id,
-                    build_indices.len(),
-                    probe_indices.len()
-                );
-            }
-
-            self.filter_debug_once_per_part[partition_state.partition_id] = true;
-        }
+            }*/
 
             // Debug counter: post-equality (before any alignment)
-            println!(
-                "[spill-join] After equality{} (pre-align): {}",
-                if self.filter.is_some() { "+filter" } else { "" },
-                build_indices.len()
-            );
+            // println!(
+            //     "[spill-join] After equality{} (pre-align): {}",
+            //     if self.filter.is_some() { "+filter" } else { "" },
+            //     build_indices.len()
+            // );
             // Shadow verify for two-key joins (stringified) to catch type coercion issues
-            if matches!(self.join_type, JoinType::Inner)
+            /*if matches!(self.join_type, JoinType::Inner)
                 && build_values.len() == 2
                 && self.current_probe_values.len() == 2
                 && !self.verify_once_per_part[partition_state.partition_id]
@@ -1761,7 +1763,6 @@ impl PartitionedHashJoinStream {
                     let key = format!("{}|{}", k0, k1);
                     *map.entry(key).or_insert(0) += 1;
                 }
-                let mut expect = 0usize;
                 let max_p = probe_batch.num_rows().min(50_000);
                 for i in 0..max_p {
                     let k0 = arrow::util::display::array_value_to_string(
@@ -1779,14 +1780,14 @@ impl PartitionedHashJoinStream {
                         expect += c;
                     }
                 }
-                println!(
-                    "[spill-join][verify2] part={} expect_pairs~{} vs actual_after_eq={}",
-                    partition_state.partition_id,
-                    expect,
-                    build_indices.len()
-                );
+                // println!(
+                //     "[spill-join][verify2] part={} expect_pairs~{} vs actual_after_eq={}",
+                //     partition_state.partition_id,
+                //     expect,
+                //     build_indices.len()
+                // );
                 self.verify_once_per_part[partition_state.partition_id] = true;
-            }
+            }*/
             // Accumulate matched rows per partition
             self.matched_rows_per_part[partition_state.partition_id] = self
                 .matched_rows_per_part[partition_state.partition_id]
@@ -1831,15 +1832,16 @@ impl PartitionedHashJoinStream {
             );
 
             // Debug counter: after alignment (or effective no-op for other join types)
-            println!("[spill-join] After alignment: {}", build_indices.len());
+            // println!("[spill-join] After alignment: {}", build_indices.len());
 
             // Prepare ids for marking after we release borrows. Prefer the pre-alignment
             // matches (for join types like LeftAnti) so bitmap tracking remains accurate.
-            let build_ids_to_mark: Vec<u64> = if let Some(indices) = build_indices_for_marking {
-                indices.values().to_vec()
-            } else {
-                build_indices.values().to_vec()
-            };
+            let build_ids_to_mark: Vec<u64> =
+                if let Some(indices) = build_indices_for_marking {
+                    indices.values().to_vec()
+                } else {
+                    build_indices.values().to_vec()
+                };
             // Track last joined probe row only for right-oriented joins; otherwise clear it
             self.joined_probe_idx = if needs_alignment && next_offset.is_some() {
                 last_joined_right_idx
@@ -1853,12 +1855,12 @@ impl PartitionedHashJoinStream {
                 JoinType::RightMark | JoinType::RightSemi | JoinType::RightAnti
             ) {
                 if matches!(self.join_type, JoinType::RightMark) {
-                    println!("[spill-join] Building output with JoinSide::Right (RightMark)");
+                    // println!("[spill-join] Building output with JoinSide::Right (RightMark)");
                 } else {
-                    println!(
-                        "[spill-join] Building output with JoinSide::Right ({:?})",
-                        self.join_type
-                    );
+                    // println!(
+                    //     "[spill-join] Building output with JoinSide::Right ({:?})",
+                    //     self.join_type
+                    // );
                 }
                 let right_indices_u64 = uint32_to_uint64_indices(&probe_indices);
                 build_batch_from_indices(
@@ -1913,19 +1915,19 @@ impl PartitionedHashJoinStream {
         }
 
         if result.num_rows() == 0 {
-            println!(
-                "[spill-join] Skipping empty batch emission (partition={})",
-                partition_state.partition_id
-            );
+            // println!(
+            //     "[spill-join] Skipping empty batch emission (partition={})",
+            //     partition_state.partition_id
+            // );
             return Poll::Ready(Ok(StatefulStreamResult::Continue));
         }
         self.join_metrics.output_batches.add(1);
         self.join_metrics.baseline.record_output(result.num_rows());
-        println!(
-            "[spill-join] Emitting batch: rows={} (partition={})",
-            result.num_rows(),
-            partition_state.partition_id
-        );
+        // println!(
+        //     "[spill-join] Emitting batch: rows={} (partition={})",
+        //     result.num_rows(),
+        //     partition_state.partition_id
+        // );
         Poll::Ready(Ok(StatefulStreamResult::Ready(Some(result))))
     }
 
@@ -1989,13 +1991,13 @@ impl PartitionedHashJoinStream {
 
                 let empty_right_batch =
                     RecordBatch::new_empty(Arc::clone(&self.probe_schema));
-                println!(
-                    "Emitting unmatched rows chunk: partition={}, offset={}, size={} (total={})",
-                    self.unmatched_partition,
-                    self.unmatched_offset,
-                    to_emit,
-                    total
-                );
+                // println!(
+                //     "Emitting unmatched rows chunk: partition={}, offset={}, size={} (total={})",
+                //     self.unmatched_partition,
+                //     self.unmatched_offset,
+                //     to_emit,
+                //     total
+                // );
 
                 let result = build_batch_from_indices(
                     &self.schema,
@@ -2013,10 +2015,10 @@ impl PartitionedHashJoinStream {
                     self.unmatched_left_indices_cache = None;
                     self.unmatched_right_indices_cache = None;
                     self.unmatched_offset = 0;
-                    println!(
-                        "Finished emitting unmatched rows for partition {}",
-                        self.unmatched_partition
-                    );
+                    // println!(
+                    //     "Finished emitting unmatched rows for partition {}",
+                    //     self.unmatched_partition
+                    // );
                     self.unmatched_partition += 1;
                 }
 
@@ -2054,11 +2056,11 @@ impl PartitionedHashJoinStream {
                         return Poll::Ready(Ok(StatefulStreamResult::Continue));
                     };
 
-                    println!(
-                        "Unmatched calculation for partition {} -> {} rows",
-                        self.unmatched_partition,
-                        left_indices.len()
-                    );
+                    // println!(
+                    //     "Unmatched calculation for partition {} -> {} rows",
+                    //     self.unmatched_partition,
+                    //     left_indices.len()
+                    // );
 
                     if left_indices.len() > 0 {
                         // Cache the full indices and emit first chunk via cached path next call
@@ -2092,11 +2094,11 @@ impl PartitionedHashJoinStream {
                         if let Some(stream) = self.pending_reload_stream.as_mut() {
                             match stream.poll_next_unpin(cx) {
                                 Poll::Ready(Some(Ok(batch))) => {
-                                    println!(
-                            "Reload stream yielded batch for build partition {} (rows={})",
-                            self.unmatched_partition,
-                            batch.num_rows()
-                        );
+                                    // println!(
+                                    //     "Reload stream yielded batch for build partition {} (rows={})",
+                                    //     self.unmatched_partition,
+                                    //     batch.num_rows()
+                                    // );
                                     self.pending_reload_batches.push(batch);
                                     return Poll::Pending;
                                 }
@@ -2117,11 +2119,11 @@ impl PartitionedHashJoinStream {
                                     )
                                     .map_err(DataFusionError::from)?;
 
-                                    println!(
-                                        "Reloaded spilled build partition {} for unmatched rows (rows={})",
-                                        self.unmatched_partition,
-                                        concatenated.num_rows()
-                                    );
+                                    // println!(
+                                    //     "Reloaded spilled build partition {} for unmatched rows (rows={})",
+                                    //     self.unmatched_partition,
+                                    //     concatenated.num_rows()
+                                    // );
 
                                     let new_reservation =
                                         MemoryConsumer::new("partition_reload_unmatched")
@@ -2145,10 +2147,10 @@ impl PartitionedHashJoinStream {
                                             values,
                                             reservation: new_reservation,
                                         };
-                                    println!(
-                                        "Prepared spilled partition {} as InMemory for unmatched emission",
-                                        self.unmatched_partition
-                                    );
+                                    // println!(
+                                    //     "Prepared spilled partition {} as InMemory for unmatched emission",
+                                    //     self.unmatched_partition
+                                    // );
 
                                     // Clear pending
                                     self.pending_reload_stream = None;
@@ -2162,11 +2164,11 @@ impl PartitionedHashJoinStream {
                                 }
                                 Poll::Pending => {
                                     // Yield until more data is available from reload stream
-                                    println!(
-                            "Reload stream pending for build partition {} (accumulated_batches={})",
-                            self.unmatched_partition,
-                            self.pending_reload_batches.len()
-                        );
+                                    // println!(
+                                    //     "Reload stream pending for build partition {} (accumulated_batches={})",
+                                    //     self.unmatched_partition,
+                                    //     self.pending_reload_batches.len()
+                                    // );
                                     return Poll::Pending;
                                 }
                             }
@@ -2221,10 +2223,10 @@ impl Stream for PartitionedHashJoinStream {
                     match self.partition_build_side(left_data) {
                         Ok(StatefulStreamResult::Continue) => continue,
                         Ok(StatefulStreamResult::Ready(Some(batch))) => {
-                            println!(
-                                "[spill-join] poll_next yielding initial batch: rows={}",
-                                batch.num_rows()
-                            );
+                            // println!(
+                            //     "[spill-join] poll_next yielding initial batch: rows={}",
+                            //     batch.num_rows()
+                            // );
                             return Poll::Ready(Some(Ok(batch)));
                         }
                         Ok(StatefulStreamResult::Ready(None)) => {
@@ -2238,18 +2240,18 @@ impl Stream for PartitionedHashJoinStream {
                     if self.num_partitions > 1 && !self.placeholder_emitted {
                         self.placeholder_emitted = true;
                         let empty = RecordBatch::new_empty(self.schema.clone());
-                        println!(
-                            "[spill-join] Emitting placeholder empty batch for partition {}",
-                            partition_state.partition_id
-                        );
+                        // println!(
+                        //     "[spill-join] Emitting placeholder empty batch for partition {}",
+                        //     partition_state.partition_id
+                        // );
                         return Poll::Ready(Some(Ok(empty)));
                     }
                     match self.process_partition(cx, &partition_state) {
                         Poll::Ready(Ok(StatefulStreamResult::Ready(Some(batch)))) => {
-                            println!(
-                                "[spill-join] poll_next yielding process batch: rows={} (state partition={})",
-                                batch.num_rows(), partition_state.partition_id
-                            );
+                            // println!(
+                            //     "[spill-join] poll_next yielding process batch: rows={} (state partition={})",
+                            //     batch.num_rows(), partition_state.partition_id
+                            // );
                             return Poll::Ready(Some(Ok(batch)));
                         }
                         Poll::Ready(Ok(StatefulStreamResult::Ready(None))) => {
@@ -2265,10 +2267,10 @@ impl Stream for PartitionedHashJoinStream {
                 PartitionedHashJoinState::HandleUnmatchedRows => {
                     match self.handle_unmatched_rows(cx) {
                         Poll::Ready(Ok(StatefulStreamResult::Ready(Some(batch)))) => {
-                            println!(
-                                "[spill-join] poll_next yielding unmatched batch: rows={}",
-                                batch.num_rows()
-                            );
+                            // println!(
+                            //     "[spill-join] poll_next yielding unmatched batch: rows={}",
+                            //     batch.num_rows()
+                            // );
                             return Poll::Ready(Some(Ok(batch)));
                         }
                         Poll::Ready(Ok(StatefulStreamResult::Ready(None))) => {

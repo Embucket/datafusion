@@ -291,7 +291,7 @@ pub(super) fn lookup_join_hashmap(
     )?;
 
     // Shadow verify for two-key INNER joins to catch coercion issues in classic path
-    if build_side_values.len() == 2 && probe_side_values.len() == 2 {
+    /*if build_side_values.len() == 2 && probe_side_values.len() == 2 {
         use std::collections::HashMap;
         let mut map: HashMap<String, usize> = HashMap::new();
         let max_b = build_side_values[0].len().min(50_000);
@@ -309,7 +309,6 @@ pub(super) fn lookup_join_hashmap(
             let key = format!("{}|{}", k0, k1);
             *map.entry(key).or_insert(0) += 1;
         }
-        let mut expect = 0usize;
         let max_p = probe_side_values[0].len().min(50_000);
         for i in 0..max_p {
             let k0 = arrow::util::display::array_value_to_string(
@@ -327,12 +326,12 @@ pub(super) fn lookup_join_hashmap(
                 expect += c;
             }
         }
-        println!(
-            "[hash-join][verify2] expect_pairs~{} vs actual_after_eq={}",
-            expect,
-            build_indices.len()
-        );
-    }
+        // println!(
+        //     "[hash-join][verify2] expect_pairs~{} vs actual_after_eq={}",
+        //     expect,
+        //     build_indices.len()
+        // );
+    }*/
 
     Ok((build_indices, probe_indices, next_offset))
 }
@@ -611,19 +610,19 @@ impl HashJoinStream {
             index_alignment_range_end = index_alignment_range_start;
         }
 
-        if matches!(
+       /*  if matches!(
             self.join_type,
             JoinType::RightSemi | JoinType::RightAnti | JoinType::RightMark
         ) {
-            println!(
-                "[hash-join] Align {:?}: pre-adjust right_indices={}, range={}..{} (next_offset_present={})",
-                self.join_type,
-                right_indices.len(),
-                index_alignment_range_start,
-                index_alignment_range_end,
-                next_offset.is_some()
-            );
-        }
+            // println!(
+            //     "[hash-join] Align {:?}: pre-adjust right_indices={}, range={}..{} (next_offset_present={})",
+            //     self.join_type,
+            //     right_indices.len(),
+            //     index_alignment_range_start,
+            //     index_alignment_range_end,
+            //     next_offset.is_some()
+            // );
+        }*/
 
         let (left_indices, right_indices) = adjust_indices_by_join_type(
             left_indices,
@@ -633,28 +632,28 @@ impl HashJoinStream {
             self.right_side_ordered,
         )?;
 
-        if matches!(
+       /* if matches!(
             self.join_type,
             JoinType::RightSemi | JoinType::RightAnti | JoinType::RightMark
         ) {
-            println!(
-                "[hash-join] Align {:?}: post-adjust unique_right_indices={} (range={}..{})",
-                self.join_type,
-                right_indices.len(),
-                index_alignment_range_start,
-                index_alignment_range_end
-            );
+            // println!(
+            //     "[hash-join] Align {:?}: post-adjust unique_right_indices={} (range={}..{})",
+            //     self.join_type,
+            //     right_indices.len(),
+            //     index_alignment_range_start,
+            //     index_alignment_range_end
+            // );
         }
 
         if matches!(self.join_type, JoinType::RightSemi | JoinType::RightAnti) {
-            println!(
-                "[hash-join] Right {:?}: probe_batch_rows={}, unique_matched_right_indices={} (range={}..{})",
-                self.join_type,
-                state.batch.num_rows(),
-                right_indices.len(),
-                index_alignment_range_start,
-                index_alignment_range_end
-            );
+            // println!(
+            //     "[hash-join] Right {:?}: probe_batch_rows={}, unique_matched_right_indices={} (range={}..{})",
+            //     self.join_type,
+            //     state.batch.num_rows(),
+            //     right_indices.len(),
+            //     index_alignment_range_start,
+            //     index_alignment_range_end
+            // );
         }
 
         // Log some matched pairs for debugging
@@ -667,7 +666,7 @@ impl HashJoinStream {
                 let build_row = left_indices.value(i) as usize;
                 let probe_row = right_indices.value(i) as usize;
 
-                let build_vals = (0..build_schema.fields().len())
+                /*let build_vals = (0..build_schema.fields().len())
                     .map(|col| {
                         let name = build_schema.field(col).name();
                         let value = arrow::util::display::array_value_to_string(
@@ -679,8 +678,8 @@ impl HashJoinStream {
                     })
                     .collect::<Vec<_>>()
                     .join(", ");
-
-                let probe_vals = (0..probe_schema.fields().len())
+*/
+                /*let probe_vals = (0..probe_schema.fields().len())
                     .map(|col| {
                         let name = probe_schema.field(col).name();
                         let value = arrow::util::display::array_value_to_string(
@@ -691,45 +690,49 @@ impl HashJoinStream {
                         format!("{}={}", name, value)
                     })
                     .collect::<Vec<_>>()
-                    .join(", ");
+                    .join(", ");*/
 
-                println!(
-                    "[hash-join][match-debug] partition={} pair {} build {{{}}} probe {{{}}}",
-                    self.partition,
-                    i,
-                    build_vals,
-                    probe_vals
-                );
+                // println!(
+                //     "[hash-join][match-debug] partition={} pair {} build {{{}}} probe {{{}}}",
+                //     self.partition,
+                //     i,
+                //     build_vals,
+                //     probe_vals
+                // );
             }
         }
 
-        let build_supply_idx = build_schema
-            .fields()
-            .iter()
-            .enumerate()
-            .find_map(|(idx, f)| {
-                if f.name().to_ascii_lowercase().contains("ps_supplycost") {
-                    Some(idx)
-                } else {
-                    None
-                }
-            });
+        let build_supply_idx =
+            build_schema
+                .fields()
+                .iter()
+                .enumerate()
+                .find_map(|(idx, f)| {
+                    if f.name().to_ascii_lowercase().contains("ps_supplycost") {
+                        Some(idx)
+                    } else {
+                        None
+                    }
+                });
 
-        let probe_min_idx = probe_schema
-            .fields()
-            .iter()
-            .enumerate()
-            .find_map(|(idx, f)| {
-                if f.name().to_ascii_lowercase().contains("min(")
-                    || f.name().to_ascii_lowercase().contains("min_")
-                {
-                    Some(idx)
-                } else {
-                    None
-                }
-            });
+        let probe_min_idx =
+            probe_schema
+                .fields()
+                .iter()
+                .enumerate()
+                .find_map(|(idx, f)| {
+                    if f.name().to_ascii_lowercase().contains("min(")
+                        || f.name().to_ascii_lowercase().contains("min_")
+                    {
+                        Some(idx)
+                    } else {
+                        None
+                    }
+                });
 
-        if let (Some(build_supply_idx), Some(probe_min_idx)) = (build_supply_idx, probe_min_idx) {
+        if let (Some(build_supply_idx), Some(probe_min_idx)) =
+            (build_supply_idx, probe_min_idx)
+        {
             let build_array = build_side.left_data.batch().column(build_supply_idx);
             let probe_array = state.batch.column(probe_min_idx);
 
@@ -749,32 +752,32 @@ impl HashJoinStream {
                 .unwrap_or_else(|_| "<err>".to_string());
 
                 if build_value != probe_value {
-                    println!(
-                        "[hash-join][mismatch] partition={} build_row={} ps_supplycost={} min_cost={}",
-                        self.partition,
-                        build_row,
-                        build_value,
-                        probe_value
-                    );
+                    // println!(
+                    //     "[hash-join][mismatch] partition={} build_row={} ps_supplycost={} min_cost={}",
+                    //     self.partition,
+                    //     build_row,
+                    //     build_value,
+                    //     probe_value
+                    // );
                     break;
                 }
             }
         } else {
-            println!(
-                "[hash-join][mismatch-debug] partition={} build_fields={:?} probe_fields={:?}",
-                self.partition,
-                build_schema
-                    .fields()
-                    .iter()
-                    .map(|f| f.name().clone())
-                    .collect::<Vec<_>>(),
-                probe_schema
-                    .fields()
-                    .iter()
-                    .map(|f| f.name().clone())
-                    .collect::<Vec<_>>()
-            );
-        }
+            // println!(
+            //     "[hash-join][mismatch-debug] partition={} build_fields={:?} probe_fields={:?}",
+            //     self.partition,
+            //     build_schema
+            //         .fields()
+            //         .iter()
+            //         .map(|f| f.name().clone())
+            //         .collect::<Vec<_>>(),
+            //     probe_schema
+            //         .fields()
+            //         .iter()
+            //         .map(|f| f.name().clone())
+            //         .collect::<Vec<_>>()
+            // );
+        }*/
 
         let result = if matches!(
             self.join_type,
