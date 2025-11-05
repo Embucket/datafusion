@@ -120,6 +120,10 @@ pub(super) enum BuildPartition {
         spill_file: Option<RefCountedTempFile>,
         /// Memory reservation (released when spilled)
         reservation: MemoryReservation,
+        /// Total bytes written for this spill partition
+        spilled_bytes: usize,
+        /// Total rows written for this spill partition
+        spilled_rows: usize,
     },
     /// Partition resources released and not available
     Released {
@@ -151,6 +155,7 @@ struct PartitionAccumulator {
     buffered_bytes: usize,
     total_rows: usize,
     spill_writer: Option<InProgressSpillFile>,
+    spilled_bytes: usize,
 }
 
 impl PartitionAccumulator {
@@ -160,6 +165,7 @@ impl PartitionAccumulator {
             buffered_bytes: 0,
             total_rows: 0,
             spill_writer: None,
+            spilled_bytes: 0,
         }
     }
 }
@@ -348,7 +354,7 @@ impl PartitionedHashJoinStream {
 
     fn spill_partition(
         &mut self,
-        partition_id: usize,
+        _partition_id: usize,
         accum: &mut PartitionAccumulator,
     ) -> Result<()> {
         let buffered_batches = mem::take(&mut accum.buffered_batches);
@@ -356,10 +362,22 @@ impl PartitionedHashJoinStream {
             return Ok(());
         }
 
-        let writer = self.ensure_build_spill_writer(accum)?;
-        for batch in buffered_batches {
-            writer.append_batch(&batch)?;
+        let created_writer = accum.spill_writer.is_none();
+        let mut total_spilled_bytes = 0usize;
+        {
+            let writer = self.ensure_build_spill_writer(accum)?;
+            if created_writer {
+                self.join_metrics.build_spill_count.add(1);
+            }
+            for batch in buffered_batches {
+                let batch_size = batch.get_array_memory_size();
+                total_spilled_bytes = total_spilled_bytes.saturating_add(batch_size);
+                self.join_metrics.build_spilled_rows.add(batch.num_rows());
+                self.join_metrics.build_spilled_bytes.add(batch_size);
+                writer.append_batch(&batch)?;
+            }
         }
+        accum.spilled_bytes = accum.spilled_bytes.saturating_add(total_spilled_bytes);
         if accum.buffered_bytes > 0 {
             let _ = self.memory_reservation.try_shrink(accum.buffered_bytes);
             accum.buffered_bytes = 0;
@@ -372,8 +390,14 @@ impl PartitionedHashJoinStream {
         accum: &mut PartitionAccumulator,
         batch: RecordBatch,
     ) -> Result<()> {
-        let writer = self.ensure_build_spill_writer(accum)?;
-        writer.append_batch(&batch)?;
+        let batch_size = batch.get_array_memory_size();
+        self.join_metrics.build_spilled_rows.add(batch.num_rows());
+        self.join_metrics.build_spilled_bytes.add(batch_size);
+        {
+            let writer = self.ensure_build_spill_writer(accum)?;
+            writer.append_batch(&batch)?;
+        }
+        accum.spilled_bytes = accum.spilled_bytes.saturating_add(batch_size);
         Ok(())
     }
 
@@ -582,8 +606,6 @@ impl PartitionedHashJoinStream {
                             let new_reservation = MemoryConsumer::new("partition_reload")
                                 .with_can_spill(true)
                                 .register(&self.runtime_env.memory_pool);
-
-                            let concat_rows = concatenated.num_rows();
 
                             self.build_partitions[part_id] = BuildPartition::InMemory {
                                 hash_map,
@@ -818,11 +840,18 @@ impl PartitionedHashJoinStream {
                                             "hash_join_probe_partition",
                                         )?;
                                     self.probe_spill_in_progress[part_id] = Some(ipf);
+                                    self.join_metrics.probe_spill_count.add(1);
                                 }
                                 if let Some(ref mut ipf) =
                                     self.probe_spill_in_progress[part_id]
                                 {
                                     ipf.append_batch(&filtered_batch)?;
+                                    self.join_metrics
+                                        .probe_spilled_rows
+                                        .add(filtered_batch.num_rows());
+                                    self.join_metrics
+                                        .probe_spilled_bytes
+                                        .add(filtered_batch.get_array_memory_size());
                                     // println!(
                                     //     "[spill-join][probe-spill] write partition={} rows={}",
                                     //     part_id,
@@ -957,8 +986,10 @@ impl PartitionedHashJoinStream {
             .map(|_| PartitionAccumulator::new())
             .collect::<Vec<_>>();
         let mut repartition_request: Option<usize> = None;
+        let mut max_spilled_bytes: usize = 0;
+        let mut any_spilled = false;
 
-        for (batch_index, batch) in build_data.original_batches().iter().enumerate() {
+        for batch in build_data.original_batches() {
             let mut keys_values: Vec<ArrayRef> = Vec::with_capacity(self.on_left.len());
             for expr in &self.on_left {
                 keys_values.push(expr.evaluate(batch)?.into_array(batch.num_rows())?);
@@ -1006,14 +1037,13 @@ impl PartitionedHashJoinStream {
                             .build_mem_used
                             .set_max(self.memory_reservation.size());
                         if self.memory_reservation.size() > self.memory_threshold {
-                            if !self.runtime_env.disk_manager.tmp_files_enabled() {
-                                if allow_repartition {
-                                    if let Some(next_count) = self.next_partition_count()
-                                    {
-                                        repartition_request = Some(next_count);
-                                        break;
-                                    }
+                            if allow_repartition {
+                                if let Some(next_count) = self.next_partition_count() {
+                                    repartition_request = Some(next_count);
+                                    break;
                                 }
+                            }
+                            if !self.runtime_env.disk_manager.tmp_files_enabled() {
                                 return Err(internal_datafusion_err!(
                                     "Insufficient memory for build partitioning and spilling is disabled"
                                 ));
@@ -1022,13 +1052,13 @@ impl PartitionedHashJoinStream {
                         }
                     }
                     Err(_) => {
-                        if !self.runtime_env.disk_manager.tmp_files_enabled() {
-                            if allow_repartition {
-                                if let Some(next_count) = self.next_partition_count() {
-                                    repartition_request = Some(next_count);
-                                    break;
-                                }
+                        if allow_repartition {
+                            if let Some(next_count) = self.next_partition_count() {
+                                repartition_request = Some(next_count);
+                                break;
                             }
+                        }
+                        if !self.runtime_env.disk_manager.tmp_files_enabled() {
                             return Err(internal_datafusion_err!(
                                 "Unable to allocate memory for build partition"
                             ));
@@ -1056,11 +1086,9 @@ impl PartitionedHashJoinStream {
         self.matched_build_rows_per_partition
             .reserve(self.num_partitions);
 
-        let mut partitions_in_memory = 0usize;
-        let mut partitions_spilled = 0usize;
-        let mut partitions_empty = 0usize;
         for part_id in 0..self.num_partitions {
             let mut accum = mem::take(&mut partition_accumulators[part_id]);
+            max_spilled_bytes = max_spilled_bytes.max(accum.spilled_bytes);
             if accum.spill_writer.is_some() {
                 if !accum.buffered_batches.is_empty() {
                     self.spill_partition(part_id, &mut accum)?;
@@ -1075,10 +1103,12 @@ impl PartitionedHashJoinStream {
                     let reservation = MemoryConsumer::new("partition_spilled")
                         .with_can_spill(true)
                         .register(&self.runtime_env.memory_pool);
-                    partitions_spilled += 1;
+                    any_spilled = true;
                     self.build_partitions.push(BuildPartition::Spilled {
                         spill_file: Some(spill_file),
                         reservation,
+                        spilled_bytes: accum.spilled_bytes,
+                        spilled_rows: accum.total_rows,
                     });
                 }
                 continue;
@@ -1087,7 +1117,6 @@ impl PartitionedHashJoinStream {
             if accum.buffered_batches.is_empty() {
                 self.matched_build_rows_per_partition
                     .push(BooleanBufferBuilder::new(0));
-                partitions_empty += 1;
                 self.build_partitions.push(BuildPartition::Empty);
                 continue;
             }
@@ -1159,13 +1188,18 @@ impl PartitionedHashJoinStream {
                     .saturating_add(approx_partition_size),
             );
 
-            partitions_in_memory += 1;
             self.build_partitions.push(BuildPartition::InMemory {
                 hash_map,
                 batch: partition_batch,
                 values: partition_values,
                 reservation,
             });
+        }
+
+        if (max_spilled_bytes > self.memory_threshold || any_spilled) && allow_repartition {
+            if let Some(next_count) = self.next_partition_count() {
+                return Ok(PartitionBuildStatus::NeedMorePartitions { next_count });
+            }
         }
 
         self.state = PartitionedHashJoinState::ProcessPartition(ProcessPartitionState {

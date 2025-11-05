@@ -1329,6 +1329,18 @@ pub(crate) struct BuildProbeJoinMetrics {
     pub(crate) build_input_rows: metrics::Count,
     /// Memory used by build-side in bytes
     pub(crate) build_mem_used: metrics::Gauge,
+    /// Number of spill files produced for the build side
+    pub(crate) build_spill_count: metrics::Count,
+    /// Total build-side bytes written to spill
+    pub(crate) build_spilled_bytes: metrics::Count,
+    /// Total build-side rows written to spill
+    pub(crate) build_spilled_rows: metrics::Count,
+    /// Number of spill files produced for the probe side
+    pub(crate) probe_spill_count: metrics::Count,
+    /// Total probe-side bytes written to spill
+    pub(crate) probe_spilled_bytes: metrics::Count,
+    /// Total probe-side rows written to spill
+    pub(crate) probe_spilled_rows: metrics::Count,
     /// Total time for joining probe-side batches to the build-side batches
     pub(crate) join_time: metrics::Time,
     /// Number of batches consumed by probe-side of this operator
@@ -1374,6 +1386,18 @@ impl BuildProbeJoinMetrics {
 
         let build_mem_used =
             MetricBuilder::new(metrics).gauge("build_mem_used", partition);
+        let build_spill_count =
+            MetricBuilder::new(metrics).counter("build_spill_count", partition);
+        let build_spilled_bytes =
+            MetricBuilder::new(metrics).counter("build_spilled_bytes", partition);
+        let build_spilled_rows =
+            MetricBuilder::new(metrics).counter("build_spilled_rows", partition);
+        let probe_spill_count =
+            MetricBuilder::new(metrics).counter("probe_spill_count", partition);
+        let probe_spilled_bytes =
+            MetricBuilder::new(metrics).counter("probe_spilled_bytes", partition);
+        let probe_spilled_rows =
+            MetricBuilder::new(metrics).counter("probe_spilled_rows", partition);
 
         let input_batches =
             MetricBuilder::new(metrics).counter("input_batches", partition);
@@ -1388,6 +1412,12 @@ impl BuildProbeJoinMetrics {
             build_input_batches,
             build_input_rows,
             build_mem_used,
+            build_spill_count,
+            build_spilled_bytes,
+            build_spilled_rows,
+            probe_spill_count,
+            probe_spilled_bytes,
+            probe_spilled_rows,
             join_time,
             input_batches,
             input_rows,
