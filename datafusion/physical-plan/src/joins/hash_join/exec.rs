@@ -85,12 +85,25 @@ use parking_lot::Mutex;
 const HASH_JOIN_SEED: RandomState =
     RandomState::with_seeds('J' as u64, 'O' as u64, 'I' as u64, 'N' as u64);
 
+/// Maximum number of partitions allowed when recursively repartitioning during hybrid hash join.
+const HYBRID_HASH_MAX_PARTITIONS: usize = 1 << 16;
+/// Upper bound multiplier applied to the initial partition fanout when searching for additional partitions.
+const HYBRID_HASH_PARTITION_GROWTH_FACTOR: usize = 16;
+/// Approximate number of probe batches worth of rows we target per partition when statistics are available.
+const HYBRID_HASH_ROWS_PER_PARTITION_BATCH_MULTIPLIER: usize = 8;
+/// Minimum number of bytes we aim to keep in memory per partition when deriving the initial fanout.
+const HYBRID_HASH_MIN_BYTES_PER_PARTITION: usize = 8 * 1024 * 1024;
+/// Minimum number of rows per partition when statistics are available to avoid extreme fan-out.
+const HYBRID_HASH_MIN_ROWS_PER_PARTITION: usize = 1_024;
+
 /// HashTable and input data for the left (build side) of a join
 pub(super) struct JoinLeftData {
     /// The hash table with indices into `batch`
     pub(super) hash_map: Box<dyn JoinHashMapType>,
     /// The input rows for the build side
     batch: RecordBatch,
+    /// Original build-side batches before concatenation
+    original_batches: Arc<Vec<RecordBatch>>,
     /// The build side on expressions values
     values: Vec<ArrayRef>,
     /// Shared bitmap builder for visited left indices
@@ -112,6 +125,7 @@ impl JoinLeftData {
     pub(super) fn new(
         hash_map: Box<dyn JoinHashMapType>,
         batch: RecordBatch,
+        original_batches: Arc<Vec<RecordBatch>>,
         values: Vec<ArrayRef>,
         visited_indices_bitmap: SharedBitmapBuilder,
         probe_threads_counter: AtomicUsize,
@@ -121,6 +135,7 @@ impl JoinLeftData {
         Self {
             hash_map,
             batch,
+            original_batches,
             values,
             visited_indices_bitmap,
             probe_threads_counter,
@@ -137,6 +152,10 @@ impl JoinLeftData {
     /// returns a reference to the build side batch
     pub(super) fn batch(&self) -> &RecordBatch {
         &self.batch
+    }
+
+    pub(super) fn original_batches(&self) -> &[RecordBatch] {
+        &self.original_batches
     }
 
     /// returns a reference to the build side expressions values
@@ -1120,16 +1139,10 @@ impl ExecutionPlan for HashJoinExec {
                         .iter()
                         .map(|(_, right_expr)| Arc::clone(right_expr))
                         .collect::<Vec<_>>();
-                    let batch_size = context.session_config().batch_size();
-                    let mut num_partitions = context.session_config().target_partitions();
-                    if num_partitions == 0 {
-                        num_partitions = 1;
-                    }
-                    let np2 = num_partitions.next_power_of_two();
-                    let num_partitions = np2.max(1);
+                    let session_config = context.session_config();
+                    let batch_size = session_config.batch_size();
                     let memory_threshold = {
-                        let bytes = context
-                            .session_config()
+                        let bytes = session_config
                             .options()
                             .execution
                             .sort_spill_reservation_bytes;
@@ -1139,6 +1152,126 @@ impl ExecutionPlan for HashJoinExec {
                             bytes
                         }
                     };
+                    let existing_partitions = std::cmp::max(
+                        1,
+                        right_plan.output_partitioning().partition_count(),
+                    );
+                    let target_partitions = std::cmp::max(
+                        existing_partitions,
+                        session_config.target_partitions(),
+                    );
+                    let mut num_partitions = target_partitions;
+                    let mut bytes_per_partition = memory_threshold / 2;
+                    bytes_per_partition = bytes_per_partition
+                        .max(HYBRID_HASH_MIN_BYTES_PER_PARTITION)
+                        .min(memory_threshold.max(HYBRID_HASH_MIN_BYTES_PER_PARTITION));
+
+                    let initial_cap = target_partitions
+                        .saturating_mul(HYBRID_HASH_PARTITION_GROWTH_FACTOR)
+                        .min(HYBRID_HASH_MAX_PARTITIONS);
+
+                    let mut build_size_bytes: Option<usize> = None;
+                    if let Ok(left_stats) = self.left.partition_statistics(None) {
+                        if let Some(total_bytes) = left_stats.total_byte_size.get_value()
+                        {
+                            let total_bytes = *total_bytes;
+                            build_size_bytes = Some(total_bytes);
+                            if total_bytes <= memory_threshold {
+                                num_partitions = 1;
+                            } else if bytes_per_partition > 0 {
+                                let required = total_bytes
+                                    .saturating_add(bytes_per_partition - 1)
+                                    / bytes_per_partition;
+                                if required > 0 {
+                                    num_partitions =
+                                        std::cmp::max(num_partitions, required);
+                                }
+                            }
+                        }
+
+                        if let Some(num_rows) = left_stats.num_rows.get_value() {
+                            let num_rows = *num_rows;
+                            let min_rows = session_config
+                                .batch_size()
+                                .saturating_mul(
+                                    HYBRID_HASH_ROWS_PER_PARTITION_BATCH_MULTIPLIER,
+                                )
+                                .max(HYBRID_HASH_MIN_ROWS_PER_PARTITION);
+                            if num_partitions > 1 && min_rows > 0 && num_rows > min_rows {
+                                let required =
+                                    num_rows.saturating_add(min_rows - 1) / min_rows;
+                                if required > 0 {
+                                    num_partitions =
+                                        std::cmp::max(num_partitions, required);
+                                }
+                            }
+                        }
+                    }
+
+                    if build_size_bytes
+                        .map(|b| b <= memory_threshold)
+                        .unwrap_or(false)
+                    {
+                        return Ok(Box::pin(HashJoinStream::new(
+                            partition,
+                            self.schema(),
+                            on_right,
+                            self.filter.clone(),
+                            self.join_type,
+                            right_stream,
+                            self.random_state.clone(),
+                            join_metrics,
+                            column_indices_after_projection,
+                            self.null_equality,
+                            HashJoinStreamState::WaitBuildSide,
+                            BuildSide::Initial(BuildSideInitialState { left_fut }),
+                            batch_size,
+                            vec![],
+                            self.right.output_ordering().is_some(),
+                            shared_bounds_accumulator,
+                        )));
+                    }
+
+                    num_partitions = num_partitions
+                        .min(initial_cap)
+                        .clamp(1, HYBRID_HASH_MAX_PARTITIONS);
+                    if num_partitions > 1 && !num_partitions.is_power_of_two() {
+                        num_partitions = num_partitions
+                            .checked_next_power_of_two()
+                            .unwrap_or(num_partitions)
+                            .max(1);
+                    }
+
+                    if num_partitions == 1 {
+                        return Ok(Box::pin(HashJoinStream::new(
+                            partition,
+                            self.schema(),
+                            on_right,
+                            self.filter.clone(),
+                            self.join_type,
+                            right_stream,
+                            self.random_state.clone(),
+                            join_metrics,
+                            column_indices_after_projection,
+                            self.null_equality,
+                            HashJoinStreamState::WaitBuildSide,
+                            BuildSide::Initial(BuildSideInitialState { left_fut }),
+                            batch_size,
+                            vec![],
+                            self.right.output_ordering().is_some(),
+                            shared_bounds_accumulator,
+                        )));
+                    }
+
+                    let mut max_partition_count = if num_partitions == 1 {
+                        1
+                    } else {
+                        num_partitions
+                            .saturating_mul(HYBRID_HASH_PARTITION_GROWTH_FACTOR)
+                            .min(HYBRID_HASH_MAX_PARTITIONS)
+                    };
+                    max_partition_count =
+                        max_partition_count.max(initial_cap).max(num_partitions);
                     let partitioned_reservation =
                         MemoryConsumer::new("PartitionedHashJoin")
                             .register(context.memory_pool());
@@ -1161,6 +1294,7 @@ impl ExecutionPlan for HashJoinExec {
                         self.null_equality,
                         batch_size,
                         num_partitions,
+                        max_partition_count,
                         memory_threshold,
                         partitioned_reservation,
                         context.runtime_env(),
@@ -1607,6 +1741,7 @@ async fn collect_left_input(
         mut reservation,
         bounds_accumulators,
     } = state;
+    let batches_arc = Arc::new(batches);
 
     // Estimation of memory size, required for hashtable, prior to allocation.
     // Final result can be verified using `RawTable.allocation_info()`
@@ -1633,7 +1768,7 @@ async fn collect_left_input(
     let mut offset = 0;
 
     // Updating hashmap starting from the last batch
-    let batches_iter = batches.iter().rev();
+    let batches_iter = batches_arc.iter().rev();
     for batch in batches_iter.clone() {
         hashes_buffer.clear();
         hashes_buffer.resize(batch.num_rows(), 0);
@@ -1688,6 +1823,7 @@ async fn collect_left_input(
     let data = JoinLeftData::new(
         hashmap,
         single_batch,
+        Arc::clone(&batches_arc),
         left_values.clone(),
         Mutex::new(visited_indices_bitmap),
         AtomicUsize::new(probe_threads_count),

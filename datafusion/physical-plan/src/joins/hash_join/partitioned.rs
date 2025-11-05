@@ -43,12 +43,12 @@
 //! - Generates join results and handles unmatched rows for outer joins
 //! - Tracks matched rows for proper outer join semantics
 
-use std::mem;
+use std::mem::{self, size_of};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use crate::joins::hash_join::exec::JoinLeftData;
-use crate::joins::join_hash_map::JoinHashMapType;
+use crate::joins::join_hash_map::{JoinHashMapType, JoinHashMapU32, JoinHashMapU64};
 use crate::joins::utils::{
     adjust_indices_by_join_type, apply_join_filter_to_indices, build_batch_from_indices,
     equal_rows_arr, get_final_indices_from_bit_map, need_produce_result_in_final,
@@ -64,6 +64,7 @@ use arrow::array::{Array, ArrayRef, BooleanBufferBuilder, UInt32Array, UInt64Arr
 use arrow::compute::{concat_batches, take};
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
+use datafusion_common::utils::memory::estimate_memory_size;
 use datafusion_common::{
     hash_utils::create_hashes, internal_datafusion_err, internal_err, DataFusionError,
     JoinSide, JoinType, NullEquality, Result,
@@ -140,6 +141,35 @@ pub(super) struct ProbePartition {
     pub hashes: Vec<Vec<u64>>,
 }
 
+enum PartitionBuildStatus {
+    Ready(StatefulStreamResult<Option<RecordBatch>>),
+    NeedMorePartitions { next_count: usize },
+}
+
+struct PartitionAccumulator {
+    buffered_batches: Vec<RecordBatch>,
+    buffered_bytes: usize,
+    total_rows: usize,
+    spill_writer: Option<InProgressSpillFile>,
+}
+
+impl PartitionAccumulator {
+    fn new() -> Self {
+        Self {
+            buffered_batches: Vec::new(),
+            buffered_bytes: 0,
+            total_rows: 0,
+            spill_writer: None,
+        }
+    }
+}
+
+impl Default for PartitionAccumulator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // Use RefCountedTempFile from datafusion_execution::disk_manager
 
 /// Partitioned Hash Join stream that can handle large datasets by partitioning
@@ -178,6 +208,8 @@ pub(super) struct PartitionedHashJoinStream {
     pub batch_size: usize,
     /// Number of partitions to use
     pub num_partitions: usize,
+    /// Maximum partition fanout allowed when recursively repartitioning
+    pub max_partition_count: usize,
     /// Memory threshold for spilling (in bytes)
     pub memory_threshold: usize,
 
@@ -199,6 +231,8 @@ pub(super) struct PartitionedHashJoinStream {
     pub build_spill_manager: SpillManager,
     /// Memory reservation for the entire operation
     pub memory_reservation: MemoryReservation,
+    /// Tracks how many repartition passes have been attempted
+    pub partition_pass: usize,
     /// Runtime environment
     pub runtime_env: Arc<RuntimeEnv>,
     /// Scratch space for computing hashes
@@ -214,6 +248,8 @@ pub(super) struct PartitionedHashJoinStream {
         Option<Arc<crate::joins::hash_join::shared_bounds::SharedBoundsAccumulator>>,
     /// Future used to synchronize dynamic filter updates across partitions
     pub bounds_waiter: Option<OnceFut<()>>,
+    /// Cached build-side schema
+    pub build_schema: SchemaRef,
     /// Cached probe-side schema
     pub probe_schema: SchemaRef,
     /// Current probe batch (filtered to the active partition), if any
@@ -279,6 +315,126 @@ impl PartitionedHashJoinStream {
         } else {
             // Fallback when num_partitions is not a power of two
             (hash as usize) % self.num_partitions
+        }
+    }
+
+    fn resize_partition_vectors(&mut self) {
+        let n = self.num_partitions;
+        self.probe_spill_in_progress = (0..n).map(|_| None).collect();
+        self.probe_spill_files = (0..n).map(|_| None).collect();
+        self.probe_batch_positions = vec![0; n];
+        self.probe_buffered_rows_per_part = vec![0; n];
+        self.probe_spilled_rows_per_part = vec![0; n];
+        self.probe_consumed_rows_per_part = vec![0; n];
+        self.matched_rows_per_part = vec![0; n];
+        self.emitted_rows_per_part = vec![0; n];
+        self.candidate_pairs_per_part = vec![0; n];
+        self.verify_once_per_part = vec![false; n];
+        self.filter_debug_once_per_part = vec![false; n];
+    }
+
+    fn ensure_build_spill_writer<'a>(
+        &self,
+        accum: &'a mut PartitionAccumulator,
+    ) -> Result<&'a mut InProgressSpillFile> {
+        if accum.spill_writer.is_none() {
+            accum.spill_writer = Some(
+                self.build_spill_manager
+                    .create_in_progress_file("hash_join_build_partition")?,
+            );
+        }
+        Ok(accum.spill_writer.as_mut().unwrap())
+    }
+
+    fn spill_partition(
+        &mut self,
+        partition_id: usize,
+        accum: &mut PartitionAccumulator,
+    ) -> Result<()> {
+        let buffered_batches = mem::take(&mut accum.buffered_batches);
+        if buffered_batches.is_empty() {
+            return Ok(());
+        }
+
+        let writer = self.ensure_build_spill_writer(accum)?;
+        for batch in buffered_batches {
+            writer.append_batch(&batch)?;
+        }
+        if accum.buffered_bytes > 0 {
+            let _ = self.memory_reservation.try_shrink(accum.buffered_bytes);
+            accum.buffered_bytes = 0;
+        }
+        Ok(())
+    }
+
+    fn append_spilled_batch(
+        &self,
+        accum: &mut PartitionAccumulator,
+        batch: RecordBatch,
+    ) -> Result<()> {
+        let writer = self.ensure_build_spill_writer(accum)?;
+        writer.append_batch(&batch)?;
+        Ok(())
+    }
+
+    fn reset_partition_state(&mut self) {
+        for writer in self.probe_spill_in_progress.iter_mut() {
+            if let Some(mut writer) = writer.take() {
+                let _ = writer.finish();
+            }
+        }
+
+        self.build_partitions.clear();
+        self.matched_build_rows_per_partition.clear();
+        self.current_partition = None;
+        self.current_probe_batch = None;
+        self.current_probe_values.clear();
+        self.current_probe_hashes.clear();
+        self.current_offset = (0, None);
+        self.joined_probe_idx = None;
+        self.placeholder_emitted = false;
+        self.right_alignment_start = 0;
+        self.unmatched_partition = 0;
+        self.unmatched_left_indices_cache = None;
+        self.unmatched_right_indices_cache = None;
+        self.unmatched_offset = 0;
+        self.probe_partitions.clear();
+        self.probe_batch_positions.clear();
+        self.probes_buffered = false;
+        self.pending_reload_stream = None;
+        self.pending_reload_batches.clear();
+        self.pending_reload_partition = None;
+        self.pending_probe_stream = None;
+        self.pending_probe_partition = None;
+        self.probe_spill_files.clear();
+        self.bounds_waiter = None;
+
+        self.resize_partition_vectors();
+
+        let reserved = self.memory_reservation.size();
+        if reserved > 0 {
+            let _ = self.memory_reservation.try_shrink(reserved);
+        }
+
+        self.state = PartitionedHashJoinState::PartitionBuildSide;
+    }
+
+    fn next_partition_count(&self) -> Option<usize> {
+        if self.num_partitions >= self.max_partition_count {
+            return None;
+        }
+
+        let mut next = self.num_partitions.saturating_mul(2);
+        if next <= self.num_partitions {
+            next = self.num_partitions.saturating_add(1);
+        }
+        if next > self.max_partition_count {
+            next = self.max_partition_count;
+        }
+        if next > self.num_partitions {
+            Some(next)
+        } else {
+            None
         }
     }
 
@@ -355,117 +511,98 @@ impl PartitionedHashJoinStream {
                 self.pending_reload_stream = Some(stream);
                 self.pending_reload_batches.clear();
                 self.pending_reload_partition = Some(part_id);
-                // println!(
-                //     "[spill-join][reload] start partition {}",
-                //     part_id
-                // );
             }
         }
 
         // Drive stream forward
         if self.pending_reload_partition == Some(part_id) {
             if let Some(stream) = self.pending_reload_stream.as_mut() {
-                match stream.poll_next_unpin(cx) {
-                    Poll::Ready(Some(Ok(batch))) => {
-                        // println!(
-                        //     "[spill-join][reload] partition {} batch rows={}",
-                        //     part_id,
-                        //     batch.num_rows()
-                        // );
-                        self.pending_reload_batches.push(batch);
-                        return Poll::Pending;
-                    }
-                    Poll::Ready(Some(Err(e))) => return Poll::Ready(Err(e)),
-                    Poll::Ready(None) => {
-                        // Concatenate
-                        let first_schema = self
-                            .pending_reload_batches
-                            .get(0)
-                            .ok_or_else(|| {
-                                internal_datafusion_err!("empty spilled partition")
-                            })?
-                            .schema();
-                        let concatenated = concat_batches(
-                            &first_schema,
-                            self.pending_reload_batches.as_slice(),
-                        )
-                        .map_err(DataFusionError::from)?;
-
-                        // println!(
-                        //     "Reloaded spilled build partition {} for probing (rows={})",
-                        //     part_id,
-                        //     concatenated.num_rows()
-                        // );
-
-                        // Grow global reservation conservatively by concatenated batch size
-                        let concat_size = concatenated.get_array_memory_size();
-                        let _ = self.memory_reservation.try_grow(concat_size);
-
-                        // Recompute values and hashmap
-                        let mut values: Vec<ArrayRef> =
-                            Vec::with_capacity(self.on_left.len());
-                        for c in &self.on_left {
-                            values.push(
-                                c.evaluate(&concatenated)?
-                                    .into_array(concatenated.num_rows())?,
-                            );
+                loop {
+                    match stream.poll_next_unpin(cx) {
+                        Poll::Ready(Some(Ok(batch))) => {
+                            self.pending_reload_batches.push(batch);
+                            // Continue draining ready batches without yielding.
+                            continue;
                         }
+                        Poll::Ready(Some(Err(e))) => return Poll::Ready(Err(e)),
+                        Poll::Ready(None) => {
+                            // Concatenate
+                            let first_schema = self
+                                .pending_reload_batches
+                                .get(0)
+                                .ok_or_else(|| {
+                                    internal_datafusion_err!("empty spilled partition")
+                                })?
+                                .schema();
+                            let concatenated = concat_batches(
+                                &first_schema,
+                                self.pending_reload_batches.as_slice(),
+                            )
+                            .map_err(DataFusionError::from)?;
 
-                        let mut hash_map: Box<dyn JoinHashMapType> = Box::new(
-                            crate::joins::join_hash_map::JoinHashMapU32::with_capacity(
-                                concatenated.num_rows(),
-                            ),
-                        );
-                        self.hashes_buffer.clear();
-                        self.hashes_buffer.resize(concatenated.num_rows(), 0);
-                        // Build HT for reloaded partition from precomputed key arrays (no re-eval)
-                        create_hashes(
-                            &values,
-                            &self.random_state,
-                            &mut self.hashes_buffer,
-                        )?;
-                        hash_map.extend_zero(concatenated.num_rows());
-                        let iter =
-                            self.hashes_buffer.iter().enumerate().map(|(i, h)| (i, h));
-                        hash_map.update_from_iter(Box::new(iter), 0);
-
-                        let new_reservation = MemoryConsumer::new("partition_reload")
-                            .with_can_spill(true)
-                            .register(&self.runtime_env.memory_pool);
-
-                        self.build_partitions[part_id] = BuildPartition::InMemory {
-                            hash_map,
-                            batch: concatenated,
-                            values,
-                            reservation: new_reservation,
-                        };
-
-                        /*if let Some(BuildPartition::InMemory {
-                            hash_map, batch, ..
-                        }) = self.build_partitions.get(part_id)
-                        {
                             // println!(
-                            //     "Reloaded partition {} hashmap empty? {} rows={}",
+                            //     "Reloaded spilled build partition {} for probing (rows={})",
                             //     part_id,
-                            //     hash_map.is_empty(),
-                            //     batch.num_rows()
+                            //     concatenated.num_rows()
                             // );
-                        }*/
 
-                        self.pending_reload_stream = None;
-                        self.pending_reload_batches.clear();
-                        self.pending_reload_partition = None;
-                        // Shrink global reservation now that partition is resident with per-partition reservation
-                        let _ = self.memory_reservation.try_shrink(concat_size);
-                        return Poll::Ready(Ok(()));
-                    }
-                    Poll::Pending => {
-                        // println!(
-                        //     "[spill-join][reload] partition {} pending batches={}",
-                        //     part_id,
-                        //     self.pending_reload_batches.len()
-                        // );
-                        return Poll::Pending;
+                            // Grow global reservation conservatively by concatenated batch size
+                            let concat_size = concatenated.get_array_memory_size();
+                            let _ = self.memory_reservation.try_grow(concat_size);
+
+                            // Recompute values and hashmap
+                            let mut values: Vec<ArrayRef> =
+                                Vec::with_capacity(self.on_left.len());
+                            for c in &self.on_left {
+                                values.push(
+                                    c.evaluate(&concatenated)?
+                                        .into_array(concatenated.num_rows())?,
+                                );
+                            }
+
+                            let mut hash_map: Box<dyn JoinHashMapType> = Box::new(
+                                JoinHashMapU32::with_capacity(concatenated.num_rows()),
+                            );
+                            self.hashes_buffer.clear();
+                            self.hashes_buffer.resize(concatenated.num_rows(), 0);
+                            // Build HT for reloaded partition from precomputed key arrays (no re-eval)
+                            create_hashes(
+                                &values,
+                                &self.random_state,
+                                &mut self.hashes_buffer,
+                            )?;
+                            hash_map.extend_zero(concatenated.num_rows());
+                            let iter = self
+                                .hashes_buffer
+                                .iter()
+                                .enumerate()
+                                .map(|(i, h)| (i, h));
+                            hash_map.update_from_iter(Box::new(iter), 0);
+
+                            let new_reservation = MemoryConsumer::new("partition_reload")
+                                .with_can_spill(true)
+                                .register(&self.runtime_env.memory_pool);
+
+                            let concat_rows = concatenated.num_rows();
+
+                            self.build_partitions[part_id] = BuildPartition::InMemory {
+                                hash_map,
+                                batch: concatenated,
+                                values,
+                                reservation: new_reservation,
+                            };
+
+                            self.pending_reload_stream = None;
+                            self.pending_reload_batches.clear();
+                            self.pending_reload_partition = None;
+                            // Shrink global reservation now that partition is resident with per-partition reservation
+                            let _ = self.memory_reservation.try_shrink(concat_size);
+                            return Poll::Ready(Ok(()));
+                        }
+                        Poll::Pending => {
+                            cx.waker().wake_by_ref();
+                            return Poll::Pending;
+                        }
                     }
                 }
             }
@@ -491,6 +628,7 @@ impl PartitionedHashJoinStream {
         null_equality: NullEquality,
         batch_size: usize,
         num_partitions: usize,
+        max_partition_count: usize,
         memory_threshold: usize,
         memory_reservation: MemoryReservation,
         runtime_env: Arc<RuntimeEnv>,
@@ -528,6 +666,7 @@ impl PartitionedHashJoinStream {
             null_equality,
             batch_size,
             num_partitions,
+            max_partition_count,
             memory_threshold,
             state: PartitionedHashJoinState::PartitionBuildSide,
             build_partitions: Vec::new(),
@@ -536,6 +675,7 @@ impl PartitionedHashJoinStream {
             probe_spill_manager,
             build_spill_manager,
             memory_reservation,
+            partition_pass: 0,
             runtime_env,
             hashes_buffer: Vec::new(),
             right_side_ordered,
@@ -543,6 +683,7 @@ impl PartitionedHashJoinStream {
             right_alignment_start: 0,
             bounds_accumulator,
             bounds_waiter: None,
+            build_schema,
             probe_schema,
             current_probe_batch: None,
             current_probe_values: vec![],
@@ -577,6 +718,14 @@ impl PartitionedHashJoinStream {
     /// Buffer the entire probe side stream into per-partition batches.
     /// Returns Pending until the right stream is fully consumed.
     fn buffer_probe_side(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        if self.probe_spill_in_progress.len() != self.num_partitions
+            || self.probe_spill_files.len() != self.num_partitions
+        {
+            self.resize_partition_vectors();
+        }
+        if self.probe_partitions.len() != self.num_partitions {
+            self.probe_partitions.clear();
+        }
         if self.probe_partitions.is_empty() {
             self.probe_partitions = (0..self.num_partitions)
                 .map(|_| ProbePartition {
@@ -753,214 +902,280 @@ impl PartitionedHashJoinStream {
         &mut self,
         build_data: Arc<JoinLeftData>,
     ) -> Result<StatefulStreamResult<Option<RecordBatch>>> {
-        // println!(
-        //     "Partitioning build side data into {} partitions",
-        //     self.num_partitions
-        // );
-        // Metrics: record build input
-        self.join_metrics.build_input_batches.add(1);
-        self.join_metrics
-            .build_input_rows
-            .add(build_data.batch().num_rows());
-        // Initialize partitions
-        self.build_partitions = Vec::with_capacity(self.num_partitions);
-        // Initialize per-partition matched rows bitmaps
-        self.matched_build_rows_per_partition = Vec::with_capacity(self.num_partitions);
-
-        // Extract build-side data
-        let batch = build_data.batch();
-        let values = build_data.values();
-
-        // Compute hash values for all rows in the build-side batch
-        let mut hashes = vec![0u64; batch.num_rows()];
-        create_hashes(values, &self.random_state, &mut hashes)?;
-
-        // Partition the data based on hash values
-        let mut partition_batches: Vec<Vec<usize>> =
-            vec![Vec::new(); self.num_partitions];
-
-        for (row_idx, &hash) in hashes.iter().enumerate() {
-            let partition_id = self.partition_for_hash(hash);
-            if row_idx < 10 {
-                // println!(
-                //     "[spill-join] build row {} hash={} -> partition {}",
-                //     row_idx, hash, partition_id
-                // );
-            }
-            partition_batches[partition_id].push(row_idx);
+        if self.partition_pass == 0 {
+            self.join_metrics.build_input_batches.add(1);
+            let total_rows: usize = build_data
+                .original_batches()
+                .iter()
+                .map(|b| b.num_rows())
+                .sum();
+            self.join_metrics.build_input_rows.add(total_rows);
         }
 
-        // Create partitions; spill when memory_threshold is exceeded
-        for partition_id in 0..self.num_partitions {
-            let row_indices = &partition_batches[partition_id];
-            if row_indices.is_empty() {
-                // Empty partition - create empty hash map
-                let empty_hash_map: Box<dyn JoinHashMapType> = Box::new(
-                    crate::joins::join_hash_map::JoinHashMapU32::with_capacity(0),
-                );
-                let empty_batch = batch.slice(0, 0);
-                let empty_values: Vec<ArrayRef> =
-                    values.iter().map(|arr| arr.slice(0, 0)).collect();
+        let build_total_size: usize = build_data
+            .original_batches()
+            .iter()
+            .map(|batch| batch.get_array_memory_size())
+            .sum();
+        if build_total_size <= self.memory_threshold {
+            self.num_partitions = 1;
+            self.max_partition_count = 1;
+        }
 
-                // Initialize empty matched rows bitmap for this partition
-                let matched_bitmap = BooleanBufferBuilder::new(0);
-                self.matched_build_rows_per_partition.push(matched_bitmap);
+        let mut allow_repartition = true;
+        loop {
+            self.reset_partition_state();
 
-                self.build_partitions.push(BuildPartition::InMemory {
-                    hash_map: empty_hash_map,
-                    batch: empty_batch,
-                    values: empty_values,
-                    reservation: MemoryConsumer::new("empty_partition")
-                        .with_can_spill(true)
-                        .register(&self.runtime_env.memory_pool),
-                });
-                continue;
+            match self.try_partition_build_side(&build_data, allow_repartition)? {
+                PartitionBuildStatus::Ready(result) => return Ok(result),
+                PartitionBuildStatus::NeedMorePartitions { next_count } => {
+                    if next_count <= self.num_partitions
+                        || next_count == 0
+                        || next_count > self.max_partition_count
+                    {
+                        allow_repartition = false;
+                        continue;
+                    }
+
+                    self.num_partitions = next_count;
+                    self.partition_pass += 1;
+                    allow_repartition = true;
+                }
+            }
+        }
+    }
+
+    fn try_partition_build_side(
+        &mut self,
+        build_data: &Arc<JoinLeftData>,
+        allow_repartition: bool,
+    ) -> Result<PartitionBuildStatus> {
+        self.build_partitions = Vec::with_capacity(self.num_partitions);
+        self.matched_build_rows_per_partition = Vec::with_capacity(self.num_partitions);
+
+        let mut partition_accumulators = (0..self.num_partitions)
+            .map(|_| PartitionAccumulator::new())
+            .collect::<Vec<_>>();
+        let mut repartition_request: Option<usize> = None;
+
+        for (batch_index, batch) in build_data.original_batches().iter().enumerate() {
+            let mut keys_values: Vec<ArrayRef> = Vec::with_capacity(self.on_left.len());
+            for expr in &self.on_left {
+                keys_values.push(expr.evaluate(batch)?.into_array(batch.num_rows())?);
+            }
+            let mut hashes = vec![0u64; batch.num_rows()];
+            create_hashes(&keys_values, &self.random_state, &mut hashes)?;
+
+            let mut indices_per_part: Vec<Vec<u32>> =
+                vec![Vec::new(); self.num_partitions];
+            for (row_idx, hash) in hashes.iter().enumerate() {
+                let partition_id = self.partition_for_hash(*hash);
+                indices_per_part[partition_id].push(row_idx as u32);
             }
 
-            // Create batch slice for this partition
-            let partition_batch = self.take_rows(batch, row_indices)?;
-            let partition_values: Vec<ArrayRef> = values
-                .iter()
-                .map(|arr| self.take_rows_from_array(arr, row_indices))
-                .collect::<Result<Vec<_>>>()?;
+            for (partition_id, indices) in indices_per_part.into_iter().enumerate() {
+                if indices.is_empty() {
+                    continue;
+                }
 
-            // Estimate memory for this partition
-            let estimated_size = partition_batch.get_array_memory_size()
-                + partition_values
-                    .iter()
-                    .map(|a| a.get_array_memory_size())
-                    .sum::<usize>();
+                let idx_array = UInt32Array::from(indices);
+                let mut filtered_columns: Vec<ArrayRef> =
+                    Vec::with_capacity(batch.num_columns());
+                for col in batch.columns() {
+                    filtered_columns.push(
+                        take(col, &idx_array, None).map_err(DataFusionError::from)?,
+                    );
+                }
+                let filtered_batch =
+                    RecordBatch::try_new(batch.schema(), filtered_columns)
+                        .map_err(DataFusionError::from)?;
+                let batch_size = filtered_batch.get_array_memory_size();
+                let accum = &mut partition_accumulators[partition_id];
+                accum.total_rows += filtered_batch.num_rows();
 
-            // Decide spilling using global reservation (per DF best practice)
-            let mut will_spill = false;
-            match self.memory_reservation.try_grow(estimated_size) {
-                Ok(_) => {
-                    if self.memory_reservation.size() > self.memory_threshold {
-                        // Exceeds threshold: roll back and spill
-                        let _ = self.memory_reservation.try_shrink(estimated_size);
-                        will_spill = true;
+                if accum.spill_writer.is_some() {
+                    self.append_spilled_batch(accum, filtered_batch)?;
+                    continue;
+                }
+
+                match self.memory_reservation.try_grow(batch_size) {
+                    Ok(_) => {
+                        accum.buffered_bytes += batch_size;
+                        accum.buffered_batches.push(filtered_batch);
+                        self.join_metrics
+                            .build_mem_used
+                            .set_max(self.memory_reservation.size());
+                        if self.memory_reservation.size() > self.memory_threshold {
+                            if !self.runtime_env.disk_manager.tmp_files_enabled() {
+                                if allow_repartition {
+                                    if let Some(next_count) = self.next_partition_count()
+                                    {
+                                        repartition_request = Some(next_count);
+                                        break;
+                                    }
+                                }
+                                return Err(internal_datafusion_err!(
+                                    "Insufficient memory for build partitioning and spilling is disabled"
+                                ));
+                            }
+                            self.spill_partition(partition_id, accum)?;
+                        }
+                    }
+                    Err(_) => {
+                        if !self.runtime_env.disk_manager.tmp_files_enabled() {
+                            if allow_repartition {
+                                if let Some(next_count) = self.next_partition_count() {
+                                    repartition_request = Some(next_count);
+                                    break;
+                                }
+                            }
+                            return Err(internal_datafusion_err!(
+                                "Unable to allocate memory for build partition"
+                            ));
+                        }
+                        self.spill_partition(partition_id, accum)?;
+                        self.append_spilled_batch(accum, filtered_batch)?;
                     }
                 }
-                Err(_) => {
-                    will_spill = true;
+
+                if repartition_request.is_some() {
+                    break;
                 }
             }
 
-            // Disable spilling in single-partition mode to avoid reload deadlocks and ensure progress
-            if self.num_partitions == 1 {
-                will_spill = false;
+            if repartition_request.is_some() {
+                break;
             }
+        }
 
-            if will_spill && self.runtime_env.disk_manager.tmp_files_enabled() {
-                // println!(
-                //     "Spilling build partition {} (rows={}) due to memory threshold (threshold={} bytes, current={})",
-                //     partition_id,
-                //     row_indices.len(),
-                //     self.memory_threshold,
-                //     self.memory_reservation.size()
-                // );
-                // Spill this partition to disk and do not keep it in memory
-                let spill_file = self
-                    .build_spill_manager
-                    .spill_record_batch_and_finish(
-                        &[partition_batch.clone()],
-                        "hash_join_build_partition",
-                    )?
-                    .ok_or_else(|| internal_datafusion_err!("expected spill file"))?;
+        if let Some(next_count) = repartition_request {
+            return Ok(PartitionBuildStatus::NeedMorePartitions { next_count });
+        }
 
-                // Initialize matched rows bitmap for this partition
-                let mut matched_bitmap = BooleanBufferBuilder::new(row_indices.len());
-                matched_bitmap.append_n(row_indices.len(), false);
-                self.matched_build_rows_per_partition.push(matched_bitmap);
+        self.build_partitions.reserve(self.num_partitions);
+        self.matched_build_rows_per_partition
+            .reserve(self.num_partitions);
 
-                // Per-partition reservation kept as zero-sized placeholder
-                let reservation = MemoryConsumer::new("partition_spilled")
-                    .with_can_spill(true)
-                    .register(&self.runtime_env.memory_pool);
-
-                self.build_partitions.push(BuildPartition::Spilled {
-                    spill_file: Some(spill_file),
-                    reservation,
-                });
+        let mut partitions_in_memory = 0usize;
+        let mut partitions_spilled = 0usize;
+        let mut partitions_empty = 0usize;
+        for part_id in 0..self.num_partitions {
+            let mut accum = mem::take(&mut partition_accumulators[part_id]);
+            if accum.spill_writer.is_some() {
+                if !accum.buffered_batches.is_empty() {
+                    self.spill_partition(part_id, &mut accum)?;
+                }
+                if let Some(mut writer) = accum.spill_writer.take() {
+                    let spill_file = writer
+                        .finish()?
+                        .ok_or_else(|| internal_datafusion_err!("expected spill file"))?;
+                    let mut matched_bitmap = BooleanBufferBuilder::new(accum.total_rows);
+                    matched_bitmap.append_n(accum.total_rows, false);
+                    self.matched_build_rows_per_partition.push(matched_bitmap);
+                    let reservation = MemoryConsumer::new("partition_spilled")
+                        .with_can_spill(true)
+                        .register(&self.runtime_env.memory_pool);
+                    partitions_spilled += 1;
+                    self.build_partitions.push(BuildPartition::Spilled {
+                        spill_file: Some(spill_file),
+                        reservation,
+                    });
+                }
                 continue;
             }
 
-            // Create hash map for this partition
-            let partition_hash_map: Box<dyn JoinHashMapType> =
-                Box::new(crate::joins::join_hash_map::JoinHashMapU32::with_capacity(
-                    row_indices.len(),
-                ));
+            if accum.buffered_batches.is_empty() {
+                self.matched_build_rows_per_partition
+                    .push(BooleanBufferBuilder::new(0));
+                partitions_empty += 1;
+                self.build_partitions.push(BuildPartition::Empty);
+                continue;
+            }
 
-            // Build the hash map for this partition from pre-sliced key arrays
-            let mut partition_hash_map = partition_hash_map;
+            let mut buffered_batches = accum.buffered_batches;
+            let partition_batch = if buffered_batches.len() == 1 {
+                buffered_batches.pop().unwrap()
+            } else {
+                let batch_refs: Vec<_> = buffered_batches.iter().collect();
+                concat_batches(&self.build_schema, batch_refs)?
+            };
+            let num_rows = partition_batch.num_rows();
+            let partition_values = self
+                .on_left
+                .iter()
+                .map(|expr| expr.evaluate(&partition_batch)?.into_array(num_rows))
+                .collect::<Result<Vec<_>>>()?;
+            let fixed_size_u32 = size_of::<JoinHashMapU32>();
+            let fixed_size_u64 = size_of::<JoinHashMapU64>();
+            let mut hash_map: Box<dyn JoinHashMapType> = if num_rows > u32::MAX as usize {
+                let estimated_hashtable_size =
+                    estimate_memory_size::<(u64, u64)>(num_rows, fixed_size_u64)?;
+                self.memory_reservation.try_grow(estimated_hashtable_size)?;
+                self.join_metrics
+                    .build_mem_used
+                    .set_max(self.memory_reservation.size());
+                Box::new(JoinHashMapU64::with_capacity(num_rows))
+            } else {
+                let estimated_hashtable_size =
+                    estimate_memory_size::<(u32, u64)>(num_rows, fixed_size_u32)?;
+                self.memory_reservation.try_grow(estimated_hashtable_size)?;
+                self.join_metrics
+                    .build_mem_used
+                    .set_max(self.memory_reservation.size());
+                Box::new(JoinHashMapU32::with_capacity(num_rows))
+            };
+
             self.hashes_buffer.clear();
-            self.hashes_buffer.resize(partition_batch.num_rows(), 0);
+            self.hashes_buffer.resize(num_rows, 0);
             create_hashes(
                 &partition_values,
                 &self.random_state,
                 &mut self.hashes_buffer,
             )?;
-            partition_hash_map.extend_zero(partition_batch.num_rows());
-            let iter = self.hashes_buffer.iter().enumerate().map(|(i, h)| (i, h));
-            partition_hash_map.update_from_iter(Box::new(iter), 0);
+            hash_map.extend_zero(num_rows);
+            let iter = self
+                .hashes_buffer
+                .iter()
+                .enumerate()
+                .map(|(idx, hash)| (idx, hash));
+            hash_map.update_from_iter(Box::new(iter), 0);
 
-            // println!(
-            //     "Built in-memory hash map for partition {} (rows={})",
-            //     partition_id,
-            //     row_indices.len()
-            // );
-            // Metrics: approximate build memory used (batch + values)
-            let approx = partition_batch.get_array_memory_size()
-                + partition_values
-                    .iter()
-                    .map(|a| a.get_array_memory_size())
-                    .sum::<usize>();
-            self.join_metrics
-                .build_mem_used
-                .set_max(self.memory_reservation.size().saturating_add(approx));
-
-            // Initialize matched rows bitmap for this partition
-            let mut matched_bitmap = BooleanBufferBuilder::new(row_indices.len());
-            matched_bitmap.append_n(row_indices.len(), false);
+            let mut matched_bitmap = BooleanBufferBuilder::new(num_rows);
+            matched_bitmap.append_n(num_rows, false);
             self.matched_build_rows_per_partition.push(matched_bitmap);
 
-            // Per-partition reservation: zero-sized placeholder; global reservation tracks memory
             let reservation = MemoryConsumer::new("partition_memory")
                 .with_can_spill(true)
                 .register(&self.runtime_env.memory_pool);
 
-            //let is_empty_after = partition_hash_map.is_empty();
-            // println!(
-            //     "Partition {} hashmap empty after build? {}",
-            //     partition_id, is_empty_after
-            // );
+            let approx_partition_size = partition_batch.get_array_memory_size()
+                + partition_values
+                    .iter()
+                    .map(|arr| arr.get_array_memory_size())
+                    .sum::<usize>();
+            self.join_metrics.build_mem_used.set_max(
+                self.memory_reservation
+                    .size()
+                    .saturating_add(approx_partition_size),
+            );
 
+            partitions_in_memory += 1;
             self.build_partitions.push(BuildPartition::InMemory {
-                hash_map: partition_hash_map,
+                hash_map,
                 batch: partition_batch,
                 values: partition_values,
                 reservation,
             });
         }
 
-        // Start processing from the first radix partition and iterate sequentially
-        // This ensures a single stream can process all partitions when the
-        // operator reports a single output partition.
-        let start_partition = 0;
-        // println!(
-        //     "Partitioning complete. Created {} partitions. Starting to process partition {}",
-        //     self.build_partitions.len(), start_partition
-        // );
-
         self.state = PartitionedHashJoinState::ProcessPartition(ProcessPartitionState {
-            partition_id: start_partition,
+            partition_id: 0,
             total_partitions: self.num_partitions,
-            is_last_partition: start_partition + 1 == self.num_partitions,
+            is_last_partition: self.num_partitions == 1,
         });
 
-        Ok(StatefulStreamResult::Continue)
+        Ok(PartitionBuildStatus::Ready(StatefulStreamResult::Continue))
     }
-
     /// Take specific rows from a RecordBatch
     fn take_rows(&self, batch: &RecordBatch, indices: &[usize]) -> Result<RecordBatch> {
         use arrow::array::UInt32Array;
@@ -1039,9 +1254,8 @@ impl PartitionedHashJoinStream {
                     .filter_map(|expr| expr.evaluate(&empty_batch).ok())
                     .filter_map(|v| v.into_array(empty_batch.num_rows()).ok())
                     .collect();
-                let empty_hash_map: Box<dyn JoinHashMapType> = Box::new(
-                    crate::joins::join_hash_map::JoinHashMapU32::with_capacity(0),
-                );
+                let empty_hash_map: Box<dyn JoinHashMapType> =
+                    Box::new(JoinHashMapU32::with_capacity(0));
 
                 self.build_partitions[partition_id] = BuildPartition::InMemory {
                     hash_map: empty_hash_map,
@@ -1076,12 +1290,10 @@ impl PartitionedHashJoinStream {
             self.state = PartitionedHashJoinState::HandleUnmatchedRows;
             return Poll::Ready(Ok(StatefulStreamResult::Continue));
         }
-        // println!(
-        //     "Processing partition {} (total_partitions={}), build_partitions.len()={}",
-        //     partition_state.partition_id,
-        //     partition_state.total_partitions,
-        //     self.build_partitions.len()
-        // );
+
+        if self.current_partition != Some(partition_state.partition_id) {
+            self.current_partition = Some(partition_state.partition_id);
+        }
 
         // Do not buffer probe side here; selection happens below depending on num_partitions
 
@@ -1235,9 +1447,11 @@ impl PartitionedHashJoinStream {
                                     partition_state.partition_id,
                                 );
                                 if partition_state.is_last_partition {
+                                    self.current_partition = None;
                                     self.state =
                                         PartitionedHashJoinState::HandleUnmatchedRows;
                                 } else {
+                                    self.current_partition = None;
                                     self.state =
                                         PartitionedHashJoinState::ProcessPartition(
                                             ProcessPartitionState {
@@ -1330,8 +1544,10 @@ impl PartitionedHashJoinStream {
             // );
             self.release_partition_resources(partition_state.partition_id);
             if partition_state.is_last_partition {
+                self.current_partition = None;
                 self.state = PartitionedHashJoinState::HandleUnmatchedRows;
             } else {
+                self.current_partition = None;
                 self.state =
                     PartitionedHashJoinState::ProcessPartition(ProcessPartitionState {
                         partition_id: partition_state.partition_id + 1,
@@ -2137,9 +2353,10 @@ impl PartitionedHashJoinStream {
                                                 .into_array(concatenated.num_rows())?,
                                         );
                                     }
-                                    let hash_map: Box<dyn JoinHashMapType> = Box::new(
-                                        crate::joins::join_hash_map::JoinHashMapU32::with_capacity(concatenated.num_rows()),
-                                    );
+                                    let hash_map: Box<dyn JoinHashMapType> =
+                                        Box::new(JoinHashMapU32::with_capacity(
+                                            concatenated.num_rows(),
+                                        ));
                                     self.build_partitions[self.unmatched_partition] =
                                         BuildPartition::InMemory {
                                             hash_map,
