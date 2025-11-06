@@ -1341,6 +1341,14 @@ pub(crate) struct BuildProbeJoinMetrics {
     pub(crate) probe_spilled_bytes: metrics::Count,
     /// Total probe-side rows written to spill
     pub(crate) probe_spilled_rows: metrics::Count,
+    /// Number of times recursive repartitioning was triggered
+    pub(crate) recursive_repartition_events: metrics::Count,
+    /// Total number of child partitions materialized by recursion
+    pub(crate) recursive_partitions_created: metrics::Count,
+    /// Maximum recursion depth reached
+    pub(crate) recursive_partition_depth: metrics::Gauge,
+    /// Maximum fan-out applied during recursive repartitioning
+    pub(crate) recursive_repartition_fanout: metrics::Gauge,
     /// Total time for joining probe-side batches to the build-side batches
     pub(crate) join_time: metrics::Time,
     /// Number of batches consumed by probe-side of this operator
@@ -1398,6 +1406,14 @@ impl BuildProbeJoinMetrics {
             MetricBuilder::new(metrics).counter("probe_spilled_bytes", partition);
         let probe_spilled_rows =
             MetricBuilder::new(metrics).counter("probe_spilled_rows", partition);
+        let recursive_repartition_events = MetricBuilder::new(metrics)
+            .counter("recursive_repartition_events", partition);
+        let recursive_partitions_created = MetricBuilder::new(metrics)
+            .counter("recursive_partitions_created", partition);
+        let recursive_partition_depth =
+            MetricBuilder::new(metrics).gauge("recursive_partition_depth", partition);
+        let recursive_repartition_fanout =
+            MetricBuilder::new(metrics).gauge("recursive_repartition_fanout", partition);
 
         let input_batches =
             MetricBuilder::new(metrics).counter("input_batches", partition);
@@ -1418,6 +1434,10 @@ impl BuildProbeJoinMetrics {
             probe_spill_count,
             probe_spilled_bytes,
             probe_spilled_rows,
+            recursive_repartition_events,
+            recursive_partitions_created,
+            recursive_partition_depth,
+            recursive_repartition_fanout,
             join_time,
             input_batches,
             input_rows,
