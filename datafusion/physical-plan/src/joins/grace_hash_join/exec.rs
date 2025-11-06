@@ -117,8 +117,6 @@ pub struct GraceHashJoinExec {
     /// HashJoinExec also needs to keep a shared bounds accumulator for coordinating updates.
     dynamic_filter: Option<HashJoinExecDynamicFilter>,
     accumulator: Arc<GraceAccumulator>,
-    spill_left: Arc<SpillManager>,
-    spill_right: Arc<SpillManager>,
 }
 
 #[derive(Clone)]
@@ -200,20 +198,7 @@ impl GraceHashJoinExec {
         let partitions = left.output_partitioning().partition_count();
         let accumulator = GraceAccumulator::new(partitions);
 
-
         let metrics = ExecutionPlanMetricsSet::new();
-        let runtime = Arc::new(RuntimeEnv::default());
-        let spill_left = Arc::new(SpillManager::new(
-            Arc::clone(&runtime),
-            SpillMetrics::new(&metrics, 0),
-            Arc::clone(&left_schema),
-        ));
-        let spill_right = Arc::new(SpillManager::new(
-            Arc::clone(&runtime),
-            SpillMetrics::new(&metrics, 0),
-            Arc::clone(&right_schema),
-        ));
-
         // Initialize both dynamic filter and bounds accumulator to None
         // They will be set later if dynamic filtering is enabled
         Ok(GraceHashJoinExec {
@@ -231,8 +216,6 @@ impl GraceHashJoinExec {
             cache,
             dynamic_filter: None,
             accumulator,
-            spill_left,
-            spill_right,
         })
     }
 
@@ -575,7 +558,6 @@ impl ExecutionPlan for GraceHashJoinExec {
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let partitions = children[0].output_partitioning().partition_count();
         Ok(Arc::new(GraceHashJoinExec {
             left: Arc::clone(&children[0]),
             right: Arc::clone(&children[1]),
@@ -599,8 +581,6 @@ impl ExecutionPlan for GraceHashJoinExec {
             // Keep the dynamic filter, bounds accumulator will be reset
             dynamic_filter: self.dynamic_filter.clone(),
             accumulator: Arc::clone(&self.accumulator),
-            spill_left: Arc::clone(&self.spill_left),
-            spill_right: Arc::clone(&self.spill_right),
         }))
     }
 
@@ -621,8 +601,6 @@ impl ExecutionPlan for GraceHashJoinExec {
             // Reset dynamic filter and bounds accumulator to initial state
             dynamic_filter: None,
             accumulator: Arc::clone(&self.accumulator),
-            spill_left: Arc::clone(&self.spill_left),
-            spill_right: Arc::clone(&self.spill_right),
         }))
     }
 
@@ -875,8 +853,6 @@ impl ExecutionPlan for GraceHashJoinExec {
                         filter: dynamic_filter,
                         bounds_accumulator: OnceLock::new(),
                     }),
-                    spill_left: Arc::clone(&self.spill_left),
-                    spill_right: Arc::clone(&self.spill_right),
                     accumulator: Arc::clone(&self.accumulator),
                 });
                 result = result.with_updated_node(new_node as Arc<dyn ExecutionPlan>);
@@ -961,50 +937,61 @@ async fn partition_and_spill_one_side(
         .map(|_| PartitionWriter::new(Arc::clone(&spill_manager)))
         .collect();
 
+    let mut buffered_batches = Vec::new();
     let mut total_rows = 0usize;
-
+    let schema = input.schema();
     while let Some(batch) = input.next().await {
         let batch = batch?;
-        let num_rows = batch.num_rows();
-        if num_rows == 0 {
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        total_rows += batch.num_rows();
+        join_metrics.build_input_batches.add(1);
+        join_metrics.build_input_rows.add(batch.num_rows());
+        buffered_batches.push(batch);
+    }
+    if buffered_batches.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Create single batch to reduce number of spilled files
+    let single_batch = concat_batches(&schema, &buffered_batches)?;
+    let num_rows = single_batch.num_rows();
+    if num_rows == 0 {
+        return Ok(Vec::new());
+    }
+
+    // Calculate hashes
+    let keys = on_exprs
+        .iter()
+        .map(|c| c.evaluate(&single_batch)?.into_array(num_rows))
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut hashes = vec![0u64; num_rows];
+    create_hashes(&keys, random_state, &mut hashes)?;
+
+    // Spread to partitions
+    let mut indices: Vec<Vec<u32>> = vec![Vec::new(); partition_count];
+    for (row, h) in hashes.iter().enumerate() {
+        let bucket = (*h as usize) % partition_count;
+        indices[bucket].push(row as u32);
+    }
+
+    // Collect and spill
+    for (i, idxs) in indices.into_iter().enumerate() {
+        if idxs.is_empty() {
             continue;
         }
 
-        total_rows += num_rows;
-        join_metrics.build_input_batches.add(1);
-        join_metrics.build_input_rows.add(num_rows);
-
-        // Calculate hashes
-        let keys = on_exprs
+        let idx_array = UInt32Array::from(idxs);
+        let taken = single_batch
+            .columns()
             .iter()
-            .map(|c| c.evaluate(&batch)?.into_array(num_rows))
-            .collect::<Result<Vec<_>>>()?;
+            .map(|c| take(c.as_ref(), &idx_array, None))
+            .collect::<arrow::error::Result<Vec<_>>>()?;
 
-        let mut hashes = vec![0u64; num_rows];
-        create_hashes(&keys, random_state, &mut hashes)?;
-
-        // Spread to partitions
-        let mut indices: Vec<Vec<u32>> = vec![Vec::new(); partition_count];
-        for (row, h) in hashes.iter().enumerate() {
-            let bucket = (*h as usize) % partition_count;
-            indices[bucket].push(row as u32);
-        }
-
-        // Collect and spill
-        for (i, idxs) in indices.into_iter().enumerate() {
-            if idxs.is_empty() {
-                continue;
-            }
-            let idx_array = UInt32Array::from(idxs);
-            let taken = batch
-                .columns()
-                .iter()
-                .map(|c| take(c.as_ref(), &idx_array, None))
-                .collect::<arrow::error::Result<Vec<_>>>()?;
-            let part_batch = RecordBatch::try_new(batch.schema(), taken)?;
-            let request_msg = format!("grace_partition_{file_request_msg}_{i}");
-            partitions[i].spill_batch_auto(&part_batch, &request_msg)?;
-        }
+        let part_batch = RecordBatch::try_new(single_batch.schema(), taken)?;
+        let request_msg = format!("grace_partition_{file_request_msg}_{i}");
+        partitions[i].spill_batch_auto(&part_batch, &request_msg)?;
     }
 
     // Prepare indexes
@@ -1012,7 +999,7 @@ async fn partition_and_spill_one_side(
     for (i, writer) in partitions.into_iter().enumerate() {
         result.push(writer.finish(i)?);
     }
-
+    println!("spill_manager {:?}", spill_manager.metrics);
     Ok(result)
 }
 
@@ -1104,6 +1091,7 @@ mod tests {
     use rstest::*;
     use rstest_reuse::*;
     use datafusion_execution::runtime_env::RuntimeEnvBuilder;
+    use crate::joins::HashJoinExec;
 
     fn build_large_table(
         a_name: &str,
@@ -1112,7 +1100,7 @@ mod tests {
         n: usize,
     ) -> Arc<dyn ExecutionPlan> {
         let a: ArrayRef = Arc::new(Int32Array::from_iter_values(1..=n as i32));
-        let b: ArrayRef = Arc::new(Int32Array::from_iter_values(1..=n as i32));
+        let b: ArrayRef = Arc::new(Int32Array::from_iter_values((1..=n as i32).map(|x| x * 2)));
         let c: ArrayRef = Arc::new(Int32Array::from_iter_values((1..=n as i32).map(|x| x * 10)));
 
         let schema = Arc::new(arrow::datatypes::Schema::new(vec![
@@ -1138,7 +1126,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn single_partition_join_overallocation() -> Result<()> {
+    async fn single_partition_join_overallocation() -> Result<()>
+    {
         // let left = build_table(
         //     ("a1", &vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 0]),
         //     ("b1", &vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 0]),
@@ -1149,13 +1138,13 @@ mod tests {
         //     ("b2", &vec![1, 2]),
         //     ("c2", &vec![14, 15]),
         // );
-        let left = build_large_table("a1", "b1", "c1", 100_000);
-        let right = build_large_table("a2", "b2", "c2", 50_000);
+        let left = build_large_table("a1", "b1", "c1", 200);
+        let right = build_large_table("a2", "b2", "c2", 500);
         let on = vec![(
             Arc::new(Column::new_with_schema("a1", &left.schema()).unwrap()) as _,
             Arc::new(Column::new_with_schema("b2", &right.schema()).unwrap()) as _,
         )];
-        let (left_expr, right_expr) = on
+        let (left_expr, right_expr): (Vec<Arc<dyn PhysicalExpr>>, Vec<Arc<dyn PhysicalExpr>>) = on
             .iter()
             .map(|(l, r)| (Arc::clone(l), Arc::clone(r)))
             .unzip();
@@ -1216,4 +1205,54 @@ mod tests {
         // );
         Ok(())
     }
+
+    #[tokio::test]
+    async fn single_partition_join_overallocation_f() -> Result<()> {
+
+        let left = build_large_table("a1", "b1", "c1", 200);
+        let right = build_large_table("a2", "b2", "c2", 500);
+        let on = vec![(
+            Arc::new(Column::new_with_schema("a1", &left.schema()).unwrap()) as _,
+            Arc::new(Column::new_with_schema("b2", &right.schema()).unwrap()) as _,
+        )];
+        let (left_expr, right_expr): (Vec<Arc<dyn PhysicalExpr>>, Vec<Arc<dyn PhysicalExpr>>) = on
+            .iter()
+            .map(|(l, r)| (Arc::clone(l), Arc::clone(r)))
+            .unzip();
+        let left_repartitioned: Arc<dyn ExecutionPlan> = Arc::new(RepartitionExec::try_new(
+            left,
+            Partitioning::Hash(left_expr, 32),
+        )?);
+        let right_repartitioned: Arc<dyn ExecutionPlan> = Arc::new(RepartitionExec::try_new(
+            right,
+            Partitioning::Hash(right_expr, 32),
+        )?);
+
+        let join = HashJoinExec::try_new(
+            left_repartitioned,
+            right_repartitioned,
+            on,
+            None,
+            &JoinType::Inner,
+            None,
+            PartitionMode::Partitioned,
+            NullEquality::NullEqualsNothing,
+        )?;
+
+        let task_ctx = Arc::new(TaskContext::default());
+        let mut batches = vec![];
+        for i in 0..32 {
+            let stream = join.execute(i, Arc::clone(&task_ctx))?;
+            let more_batches = common::collect(stream).await?;
+            batches.extend(
+                more_batches
+                    .into_iter()
+                    .filter(|b| b.num_rows() > 0)
+                    .collect::<Vec<_>>(),
+            );
+        }
+        print_batches(&*batches).unwrap();
+        Ok(())
+    }
+
 }

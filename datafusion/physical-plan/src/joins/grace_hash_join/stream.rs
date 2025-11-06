@@ -265,6 +265,7 @@ fn load_partition_async(
 ) -> OnceFut<Vec<RecordBatch>> {
     OnceFut::new(async move {
         let mut all_batches = Vec::new();
+        println!("partitions {:?}", partitions);
         for p in partitions {
             for chunk in p.chunks {
                 let mut reader = spill_manager.load_spilled_batch(&chunk)?;
