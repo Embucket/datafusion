@@ -48,6 +48,8 @@ use std::mem::{self, size_of};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+#[cfg(feature = "hybrid_hash_join_scheduler")]
+use super::scheduler::{HybridTaskScheduler, SchedulerConfig};
 use crate::joins::hash_join::exec::JoinLeftData;
 use crate::joins::join_hash_map::{JoinHashMapType, JoinHashMapU32, JoinHashMapU64};
 use crate::joins::utils::{
@@ -1617,7 +1619,27 @@ impl PartitionedHashJoinStream {
     }
 
     /// Partition build-side data into multiple partitions
+    #[cfg(feature = "hybrid_hash_join_scheduler")]
     fn partition_build_side(
+        &mut self,
+        build_data: Arc<JoinLeftData>,
+    ) -> Result<StatefulStreamResult<Option<RecordBatch>>> {
+        let config = SchedulerConfig::from_stream(self);
+        HybridTaskScheduler::with_build_task(config, build_data)
+            .run_until_build_finished(self)
+    }
+
+    /// Partition build-side data into multiple partitions (legacy serial path)
+    #[cfg(not(feature = "hybrid_hash_join_scheduler"))]
+    fn partition_build_side(
+        &mut self,
+        build_data: Arc<JoinLeftData>,
+    ) -> Result<StatefulStreamResult<Option<RecordBatch>>> {
+        self.partition_build_side_serial(build_data)
+    }
+
+    /// Legacy build partitioning logic shared with the experimental scheduler.
+    pub(super) fn partition_build_side_serial(
         &mut self,
         build_data: Arc<JoinLeftData>,
     ) -> Result<StatefulStreamResult<Option<RecordBatch>>> {

@@ -21,5 +21,7 @@ pub use exec::HashJoinExec;
 
 mod exec;
 mod partitioned;
+#[cfg(feature = "hybrid_hash_join_scheduler")]
+mod scheduler;
 mod shared_bounds;
 mod stream;
