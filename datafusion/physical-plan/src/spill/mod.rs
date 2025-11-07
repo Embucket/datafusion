@@ -17,9 +17,9 @@
 
 //! Defines the spilling functions
 
+pub(crate) mod in_memory_spill_buffer;
 pub(crate) mod in_progress_spill_file;
 pub(crate) mod spill_manager;
-pub(crate) mod in_memory_spill_buffer;
 
 use std::fs::File;
 use std::io::BufReader;
@@ -387,8 +387,8 @@ mod tests {
     use datafusion_execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
     use futures::StreamExt as _;
 
-    use std::sync::Arc;
     use datafusion_execution::memory_pool::{FairSpillPool, MemoryPool};
+    use std::sync::Arc;
 
     #[tokio::test]
     async fn test_batch_spill_and_read() -> Result<()> {
@@ -456,8 +456,8 @@ mod tests {
 
         // --- create small memory pool (simulate memory pressure) ---
         let memory_limit_bytes = 20 * 1024; // 20KB
-        let memory_pool: Arc<dyn MemoryPool> = Arc::new(FairSpillPool::new(memory_limit_bytes));
-
+        let memory_pool: Arc<dyn MemoryPool> =
+            Arc::new(FairSpillPool::new(memory_limit_bytes));
 
         // Construct SpillManager
         let env = RuntimeEnvBuilder::new()
@@ -469,8 +469,14 @@ mod tests {
         let results = spill_manager.spill_batches_auto(&batches, "TestAutoSpill")?;
         assert_eq!(results.len(), 2);
 
-        let mem_count = results.iter().filter(|r| matches!(r, SpillLocation::Memory(_))).count();
-        let disk_count = results.iter().filter(|r| matches!(r, SpillLocation::Disk(_))).count();
+        let mem_count = results
+            .iter()
+            .filter(|r| matches!(r, SpillLocation::Memory(_)))
+            .count();
+        let disk_count = results
+            .iter()
+            .filter(|r| matches!(r, SpillLocation::Disk(_)))
+            .count();
         assert!(mem_count >= 1);
         assert!(disk_count >= 1);
 

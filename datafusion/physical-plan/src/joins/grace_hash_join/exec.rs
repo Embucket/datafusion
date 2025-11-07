@@ -15,52 +15,47 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::fmt;
-use std::mem::size_of;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
-use std::{any::Any, vec};
-use std::fmt::{format, Formatter};
 use crate::execution_plan::{boundedness_from_children, EmissionType};
 use crate::filter_pushdown::{
     ChildPushdownResult, FilterDescription, FilterPushdownPhase,
     FilterPushdownPropagation,
 };
 use crate::joins::utils::{
-    asymmetric_join_output_partitioning, reorder_output_after_swap, swap_join_projection,
-    update_hash, OnceAsync, OnceFut,
+    reorder_output_after_swap, swap_join_projection, OnceFut,
 };
-use crate::joins::{JoinOn, JoinOnRef, PartitionMode, SharedBitmapBuilder};
+use crate::joins::{JoinOn, JoinOnRef, PartitionMode};
 use crate::projection::{
     try_embed_projection, try_pushdown_through_join, EmbeddedProjection, JoinData,
     ProjectionExec,
 };
 use crate::spill::get_record_batch_memory_size;
-use crate::{displayable, ExecutionPlanProperties, SpillManager};
 use crate::{
     common::can_project,
     joins::utils::{
         build_join_schema, check_join_is_valid, estimate_join_statistics,
-        need_produce_result_in_final, symmetric_join_output_partitioning,
-        BuildProbeJoinMetrics, ColumnIndex, JoinFilter, JoinHashMapType,
+        symmetric_join_output_partitioning,
+        BuildProbeJoinMetrics, ColumnIndex, JoinFilter,
     },
     metrics::{ExecutionPlanMetricsSet, MetricsSet},
-    DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, Partitioning,
+    DisplayAs, DisplayFormatType, Distribution, ExecutionPlan,
     PlanProperties, SendableRecordBatchStream, Statistics,
 };
+use crate::{ExecutionPlanProperties, SpillManager};
+use std::fmt;
+use std::fmt::Formatter;
+use std::sync::{Arc, OnceLock};
+use std::{any::Any, vec};
 
-use arrow::array::{ArrayRef, BooleanBufferBuilder, UInt32Array};
-use arrow::compute::{concat, concat_batches, take};
+use arrow::array::UInt32Array;
+use arrow::compute::{concat_batches, take};
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
-use arrow::util::bit_util;
-use arrow_schema::DataType;
 use datafusion_common::config::ConfigOptions;
-use datafusion_common::utils::memory::estimate_memory_size;
-use datafusion_common::{internal_datafusion_err, internal_err, plan_err, project_schema, DataFusionError, JoinSide, JoinType, NullEquality, Result};
-use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
+use datafusion_common::{
+    internal_err, plan_err, project_schema, JoinSide, JoinType,
+    NullEquality, Result,
+};
 use datafusion_execution::TaskContext;
-use datafusion_expr::{Accumulator, UserDefinedLogicalNode};
 use datafusion_functions_aggregate_common::min_max::{MaxAccumulator, MinAccumulator};
 use datafusion_physical_expr::equivalence::{
     join_equivalence_properties, ProjectionMapping,
@@ -68,19 +63,16 @@ use datafusion_physical_expr::equivalence::{
 use datafusion_physical_expr::expressions::{lit, DynamicFilterPhysicalExpr};
 use datafusion_physical_expr::{PhysicalExpr, PhysicalExprRef};
 
-use ahash::RandomState;
-use arrow_ord::partition::partition;
-use datafusion_physical_expr_common::physical_expr::fmt_sql;
-use futures::{StreamExt, TryStreamExt};
-use futures::executor::block_on;
-use parking_lot::Mutex;
-use datafusion_common::hash_utils::create_hashes;
-use datafusion_execution::runtime_env::RuntimeEnv;
-use crate::empty::EmptyExec;
-use crate::joins::grace_hash_join::stream::{GraceAccumulator, GraceHashJoinStream, SpillFut};
+use crate::joins::grace_hash_join::stream::{
+    GraceAccumulator, GraceHashJoinStream, SpillFut,
+};
 use crate::joins::hash_join::shared_bounds::SharedBoundsAccumulator;
 use crate::metrics::SpillMetrics;
-use crate::spill::spill_manager::{GetSlicedSize, SpillLocation};
+use crate::spill::spill_manager::SpillLocation;
+use ahash::RandomState;
+use datafusion_common::hash_utils::create_hashes;
+use datafusion_physical_expr_common::physical_expr::fmt_sql;
+use futures::StreamExt;
 
 /// Hard-coded seed to ensure hash values from the hash join differ from `RepartitionExec`, avoiding collisions.
 const HASH_JOIN_SEED: RandomState =
@@ -147,7 +139,6 @@ impl fmt::Debug for GraceHashJoinExec {
             .finish()
     }
 }
-
 
 impl EmbeddedProjection for GraceHashJoinExec {
     fn with_projection(&self, projection: Option<Vec<usize>>) -> Result<Self> {
@@ -331,7 +322,8 @@ impl GraceHashJoinExec {
             on,
         )?;
 
-        let mut output_partitioning = symmetric_join_output_partitioning(left, right, &join_type)?;
+        let mut output_partitioning =
+            symmetric_join_output_partitioning(left, right, &join_type)?;
         let emission_type = if left.boundedness().is_unbounded() {
             EmissionType::Final
         } else if right.pipeline_behavior() == EmissionType::Incremental {
@@ -399,7 +391,7 @@ impl GraceHashJoinExec {
     /// insert `RepartitionExec` operators).
     pub fn swap_inputs(
         &self,
-        partition_mode: PartitionMode,
+        _partition_mode: PartitionMode,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let left = self.left();
         let right = self.right();
@@ -677,8 +669,11 @@ impl ExecutionPlan for GraceHashJoinExec {
                 spill_left_clone,
                 spill_right_clone,
                 partition,
-            ).await?;
-            accumulator_clone.report_partition(partition, left_idx.clone(), right_idx.clone()).await;
+            )
+            .await?;
+            accumulator_clone
+                .report_partition(partition, left_idx.clone(), right_idx.clone())
+                .await;
             Ok(SpillFut::new(partition, left_idx, right_idx))
         });
 
@@ -710,9 +705,6 @@ impl ExecutionPlan for GraceHashJoinExec {
         if partition.is_some() {
             return Ok(Statistics::new_unknown(&self.schema()));
         }
-        // TODO stats: it is not possible in general to know the output size of joins
-        // There are some special cases though, for example:
-        // - `A LEFT JOIN B ON A.col=B.col` with `COUNT_DISTINCT(B.col)=COUNT(B.col)`
         let stats = estimate_join_statistics(
             self.left.partition_statistics(None)?,
             self.right.partition_statistics(None)?,
@@ -895,31 +887,31 @@ pub async fn partition_and_spill(
     let on_left: Vec<_> = on.iter().map(|(l, _)| Arc::clone(l)).collect();
     let on_right: Vec<_> = on.iter().map(|(_, r)| Arc::clone(r)).collect();
 
-    // === LEFT side partitioning ===
+    // LEFT side partitioning
     let left_index = partition_and_spill_one_side(
         &mut left_stream,
         &on_left,
         &random_state,
         partition_count,
         spill_left,
+        &format!("left_{partition}"),
         &join_metrics,
         enable_dynamic_filter_pushdown,
-        &format!("left_{partition}"),
     )
-        .await?;
+    .await?;
 
-    // === RIGHT side partitioning ===
+    // RIGHT side partitioning
     let right_index = partition_and_spill_one_side(
         &mut right_stream,
         &on_right,
         &random_state,
         partition_count,
         spill_right,
+        &format!("right_{partition}"),
         &join_metrics,
         enable_dynamic_filter_pushdown,
-        &format!("right_{partition}"),
     )
-        .await?;
+    .await?;
     Ok((left_index, right_index))
 }
 
@@ -929,23 +921,22 @@ async fn partition_and_spill_one_side(
     random_state: &RandomState,
     partition_count: usize,
     spill_manager: Arc<SpillManager>,
+    spilling_request_msg: &str,
     join_metrics: &BuildProbeJoinMetrics,
-    enable_dynamic_filter_pushdown: bool,
-    file_request_msg: &str,
+    _enable_dynamic_filter_pushdown: bool,
 ) -> Result<Vec<PartitionIndex>> {
     let mut partitions: Vec<PartitionWriter> = (0..partition_count)
         .map(|_| PartitionWriter::new(Arc::clone(&spill_manager)))
         .collect();
 
     let mut buffered_batches = Vec::new();
-    let mut total_rows = 0usize;
+
     let schema = input.schema();
     while let Some(batch) = input.next().await {
         let batch = batch?;
         if batch.num_rows() == 0 {
             continue;
         }
-        total_rows += batch.num_rows();
         join_metrics.build_input_batches.add(1);
         join_metrics.build_input_rows.add(batch.num_rows());
         buffered_batches.push(batch);
@@ -990,7 +981,8 @@ async fn partition_and_spill_one_side(
             .collect::<arrow::error::Result<Vec<_>>>()?;
 
         let part_batch = RecordBatch::try_new(single_batch.schema(), taken)?;
-        let request_msg = format!("grace_partition_{file_request_msg}_{i}");
+        // We need unique name for spilling
+        let request_msg = format!("grace_partition_{spilling_request_msg}_{i}");
         partitions[i].spill_batch_auto(&part_batch, &request_msg)?;
     }
 
@@ -999,7 +991,7 @@ async fn partition_and_spill_one_side(
     for (i, writer) in partitions.into_iter().enumerate() {
         result.push(writer.finish(i)?);
     }
-    println!("spill_manager {:?}", spill_manager.metrics);
+    // println!("spill_manager {:?}", spill_manager.metrics);
     Ok(result)
 }
 
@@ -1021,7 +1013,11 @@ impl PartitionWriter {
         }
     }
 
-    pub fn spill_batch_auto(&mut self, batch: &RecordBatch, request_msg: &str) -> Result<()> {
+    pub fn spill_batch_auto(
+        &mut self,
+        batch: &RecordBatch,
+        request_msg: &str,
+    ) -> Result<()> {
         let loc = self.spill_manager.spill_batch_auto(batch, request_msg)?;
         self.total_rows += batch.num_rows();
         self.total_bytes += get_record_batch_memory_size(batch);
@@ -1066,32 +1062,16 @@ pub struct PartitionIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::coalesce_partitions::CoalescePartitionsExec;
-    use crate::test::{assert_join_metrics, TestMemoryExec};
+    use crate::test::TestMemoryExec;
     use crate::{
         common, expressions::Column, repartition::RepartitionExec, test::build_table_i32,
-        test::exec::MockExec,
     };
 
-    use arrow::array::{Date32Array, Int32Array, StructArray, UInt32Array, UInt64Array};
-    use arrow::buffer::NullBuffer;
-    use arrow::datatypes::{DataType, Field};
-    use arrow::util::pretty::print_batches;
-    use arrow_schema::Schema;
-    use futures::future;
-    use datafusion_common::hash_utils::create_hashes;
-    use datafusion_common::test_util::{batches_to_sort_string, batches_to_string};
-    use datafusion_common::{
-        assert_batches_eq, assert_batches_sorted_eq, assert_contains, exec_err,
-        ScalarValue,
-    };
-    use datafusion_execution::config::SessionConfig;
-    use hashbrown::HashTable;
-    use insta::{allow_duplicates, assert_snapshot};
-    use rstest::*;
-    use rstest_reuse::*;
-    use datafusion_execution::runtime_env::RuntimeEnvBuilder;
     use crate::joins::HashJoinExec;
+    use arrow::array::{ArrayRef, Int32Array};
+    use datafusion_execution::runtime_env::RuntimeEnvBuilder;
+    use datafusion_physical_expr::Partitioning;
+    use futures::future;
 
     fn build_large_table(
         a_name: &str,
@@ -1100,18 +1080,30 @@ mod tests {
         n: usize,
     ) -> Arc<dyn ExecutionPlan> {
         let a: ArrayRef = Arc::new(Int32Array::from_iter_values(1..=n as i32));
-        let b: ArrayRef = Arc::new(Int32Array::from_iter_values((1..=n as i32).map(|x| x * 2)));
-        let c: ArrayRef = Arc::new(Int32Array::from_iter_values((1..=n as i32).map(|x| x * 10)));
+        let b: ArrayRef =
+            Arc::new(Int32Array::from_iter_values((1..=n as i32).map(|x| x * 2)));
+        let c: ArrayRef =
+            Arc::new(Int32Array::from_iter_values((1..=n as i32).map(|x| x * 10)));
 
         let schema = Arc::new(arrow::datatypes::Schema::new(vec![
-            arrow::datatypes::Field::new(a_name, arrow::datatypes::DataType::Int32, false),
-            arrow::datatypes::Field::new(b_name, arrow::datatypes::DataType::Int32, false),
-            arrow::datatypes::Field::new(c_name, arrow::datatypes::DataType::Int32, false),
+            arrow::datatypes::Field::new(
+                a_name,
+                arrow::datatypes::DataType::Int32,
+                false,
+            ),
+            arrow::datatypes::Field::new(
+                b_name,
+                arrow::datatypes::DataType::Int32,
+                false,
+            ),
+            arrow::datatypes::Field::new(
+                c_name,
+                arrow::datatypes::DataType::Int32,
+                false,
+            ),
         ]));
 
         let batch = RecordBatch::try_new(Arc::clone(&schema), vec![a, b, c]).unwrap();
-
-        // MemoryExec требует список партиций: Vec<Vec<RecordBatch>>
         Arc::new(TestMemoryExec::try_new(&[vec![batch]], schema, None).unwrap())
     }
 
@@ -1126,8 +1118,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn single_partition_join_overallocation() -> Result<()>
-    {
+    async fn simple_grace_hash_join() -> Result<()> {
         // let left = build_table(
         //     ("a1", &vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 0]),
         //     ("b1", &vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 0]),
@@ -1138,27 +1129,28 @@ mod tests {
         //     ("b2", &vec![1, 2]),
         //     ("c2", &vec![14, 15]),
         // );
-        let left = build_large_table("a1", "b1", "c1", 200);
-        let right = build_large_table("a2", "b2", "c2", 500);
+        let left = build_large_table("a1", "b1", "c1", 2000000);
+        let right = build_large_table("a2", "b2", "c2", 5000000);
         let on = vec![(
-            Arc::new(Column::new_with_schema("a1", &left.schema()).unwrap()) as _,
-            Arc::new(Column::new_with_schema("b2", &right.schema()).unwrap()) as _,
+            Arc::new(Column::new_with_schema("a1", &left.schema())?) as _,
+            Arc::new(Column::new_with_schema("b2", &right.schema())?) as _,
         )];
-        let (left_expr, right_expr): (Vec<Arc<dyn PhysicalExpr>>, Vec<Arc<dyn PhysicalExpr>>) = on
+        let (left_expr, right_expr): (
+            Vec<Arc<dyn PhysicalExpr>>,
+            Vec<Arc<dyn PhysicalExpr>>,
+        ) = on
             .iter()
             .map(|(l, r)| (Arc::clone(l), Arc::clone(r)))
             .unzip();
-        let left_repartitioned: Arc<dyn ExecutionPlan> = Arc::new(RepartitionExec::try_new(
-            left,
-            Partitioning::Hash(left_expr, 32),
-        )?);
-        let right_repartitioned: Arc<dyn ExecutionPlan> = Arc::new(RepartitionExec::try_new(
-            right,
-            Partitioning::Hash(right_expr, 32),
-        )?);
+        let left_repartitioned: Arc<dyn ExecutionPlan> = Arc::new(
+            RepartitionExec::try_new(left, Partitioning::Hash(left_expr, 32))?,
+        );
+        let right_repartitioned: Arc<dyn ExecutionPlan> = Arc::new(
+            RepartitionExec::try_new(right, Partitioning::Hash(right_expr, 32))?,
+        );
 
         let runtime = RuntimeEnvBuilder::new()
-            .with_memory_limit(50_000_000_000, 1.0)
+            .with_memory_limit(500_000_000, 1.0)
             .build_arc()?;
         let task_ctx = TaskContext::default().with_runtime(runtime);
         let task_ctx = Arc::new(task_ctx);
@@ -1174,8 +1166,6 @@ mod tests {
         )?;
 
         let partition_count = right_repartitioned.output_partitioning().partition_count();
-        println!("partition_count {partition_count}");
-
         let tasks: Vec<_> = (0..partition_count)
             .map(|i| {
                 let ctx = Arc::clone(&task_ctx);
@@ -1191,8 +1181,10 @@ mod tests {
             v.retain(|b| b.num_rows() > 0);
             batches.extend(v);
         }
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        println!("TOTAL ROWS = {}", total_rows);
 
-        print_batches(&*batches).unwrap();
+        // print_batches(&*batches).unwrap();
         // Asserting that operator-level reservation attempting to overallocate
         // assert_contains!(
         //     err.to_string(),
@@ -1207,26 +1199,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn single_partition_join_overallocation_f() -> Result<()> {
-
-        let left = build_large_table("a1", "b1", "c1", 200);
-        let right = build_large_table("a2", "b2", "c2", 500);
+    async fn simple_hash_join() -> Result<()> {
+        let left = build_large_table("a1", "b1", "c1", 2000000);
+        let right = build_large_table("a2", "b2", "c2", 5000000);
         let on = vec![(
-            Arc::new(Column::new_with_schema("a1", &left.schema()).unwrap()) as _,
-            Arc::new(Column::new_with_schema("b2", &right.schema()).unwrap()) as _,
+            Arc::new(Column::new_with_schema("a1", &left.schema())?) as _,
+            Arc::new(Column::new_with_schema("b2", &right.schema())?) as _,
         )];
-        let (left_expr, right_expr): (Vec<Arc<dyn PhysicalExpr>>, Vec<Arc<dyn PhysicalExpr>>) = on
+        let (left_expr, right_expr): (
+            Vec<Arc<dyn PhysicalExpr>>,
+            Vec<Arc<dyn PhysicalExpr>>,
+        ) = on
             .iter()
             .map(|(l, r)| (Arc::clone(l), Arc::clone(r)))
             .unzip();
-        let left_repartitioned: Arc<dyn ExecutionPlan> = Arc::new(RepartitionExec::try_new(
-            left,
-            Partitioning::Hash(left_expr, 32),
-        )?);
-        let right_repartitioned: Arc<dyn ExecutionPlan> = Arc::new(RepartitionExec::try_new(
-            right,
-            Partitioning::Hash(right_expr, 32),
-        )?);
+        let left_repartitioned: Arc<dyn ExecutionPlan> = Arc::new(
+            RepartitionExec::try_new(left, Partitioning::Hash(left_expr, 32))?,
+        );
+        let right_repartitioned: Arc<dyn ExecutionPlan> = Arc::new(
+            RepartitionExec::try_new(right, Partitioning::Hash(right_expr, 32))?,
+        );
+        let partition_count = left_repartitioned.output_partitioning().partition_count();
 
         let join = HashJoinExec::try_new(
             left_repartitioned,
@@ -1241,7 +1234,7 @@ mod tests {
 
         let task_ctx = Arc::new(TaskContext::default());
         let mut batches = vec![];
-        for i in 0..32 {
+        for i in 0..partition_count {
             let stream = join.execute(i, Arc::clone(&task_ctx))?;
             let more_batches = common::collect(stream).await?;
             batches.extend(
@@ -1251,8 +1244,10 @@ mod tests {
                     .collect::<Vec<_>>(),
             );
         }
-        print_batches(&*batches).unwrap();
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        println!("TOTAL ROWS = {}", total_rows);
+
+        // print_batches(&*batches).unwrap();
         Ok(())
     }
-
 }

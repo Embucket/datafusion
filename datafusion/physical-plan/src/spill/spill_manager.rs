@@ -179,7 +179,7 @@ impl SpillManager {
             ));
         };
         Ok(SpillLocation::Disk(Arc::new(file)))
-        //
+        // //
         // let size = batch.get_sliced_size()?;
         //
         // // Check current memory usage and total limit from the runtime memory pool
@@ -188,9 +188,9 @@ impl SpillManager {
         //     datafusion_execution::memory_pool::MemoryLimit::Finite(l) => l,
         //     _ => usize::MAX,
         // };
-        //
+        // println!("size {size} used {used}");
         // // If there's enough memory (with a small safety margin), keep it in memory
-        // if used + size * 3 / 2 <= limit {
+        // if used + size * 3 * 64 / 2  <= limit {
         //     let buf = Arc::new(InMemorySpillBuffer::from_batch(batch)?);
         //     self.metrics.spilled_bytes.add(size);
         //     self.metrics.spilled_rows.add(batch.num_rows());

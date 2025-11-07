@@ -24,33 +24,24 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use crate::joins::utils::{
-    equal_rows_arr, get_final_indices_from_shared_bitmap, OnceFut,
+use crate::joins::utils::OnceFut;
+use crate::{
+    joins::utils::{BuildProbeJoinMetrics, ColumnIndex, JoinFilter},
+    ExecutionPlan, RecordBatchStream, SendableRecordBatchStream, SpillManager,
 };
-use crate::{handle_state, hash_utils::create_hashes, joins::join_hash_map::JoinHashMapOffset, joins::utils::{
-    adjust_indices_by_join_type, apply_join_filter_to_indices,
-    build_batch_empty_build_side, build_batch_from_indices,
-    need_produce_result_in_final, BuildProbeJoinMetrics, ColumnIndex, JoinFilter,
-    JoinHashMapType, StatefulStreamResult,
-}, ExecutionPlan, RecordBatchStream, SendableRecordBatchStream, SpillManager};
 
-use arrow::array::{ArrayRef, UInt32Array, UInt64Array};
-use arrow::datatypes::{Schema, SchemaRef};
-use arrow::record_batch::RecordBatch;
-use datafusion_common::{
-    internal_datafusion_err, internal_err, JoinSide, JoinType, NullEquality, Result,
-};
-use datafusion_physical_expr::PhysicalExprRef;
-use ahash::RandomState;
-use futures::{ready, FutureExt, Stream, StreamExt};
-use tokio::sync::Mutex;
-use datafusion_execution::TaskContext;
 use crate::empty::EmptyExec;
 use crate::joins::grace_hash_join::exec::PartitionIndex;
 use crate::joins::{HashJoinExec, PartitionMode};
-use crate::memory::MemoryStream;
-use crate::stream::RecordBatchStreamAdapter;
 use crate::test::TestMemoryExec;
+use ahash::RandomState;
+use arrow::datatypes::{Schema, SchemaRef};
+use arrow::record_batch::RecordBatch;
+use datafusion_common::{JoinType, NullEquality, Result};
+use datafusion_execution::TaskContext;
+use datafusion_physical_expr::PhysicalExprRef;
+use futures::{ready, Stream, StreamExt};
+use tokio::sync::Mutex;
 
 enum GraceJoinState {
     /// Waiting for the partitioning phase (Phase 1) to finish
@@ -70,19 +61,6 @@ enum GraceJoinState {
     },
 
     Done,
-}
-
-/// Container for HashJoinStreamState::ProcessProbeBatch related data
-#[derive(Debug, Clone)]
-pub(super) struct ProcessProbeBatchState {
-    /// Current probe-side batch
-    batch: RecordBatch,
-    /// Probe-side on expressions values
-    values: Vec<ArrayRef>,
-    /// Starting offset for JoinHashMap lookups
-    offset: JoinHashMapOffset,
-    /// Max joined probe-side index from current batch
-    joined_probe_idx: Option<usize>,
 }
 
 pub struct GraceHashJoinStream {
@@ -105,10 +83,14 @@ pub struct GraceHashJoinStream {
 pub struct SpillFut {
     partition: usize,
     left: Vec<PartitionIndex>,
-    right: Vec<PartitionIndex>
+    right: Vec<PartitionIndex>,
 }
 impl SpillFut {
-    pub(crate) fn new(partition: usize, left: Vec<PartitionIndex>, right: Vec<PartitionIndex>) -> Self {
+    pub(crate) fn new(
+        partition: usize,
+        left: Vec<PartitionIndex>,
+        right: Vec<PartitionIndex>,
+    ) -> Self {
         SpillFut {
             partition,
             left,
@@ -156,7 +138,10 @@ impl GraceHashJoinStream {
     }
 
     /// Core state machine logic (poll implementation)
-    fn poll_next_impl(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<RecordBatch>>> {
+    fn poll_next_impl(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<RecordBatch>>> {
         loop {
             match &mut self.state {
                 GraceJoinState::WaitPartitioning => {
@@ -165,6 +150,7 @@ impl GraceHashJoinStream {
                     let acc = Arc::clone(&self.accumulator);
                     let left = shared.left.clone();
                     let right = shared.right.clone();
+                    // Use 0 partition as the main
                     let wait_all_fut = if shared.partition == 0 {
                         OnceFut::new(async move {
                             acc.report_partition(shared.partition, left, right).await;
@@ -178,7 +164,9 @@ impl GraceHashJoinStream {
                             Ok(vec![])
                         })
                     };
-                    self.state = GraceJoinState::WaitAllPartitions { wait_all_fut: Some(wait_all_fut) };
+                    self.state = GraceJoinState::WaitAllPartitions {
+                        wait_all_fut: Some(wait_all_fut),
+                    };
                     continue;
                 }
                 GraceJoinState::WaitAllPartitions { wait_all_fut } => {
@@ -215,12 +203,21 @@ impl GraceHashJoinStream {
                     if current_stream.is_none() {
                         if left_fut.is_none() && right_fut.is_none() {
                             let spill_fut = &all_parts[*current];
-                            *left_fut = Some(load_partition_async(Arc::clone(&self.spill_left), spill_fut.left.clone()));
-                            *right_fut = Some(load_partition_async(Arc::clone(&self.spill_right), spill_fut.right.clone()));
+                            *left_fut = Some(load_partition_async(
+                                Arc::clone(&self.spill_left),
+                                spill_fut.left.clone(),
+                            ));
+                            *right_fut = Some(load_partition_async(
+                                Arc::clone(&self.spill_right),
+                                spill_fut.right.clone(),
+                            ));
                         }
 
-                        let left_batches = (*ready!(left_fut.as_mut().unwrap().get_shared(cx))?).clone();
-                        let right_batches = (*ready!(right_fut.as_mut().unwrap().get_shared(cx))?).clone();
+                        let left_batches =
+                            (*ready!(left_fut.as_mut().unwrap().get_shared(cx))?).clone();
+                        let right_batches =
+                            (*ready!(right_fut.as_mut().unwrap().get_shared(cx))?)
+                                .clone();
 
                         let stream = build_in_memory_join_stream(
                             Arc::clone(&self.schema),
@@ -265,7 +262,7 @@ fn load_partition_async(
 ) -> OnceFut<Vec<RecordBatch>> {
     OnceFut::new(async move {
         let mut all_batches = Vec::new();
-        println!("partitions {:?}", partitions);
+
         for p in partitions {
             for chunk in p.chunks {
                 let mut reader = spill_manager.load_spilled_batch(&chunk)?;
@@ -299,18 +296,21 @@ fn build_in_memory_join_stream(
     let left_schema = left_batches
         .first()
         .map(|b| b.schema())
-        .unwrap_or_else(|| Arc::new(arrow_schema::Schema::empty()));
+        .unwrap_or_else(|| Arc::new(Schema::empty()));
 
     let right_schema = right_batches
         .first()
         .map(|b| b.schema())
-        .unwrap_or_else(|| Arc::new(arrow_schema::Schema::empty()));
+        .unwrap_or_else(|| Arc::new(Schema::empty()));
 
     // Build memory execution nodes for each side
     let left_plan: Arc<dyn ExecutionPlan> =
         Arc::new(TestMemoryExec::try_new(&[left_batches], left_schema, None)?);
-    let right_plan: Arc<dyn ExecutionPlan> =
-        Arc::new(TestMemoryExec::try_new(&[right_batches], right_schema, None)?);
+    let right_plan: Arc<dyn ExecutionPlan> = Arc::new(TestMemoryExec::try_new(
+        &[right_batches],
+        right_schema,
+        None,
+    )?);
 
     // Combine join expressions into pairs
     let on: Vec<(PhysicalExprRef, PhysicalExprRef)> = on_left
@@ -380,9 +380,7 @@ impl GraceAccumulator {
         }
     }
 
-    pub async fn wait_all(
-        &self,
-    ) -> Vec<SpillFut> {
+    pub async fn wait_all(&self) -> Vec<SpillFut> {
         loop {
             {
                 let guard = self.collected.lock().await;
