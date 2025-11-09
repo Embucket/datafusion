@@ -112,6 +112,17 @@ fn max_partitions_allowed_for_memory(memory_threshold: usize) -> usize {
     highest_power_of_two_leq(slots)
 }
 
+fn per_partition_budget_bytes(memory_threshold: usize, partitions: usize) -> usize {
+    let partitions = partitions.max(1);
+    let mut budget = memory_threshold
+        .checked_div(partitions)
+        .unwrap_or(memory_threshold);
+    if budget == 0 {
+        budget = HYBRID_HASH_MIN_PARTITION_BYTES;
+    }
+    budget.max(HYBRID_HASH_MIN_PARTITION_BYTES)
+}
+
 #[inline]
 fn hhj_debug<F: FnOnce() -> String>(builder: F) {
     if std::env::var("DATAFUSION_HHJ_DEBUG").is_ok() {
@@ -201,6 +212,7 @@ impl ProbePartition {
 }
 
 /// Runtime state tracked per probe partition.
+#[cfg(not(feature = "hybrid_hash_join_scheduler"))]
 #[cfg(not(feature = "hybrid_hash_join_scheduler"))]
 pub(super) struct ProbePartitionState {
     buffered: ProbePartition,
@@ -383,6 +395,8 @@ pub(super) struct PartitionedHashJoinStream {
     pub memory_reservation: MemoryReservation,
     /// Tracks how many repartition passes have been attempted
     pub partition_pass: usize,
+    /// Indicates whether the current pass has already prepared partitions for output
+    pub partition_pass_output_started: bool,
     /// Runtime environment
     pub runtime_env: Arc<RuntimeEnv>,
     /// Scratch space for computing hashes
@@ -609,14 +623,8 @@ impl PartitionedHashJoinStream {
             return None;
         }
 
-        let mut per_partition_budget = self
-            .memory_threshold
-            .checked_div(self.max_partition_count.max(1))
-            .unwrap_or(self.memory_threshold);
-        if per_partition_budget == 0 {
-            per_partition_budget = HYBRID_HASH_MIN_PARTITION_BYTES;
-        }
-        per_partition_budget = per_partition_budget.max(HYBRID_HASH_MIN_PARTITION_BYTES);
+        let mut per_partition_budget =
+            per_partition_budget_bytes(self.memory_threshold, self.num_partitions);
 
         let rows_budget = self
             .batch_size
@@ -1229,9 +1237,6 @@ impl PartitionedHashJoinStream {
                 Poll::Ready(None) => {
                     self.probe_stream_finished = true;
                     for part_id in 0..self.num_partitions {
-                        if let Some(state) = self.probe_states.get_mut(part_id) {
-                            state.batch_position = 0;
-                        }
                         self.finalize_spilled_partition(part_id)?;
                     }
                     return Poll::Ready(Ok(()));
@@ -1767,6 +1772,7 @@ impl PartitionedHashJoinStream {
             build_spill_manager,
             memory_reservation,
             partition_pass: 0,
+            partition_pass_output_started: false,
             runtime_env,
             hashes_buffer: Vec::new(),
             right_side_ordered,
@@ -1840,7 +1846,7 @@ impl PartitionedHashJoinStream {
             self.max_partition_count = 1;
         }
 
-        let mut allow_repartition = true;
+        let mut allow_repartition = !self.partition_pass_output_started;
         loop {
             hhj_debug(|| {
                 format!(
@@ -1883,6 +1889,7 @@ impl PartitionedHashJoinStream {
 
                     self.num_partitions = next_count;
                     self.partition_pass += 1;
+                    self.partition_pass_output_started = false;
                     allow_repartition = true;
                 }
             }
@@ -1966,13 +1973,6 @@ impl PartitionedHashJoinStream {
                                         repartition_request = Some(next_count);
                                         break;
                                     }
-                                } else {
-                                    hhj_debug(|| {
-                                        format!(
-                                            "partition {} exceeded global mem but bytes={} under per-part budget; skipping repartition",
-                                            build_index, partition_estimate
-                                        )
-                                    });
                                 }
                             }
                             if !self.runtime_env.disk_manager.tmp_files_enabled() {
@@ -1998,13 +1998,6 @@ impl PartitionedHashJoinStream {
                                     repartition_request = Some(next_count);
                                     break;
                                 }
-                            } else {
-                                hhj_debug(|| {
-                                    format!(
-                                        "allocation failure for partition {} but bytes={} under per-part budget; spilling without repartition",
-                                        build_index, partition_estimate
-                                    )
-                                });
                             }
                         }
                         if !self.runtime_env.disk_manager.tmp_files_enabled() {
@@ -2150,19 +2143,11 @@ impl PartitionedHashJoinStream {
             });
         }
 
-        if (max_spilled_bytes > self.memory_threshold || any_spilled) && allow_repartition
+        if allow_repartition
+            && (max_spilled_bytes > self.memory_threshold || any_spilled)
+            && self.repartition_worthwhile(max_spilled_bytes)
         {
-            if !self.repartition_worthwhile(max_spilled_bytes) {
-                hhj_debug(|| {
-                    format!(
-                        "spilled partitions already near budget (max_spilled_bytes={} bytes, memory_threshold={} partitions={}, budget≈{})",
-                        max_spilled_bytes,
-                        self.memory_threshold,
-                        self.num_partitions,
-                        (self.memory_threshold / self.num_partitions.max(1)).max(1)
-                    )
-                });
-            } else if let Some(next_count) = self.next_partition_count() {
+            if let Some(next_count) = self.next_partition_count() {
                 hhj_debug(|| {
                     format!(
                         "try_partition_build_side repartition due to spill (max_spilled_bytes={} threshold={} any_spilled={}) next_count={}",
@@ -2173,14 +2158,11 @@ impl PartitionedHashJoinStream {
                     )
                 });
                 return Ok(PartitionBuildStatus::NeedMorePartitions { next_count });
-            } else {
-                hhj_debug(|| {
-                    "spill detected but no further repartition possible".to_string()
-                });
             }
         }
 
         self.prepare_partition_queue();
+        self.partition_pass_output_started = true;
         self.transition_to_next_partition();
 
         Ok(PartitionBuildStatus::Ready(StatefulStreamResult::Continue))
@@ -2293,6 +2275,11 @@ impl PartitionedHashJoinStream {
                 state.active_values = values;
                 state.active_hashes = hashes;
                 state.active_offset = (0, None);
+                if state.batch_position >= state.buffered.batches.len() {
+                    state.buffered = ProbePartition::new();
+                    state.batch_position = 0;
+                    state.buffered_rows = 0;
+                }
                 if let Some(b) = state.active_batch.as_ref() {
                     state.consumed_rows =
                         state.consumed_rows.saturating_add(b.num_rows());
