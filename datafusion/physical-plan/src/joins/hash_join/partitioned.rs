@@ -623,7 +623,7 @@ impl PartitionedHashJoinStream {
             return None;
         }
 
-        let mut per_partition_budget =
+        let per_partition_budget =
             per_partition_budget_bytes(self.memory_threshold, self.num_partitions);
 
         let rows_budget = self
@@ -3872,10 +3872,16 @@ mod scheduler_tests {
         let reservation = MemoryConsumer::new("left")
             .with_can_spill(true)
             .register(&runtime_env.memory_pool);
+        let arc_batches = Arc::new(vec![batch.clone()]);
+        let total_rows = arc_batches.iter().map(|b| b.num_rows()).sum();
+        let total_input_size =
+            arc_batches.iter().map(|b| b.get_array_memory_size()).sum();
         JoinLeftData::new(
             hash_map,
-            batch.clone(),
-            Arc::new(vec![batch]),
+            batch,
+            OriginalBuildInput::InMemory(Arc::clone(&arc_batches)),
+            total_rows,
+            total_input_size,
             vec![],
             Mutex::new(BooleanBufferBuilder::new(0)),
             AtomicUsize::new(0),
