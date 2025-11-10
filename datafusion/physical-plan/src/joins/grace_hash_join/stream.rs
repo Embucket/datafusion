@@ -34,7 +34,6 @@ use crate::empty::EmptyExec;
 use crate::joins::grace_hash_join::exec::PartitionIndex;
 use crate::joins::{HashJoinExec, PartitionMode};
 use crate::test::TestMemoryExec;
-use ahash::RandomState;
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use datafusion_common::{JoinType, NullEquality, Result};
@@ -70,7 +69,8 @@ pub struct GraceHashJoinStream {
     spill_right: Arc<SpillManager>,
     on_left: Vec<PhysicalExprRef>,
     on_right: Vec<PhysicalExprRef>,
-    random_state: RandomState,
+    projection: Option<Vec<usize>>,
+    filter: Option<JoinFilter>,
     join_type: JoinType,
     column_indices: Vec<ColumnIndex>,
     join_metrics: Arc<BuildProbeJoinMetrics>,
@@ -113,7 +113,8 @@ impl GraceHashJoinStream {
         spill_right: Arc<SpillManager>,
         on_left: Vec<PhysicalExprRef>,
         on_right: Vec<PhysicalExprRef>,
-        random_state: RandomState,
+        projection: Option<Vec<usize>>,
+        filter: Option<JoinFilter>,
         join_type: JoinType,
         column_indices: Vec<ColumnIndex>,
         join_metrics: Arc<BuildProbeJoinMetrics>,
@@ -127,7 +128,8 @@ impl GraceHashJoinStream {
             spill_right,
             on_left,
             on_right,
-            random_state,
+            projection,
+            filter,
             join_type,
             column_indices,
             join_metrics,
@@ -225,7 +227,8 @@ impl GraceHashJoinStream {
                             right_batches,
                             &self.on_left,
                             &self.on_right,
-                            self.random_state.clone(),
+                            self.projection.clone(),
+                            self.filter.clone(),
                             self.join_type,
                             &self.column_indices,
                             &self.join_metrics,
@@ -283,10 +286,11 @@ fn build_in_memory_join_stream(
     right_batches: Vec<RecordBatch>,
     on_left: &[PhysicalExprRef],
     on_right: &[PhysicalExprRef],
-    random_state: RandomState,
+    projection: Option<Vec<usize>>,
+    filter: Option<JoinFilter>,
     join_type: JoinType,
-    column_indices: &[ColumnIndex],
-    join_metrics: &BuildProbeJoinMetrics,
+    _column_indices: &[ColumnIndex],
+    _join_metrics: &BuildProbeJoinMetrics,
     context: &Arc<TaskContext>,
 ) -> Result<SendableRecordBatchStream> {
     if left_batches.is_empty() && right_batches.is_empty() {
@@ -324,9 +328,9 @@ fn build_in_memory_join_stream(
         left_plan,
         right_plan,
         on,
-        None::<JoinFilter>,
+        filter,
         &join_type,
-        None,
+        projection,
         PartitionMode::CollectLeft,
         NullEquality::NullEqualsNothing,
     )?;

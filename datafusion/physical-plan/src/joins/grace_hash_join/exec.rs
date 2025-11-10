@@ -684,7 +684,8 @@ impl ExecutionPlan for GraceHashJoinExec {
             spill_right,
             on_left,
             on_right,
-            self.random_state.clone(),
+            self.projection.clone(),
+            self.filter.clone(),
             self.join_type,
             column_indices_after_projection,
             join_metrics,
@@ -854,24 +855,8 @@ impl ExecutionPlan for GraceHashJoinExec {
     }
 }
 
-/// Accumulator for collecting min/max bounds from build-side data during hash join.
-///
-/// This struct encapsulates the logic for progressively computing column bounds
-/// (minimum and maximum values) for a specific join key expression as batches
-/// are processed during the build phase of a hash join.
-///
-/// The bounds are used for dynamic filter pushdown optimization, where filters
-/// based on the actual data ranges can be pushed down to the probe side to
-/// eliminate unnecessary data early.
-struct CollectLeftAccumulator {
-    /// The physical expression to evaluate for each batch
-    expr: Arc<dyn PhysicalExpr>,
-    /// Accumulator for tracking the minimum value across all batches
-    min: MinAccumulator,
-    /// Accumulator for tracking the maximum value across all batches
-    max: MaxAccumulator,
-}
 
+#[allow(clippy::too_many_arguments)]
 pub async fn partition_and_spill(
     random_state: RandomState,
     on: Vec<(PhysicalExprRef, PhysicalExprRef)>,
@@ -915,6 +900,7 @@ pub async fn partition_and_spill(
     Ok((left_index, right_index))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn partition_and_spill_one_side(
     input: &mut SendableRecordBatchStream,
     on_exprs: &[PhysicalExprRef],

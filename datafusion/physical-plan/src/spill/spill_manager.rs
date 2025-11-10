@@ -173,37 +173,37 @@ impl SpillManager {
     /// Automatically decides whether to spill the given RecordBatch to memory or disk,
     /// depending on available memory pool capacity.
     pub(crate) fn spill_batch_auto(&self, batch: &RecordBatch, request_msg: &str) -> Result<SpillLocation> {
-        let Some(file) = self.spill_record_batch_and_finish(slice::from_ref(batch), request_msg)? else {
-            return Err(DataFusionError::Execution(
-                "failed to spill batch to disk".into(),
-            ));
-        };
-        Ok(SpillLocation::Disk(Arc::new(file)))
-        // //
-        // let size = batch.get_sliced_size()?;
-        //
-        // // Check current memory usage and total limit from the runtime memory pool
-        // let used = self.env.memory_pool.reserved();
-        // let limit = match self.env.memory_pool.memory_limit() {
-        //     datafusion_execution::memory_pool::MemoryLimit::Finite(l) => l,
-        //     _ => usize::MAX,
+        // let Some(file) = self.spill_record_batch_and_finish(slice::from_ref(batch), request_msg)? else {
+        //     return Err(DataFusionError::Execution(
+        //         "failed to spill batch to disk".into(),
+        //     ));
         // };
-        // println!("size {size} used {used}");
-        // // If there's enough memory (with a small safety margin), keep it in memory
-        // if used + size * 3 * 64 / 2  <= limit {
-        //     let buf = Arc::new(InMemorySpillBuffer::from_batch(batch)?);
-        //     self.metrics.spilled_bytes.add(size);
-        //     self.metrics.spilled_rows.add(batch.num_rows());
-        //     Ok(SpillLocation::Memory(buf))
-        // } else {
-        //     // Otherwise spill to disk using the existing SpillManager logic
-        //     let Some(file) = self.spill_record_batch_and_finish(slice::from_ref(batch), request_msg)? else {
-        //         return Err(DataFusionError::Execution(
-        //             "failed to spill batch to disk".into(),
-        //         ));
-        //     };
-        //     Ok(SpillLocation::Disk(Arc::new(file)))
-        // }
+        // Ok(SpillLocation::Disk(Arc::new(file)))
+        // //
+        let size = batch.get_sliced_size()?;
+
+        // Check current memory usage and total limit from the runtime memory pool
+        let used = self.env.memory_pool.reserved();
+        let limit = match self.env.memory_pool.memory_limit() {
+            datafusion_execution::memory_pool::MemoryLimit::Finite(l) => l,
+            _ => usize::MAX,
+        };
+
+        // If there's enough memory (with a safety margin), keep it in memory
+        if used + size * 3 / 2  <= limit {
+            let buf = Arc::new(InMemorySpillBuffer::from_batch(batch)?);
+            self.metrics.spilled_bytes.add(size);
+            self.metrics.spilled_rows.add(batch.num_rows());
+            Ok(SpillLocation::Memory(buf))
+        } else {
+            // Otherwise spill to disk using the existing SpillManager logic
+            let Some(file) = self.spill_record_batch_and_finish(slice::from_ref(batch), request_msg)? else {
+                return Err(DataFusionError::Execution(
+                    "failed to spill batch to disk".into(),
+                ));
+            };
+            Ok(SpillLocation::Disk(Arc::new(file)))
+        }
     }
 
     pub fn spill_batches_auto(
