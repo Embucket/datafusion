@@ -182,6 +182,18 @@ impl SpillManager {
 
         Ok(spawn_buffered(stream, self.batch_read_buffer_capacity))
     }
+
+    pub fn read_spill_as_stream_shared(
+        &self,
+        spill_file_path: Arc<RefCountedTempFile>,
+    ) -> Result<SendableRecordBatchStream> {
+        let stream = Box::pin(cooperative(SpillReaderStream::new_from_shared(
+            Arc::clone(&self.schema),
+            spill_file_path,
+        )));
+
+        Ok(spawn_buffered(stream, self.batch_read_buffer_capacity))
+    }
 }
 
 pub(crate) trait GetSlicedSize {

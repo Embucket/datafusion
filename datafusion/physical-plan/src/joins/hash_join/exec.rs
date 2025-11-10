@@ -41,7 +41,7 @@ use crate::projection::{
     try_embed_projection, try_pushdown_through_join, EmbeddedProjection, JoinData,
     ProjectionExec,
 };
-use crate::spill::get_record_batch_memory_size;
+use crate::spill::{get_record_batch_memory_size, spill_manager::SpillManager};
 use crate::ExecutionPlanProperties;
 use crate::{
     common::can_project,
@@ -66,6 +66,7 @@ use datafusion_common::utils::memory::estimate_memory_size;
 use datafusion_common::{
     internal_err, plan_err, project_schema, JoinSide, JoinType, NullEquality, Result,
 };
+use datafusion_execution::disk_manager::RefCountedTempFile;
 use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion_execution::TaskContext;
 use datafusion_expr::Accumulator;
@@ -78,7 +79,7 @@ use datafusion_physical_expr::{PhysicalExpr, PhysicalExprRef};
 
 use ahash::RandomState;
 use datafusion_physical_expr_common::physical_expr::fmt_sql;
-use futures::TryStreamExt;
+use futures::{executor::block_on, StreamExt, TryStreamExt};
 use parking_lot::Mutex;
 
 /// Hard-coded seed to ensure hash values from the hash join differ from `RepartitionExec`, avoiding collisions.
@@ -100,10 +101,14 @@ const HYBRID_HASH_MIN_ROWS_PER_PARTITION: usize = 1_024;
 pub(super) struct JoinLeftData {
     /// The hash table with indices into `batch`
     pub(super) hash_map: Box<dyn JoinHashMapType>,
-    /// The input rows for the build side
+    /// The input rows for the build side (may be empty when spilled)
     batch: RecordBatch,
-    /// Original build-side batches before concatenation
-    original_batches: Arc<Vec<RecordBatch>>,
+    /// Build-side input backing storage
+    original_input: OriginalBuildInput,
+    /// Total rows collected from the build side
+    total_rows: usize,
+    /// Estimated bytes for the original build input
+    total_input_size: usize,
     /// The build side on expressions values
     values: Vec<ArrayRef>,
     /// Shared bitmap builder for visited left indices
@@ -120,6 +125,14 @@ pub(super) struct JoinLeftData {
     pub(super) bounds: Option<Vec<ColumnBounds>>,
 }
 
+enum OriginalBuildInput {
+    InMemory(Arc<Vec<RecordBatch>>),
+    Spilled {
+        spill_manager: Arc<SpillManager>,
+        spill_file: Arc<RefCountedTempFile>,
+    },
+}
+
 impl JoinLeftData {
     /// Create a new `JoinLeftData` from its parts
     pub(super) fn new(
@@ -132,10 +145,17 @@ impl JoinLeftData {
         reservation: MemoryReservation,
         bounds: Option<Vec<ColumnBounds>>,
     ) -> Self {
+        let total_rows = original_batches.iter().map(|b| b.num_rows()).sum();
+        let total_input_size = original_batches
+            .iter()
+            .map(|batch| batch.get_array_memory_size())
+            .sum();
         Self {
             hash_map,
             batch,
-            original_batches,
+            original_input: OriginalBuildInput::InMemory(original_batches),
+            total_rows,
+            total_input_size,
             values,
             visited_indices_bitmap,
             probe_threads_counter,
@@ -154,8 +174,12 @@ impl JoinLeftData {
         &self.batch
     }
 
-    pub(super) fn original_batches(&self) -> &[RecordBatch] {
-        &self.original_batches
+    pub(super) fn total_rows(&self) -> usize {
+        self.total_rows
+    }
+
+    pub(super) fn total_input_size(&self) -> usize {
+        self.total_input_size
     }
 
     /// returns a reference to the build side expressions values
@@ -172,6 +196,37 @@ impl JoinLeftData {
     /// if caller is the last running thread
     pub(super) fn report_probe_completed(&self) -> bool {
         self.probe_threads_counter.fetch_sub(1, Ordering::Relaxed) == 1
+    }
+
+    pub(super) fn for_each_original_batch<F>(&self, mut f: F) -> Result<()>
+    where
+        F: FnMut(RecordBatch) -> Result<bool>,
+    {
+        match &self.original_input {
+            OriginalBuildInput::InMemory(batches) => {
+                for batch in batches.iter() {
+                    if !f(batch.clone())? {
+                        break;
+                    }
+                }
+                Ok(())
+            }
+            OriginalBuildInput::Spilled {
+                spill_manager,
+                spill_file,
+            } => {
+                let mut stream =
+                    spill_manager.read_spill_as_stream_shared(Arc::clone(spill_file))?;
+                block_on(async {
+                    while let Some(batch) = stream.next().await.transpose()? {
+                        if !f(batch)? {
+                            break;
+                        }
+                    }
+                    Ok(())
+                })
+            }
+        }
     }
 }
 
@@ -1742,7 +1797,6 @@ async fn collect_left_input(
         bounds_accumulators,
     } = state;
     let batches_arc = Arc::new(batches);
-
     // Estimation of memory size, required for hashtable, prior to allocation.
     // Final result can be verified using `RawTable.allocation_info()`
     let fixed_size_u32 = size_of::<JoinHashMapU32>();
@@ -1824,7 +1878,7 @@ async fn collect_left_input(
         hashmap,
         single_batch,
         Arc::clone(&batches_arc),
-        left_values.clone(),
+        left_values,
         Mutex::new(visited_indices_bitmap),
         AtomicUsize::new(probe_threads_count),
         reservation,
