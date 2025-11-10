@@ -123,6 +123,21 @@ fn per_partition_budget_bytes(memory_threshold: usize, partitions: usize) -> usi
     budget.max(HYBRID_HASH_MIN_PARTITION_BYTES)
 }
 
+fn estimate_probe_buffer_bytes(
+    batch: &RecordBatch,
+    values: &[ArrayRef],
+    hashes: &[u64],
+) -> usize {
+    let batch_bytes = batch.get_array_memory_size();
+    let values_bytes = values.iter().fold(0usize, |acc, arr| {
+        acc.saturating_add(arr.get_array_memory_size())
+    });
+    let hashes_bytes = hashes.len().saturating_mul(size_of::<u64>());
+    batch_bytes
+        .saturating_add(values_bytes)
+        .saturating_add(hashes_bytes)
+}
+
 #[inline]
 fn hhj_debug<F: FnOnce() -> String>(builder: F) {
     if std::env::var("DATAFUSION_HHJ_DEBUG").is_ok() {
@@ -218,6 +233,7 @@ pub(super) struct ProbePartitionState {
     buffered: ProbePartition,
     batch_position: usize,
     buffered_rows: usize,
+    buffered_bytes: usize,
     spilled_rows: usize,
     consumed_rows: usize,
     spill_in_progress: Option<InProgressSpillFile>,
@@ -237,6 +253,7 @@ impl ProbePartitionState {
             buffered: ProbePartition::new(),
             batch_position: 0,
             buffered_rows: 0,
+            buffered_bytes: 0,
             spilled_rows: 0,
             consumed_rows: 0,
             spill_in_progress: None,
@@ -601,6 +618,71 @@ impl PartitionedHashJoinStream {
         Ok(false)
     }
 
+    fn flush_probe_buffer_to_spill(&mut self, part_id: usize) -> Result<()> {
+        if !self.runtime_env.disk_manager.tmp_files_enabled() {
+            return Err(internal_datafusion_err!(
+                "Insufficient memory for buffering probe partitions and spilling is disabled"
+            ));
+        }
+        if part_id >= self.probe_states.len() {
+            return Ok(());
+        }
+
+        let (buffered, queue_ready, stream_active, mut writer_opt) = {
+            let state = self
+                .probe_states
+                .get_mut(part_id)
+                .ok_or_else(|| internal_datafusion_err!("missing probe partition"))?;
+            if state.buffered.batches.is_empty() {
+                state.buffered_bytes = 0;
+                return Ok(());
+            }
+            let queue_ready = !state.spill_files.is_empty();
+            let stream_active = state.pending_stream.is_some();
+            let buffered = mem::replace(&mut state.buffered, ProbePartition::new());
+            state.buffered_rows = 0;
+            state.buffered_bytes = 0;
+            state.batch_position = 0;
+            let writer_opt = state.spill_in_progress.take();
+            (buffered, queue_ready, stream_active, writer_opt)
+        };
+
+        if writer_opt.is_none() {
+            writer_opt = Some(
+                self.probe_spill_manager
+                    .create_in_progress_file("hash_join_probe_partition")?,
+            );
+            self.join_metrics.probe_spill_count.add(1);
+        }
+
+        let mut writer = writer_opt.ok_or_else(|| {
+            internal_datafusion_err!("expected probe spill writer for partition")
+        })?;
+
+        let mut spilled_rows = 0usize;
+        for batch in buffered.batches {
+            let batch_size = batch.get_array_memory_size();
+            writer.append_batch(&batch)?;
+            self.join_metrics.probe_spilled_rows.add(batch.num_rows());
+            self.join_metrics.probe_spilled_bytes.add(batch_size);
+            spilled_rows = spilled_rows.saturating_add(batch.num_rows());
+        }
+
+        {
+            let state = self
+                .probe_states
+                .get_mut(part_id)
+                .ok_or_else(|| internal_datafusion_err!("missing probe partition"))?;
+            state.spill_in_progress = Some(writer);
+            state.spilled_rows = state.spilled_rows.saturating_add(spilled_rows);
+        }
+
+        if !queue_ready && !stream_active {
+            self.finalize_spilled_partition(part_id)?;
+        }
+        Ok(())
+    }
+
     fn compute_recursive_fanout(
         &self,
         descriptor: &PartitionDescriptor,
@@ -942,6 +1024,8 @@ impl PartitionedHashJoinStream {
 
         let shift_bits = descriptor.radix_bits;
         let mask = (fanout - 1) as u64;
+        let probe_partition_budget =
+            per_partition_budget_bytes(self.memory_threshold, self.num_partitions);
 
         let spill_file = {
             let state = self
@@ -950,6 +1034,7 @@ impl PartitionedHashJoinStream {
                 .ok_or_else(|| internal_datafusion_err!("missing probe partition"))?;
             state.batch_position = 0;
             state.buffered_rows = 0;
+            state.buffered_bytes = 0;
             state.spilled_rows = 0;
             state.consumed_rows = 0;
             state.active_batch = None;
@@ -1036,6 +1121,7 @@ impl PartitionedHashJoinStream {
                 state.spill_files.push_back(file);
                 state.spilled_rows = 0;
                 state.buffered_rows = 0;
+                state.buffered_bytes = 0;
                 state.consumed_rows = 0;
                 state.batch_position = 0;
                 state.pending_stream = None;
@@ -1054,6 +1140,8 @@ impl PartitionedHashJoinStream {
                 .probe_states
                 .get_mut(parent_index)
                 .ok_or_else(|| internal_datafusion_err!("missing probe partition"))?;
+            state.buffered_bytes = 0;
+            state.batch_position = 0;
             mem::replace(&mut state.buffered, ProbePartition::new())
         };
         for idx in 0..parent_partition.batches.len() {
@@ -1095,20 +1183,30 @@ impl PartitionedHashJoinStream {
                 }
 
                 let idx = partition_indices[sub_idx];
-                let state = self
-                    .probe_states
-                    .get_mut(idx)
-                    .ok_or_else(|| internal_datafusion_err!("missing probe partition"))?;
-                state.buffered.batches.push(filtered_batch);
-                state.buffered.values.push(filtered_values);
-                state.buffered.hashes.push(filtered_hashes);
-                let buffered = state
-                    .buffered
-                    .batches
-                    .last()
-                    .map(|b| b.num_rows())
-                    .unwrap_or_default();
-                state.buffered_rows = state.buffered_rows.saturating_add(buffered);
+                let row_count = filtered_batch.num_rows();
+                let buffered_bytes_delta = estimate_probe_buffer_bytes(
+                    &filtered_batch,
+                    &filtered_values,
+                    &filtered_hashes,
+                );
+                let mut should_flush = false;
+                {
+                    let state = self.probe_states.get_mut(idx).ok_or_else(|| {
+                        internal_datafusion_err!("missing probe partition")
+                    })?;
+                    state.buffered.batches.push(filtered_batch);
+                    state.buffered.values.push(filtered_values);
+                    state.buffered.hashes.push(filtered_hashes);
+                    state.buffered_rows = state.buffered_rows.saturating_add(row_count);
+                    state.buffered_bytes =
+                        state.buffered_bytes.saturating_add(buffered_bytes_delta);
+                    if state.buffered_bytes >= probe_partition_budget {
+                        should_flush = true;
+                    }
+                }
+                if should_flush {
+                    self.flush_probe_buffer_to_spill(idx)?;
+                }
             }
         }
 
@@ -1119,6 +1217,8 @@ impl PartitionedHashJoinStream {
         if self.probe_states.len() != self.num_partitions {
             self.resize_partition_vectors();
         }
+        let probe_partition_budget =
+            per_partition_budget_bytes(self.memory_threshold, self.num_partitions);
 
         loop {
             match self.right.poll_next_unpin(cx) {
@@ -1217,16 +1317,36 @@ impl PartitionedHashJoinStream {
                                 self.finalize_spilled_partition(part_id)?;
                             }
                         } else {
-                            let state =
-                                self.probe_states.get_mut(part_id).ok_or_else(|| {
-                                    internal_datafusion_err!("missing probe partition")
-                                })?;
-                            state.buffered.batches.push(filtered_batch);
-                            state.buffered.values.push(filtered_on_values);
-                            state.buffered.hashes.push(filtered_hashes);
-                            if let Some(last) = state.buffered.batches.last() {
+                            let row_count = filtered_batch.num_rows();
+                            let buffered_bytes_delta = estimate_probe_buffer_bytes(
+                                &filtered_batch,
+                                &filtered_on_values,
+                                &filtered_hashes,
+                            );
+                            let mut should_flush = false;
+                            {
+                                let state = self
+                                    .probe_states
+                                    .get_mut(part_id)
+                                    .ok_or_else(|| {
+                                        internal_datafusion_err!(
+                                            "missing probe partition"
+                                        )
+                                    })?;
+                                state.buffered.batches.push(filtered_batch);
+                                state.buffered.values.push(filtered_on_values);
+                                state.buffered.hashes.push(filtered_hashes);
                                 state.buffered_rows =
-                                    state.buffered_rows.saturating_add(last.num_rows());
+                                    state.buffered_rows.saturating_add(row_count);
+                                state.buffered_bytes = state
+                                    .buffered_bytes
+                                    .saturating_add(buffered_bytes_delta);
+                                if state.buffered_bytes >= probe_partition_budget {
+                                    should_flush = true;
+                                }
+                            }
+                            if should_flush {
+                                self.flush_probe_buffer_to_spill(part_id)?;
                             }
                         }
                     }
@@ -2273,6 +2393,7 @@ impl PartitionedHashJoinStream {
                     state.buffered = ProbePartition::new();
                     state.batch_position = 0;
                     state.buffered_rows = 0;
+                    state.buffered_bytes = 0;
                 }
                 if let Some(b) = state.active_batch.as_ref() {
                     state.consumed_rows =
