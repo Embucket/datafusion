@@ -17,6 +17,7 @@
 
 //! Defines the spilling functions
 
+pub(crate) mod in_memory_spill_buffer;
 pub(crate) mod in_progress_spill_file;
 pub(crate) mod spill_manager;
 
@@ -382,16 +383,17 @@ mod tests {
     use crate::common::collect;
     use crate::metrics::ExecutionPlanMetricsSet;
     use crate::metrics::SpillMetrics;
-    use crate::spill::spill_manager::SpillManager;
+    use crate::spill::spill_manager::{SpillLocation, SpillManager};
     use crate::test::build_table_i32;
     use arrow::array::{ArrayRef, Float64Array, Int32Array, ListArray, StringArray};
     use arrow::compute::cast;
     use arrow::datatypes::{DataType, Field, Int32Type, Schema};
     use arrow::record_batch::RecordBatch;
     use datafusion_common::Result;
-    use datafusion_execution::runtime_env::RuntimeEnv;
+    use datafusion_execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
     use futures::StreamExt as _;
 
+    use datafusion_execution::memory_pool::{FairSpillPool, MemoryPool};
     use std::sync::Arc;
 
     #[tokio::test]
@@ -428,6 +430,71 @@ mod tests {
 
         let batches = collect(stream).await?;
         assert_eq!(batches.len(), 2);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_batch_spill_to_memory_and_disk_and_read() -> Result<()> {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]));
+
+        let batch1 = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..1000)),
+                Arc::new(Int32Array::from_iter_values(1000..2000)),
+            ],
+        )?;
+
+        let batch2 = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from_iter_values(2000..4000)),
+                Arc::new(Int32Array::from_iter_values(4000..6000)),
+            ],
+        )?;
+
+        let num_rows = batch1.num_rows() + batch2.num_rows();
+        let batches = vec![batch1, batch2];
+
+        // --- create small memory pool (simulate memory pressure) ---
+        let memory_limit_bytes = 20 * 1024; // 20KB
+        let memory_pool: Arc<dyn MemoryPool> =
+            Arc::new(FairSpillPool::new(memory_limit_bytes));
+
+        // Construct SpillManager
+        let env = RuntimeEnvBuilder::new()
+            .with_memory_pool(memory_pool)
+            .build_arc()?;
+        let metrics = SpillMetrics::new(&ExecutionPlanMetricsSet::new(), 0);
+        let spill_manager = SpillManager::new(env, metrics, Arc::clone(&schema));
+
+        let results = spill_manager.spill_batches_auto(&batches, "TestAutoSpill")?;
+        assert_eq!(results.len(), 2);
+
+        let mem_count = results
+            .iter()
+            .filter(|r| matches!(r, SpillLocation::Memory(_)))
+            .count();
+        let disk_count = results
+            .iter()
+            .filter(|r| matches!(r, SpillLocation::Disk(_)))
+            .count();
+        assert!(mem_count >= 1);
+        assert!(disk_count >= 1);
+
+        let spilled_rows = spill_manager.metrics.spilled_rows.value();
+        assert_eq!(spilled_rows, num_rows);
+
+        for spill in results {
+            let stream = spill_manager.load_spilled_batch(&spill)?;
+            let collected = collect(stream).await?;
+            assert!(!collected.is_empty());
+            assert_eq!(collected[0].schema(), schema);
+        }
 
         Ok(())
     }

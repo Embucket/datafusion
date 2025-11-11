@@ -15,14 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! [`HashJoinExec`] Partitioned Hash Join Operator
+//! [`GraceHashJoinExec`] Partitioned Hash Join Operator
 
-pub use exec::HashJoinExec;
+pub use exec::GraceHashJoinExec;
 
 mod exec;
-mod partitioned;
-#[cfg(feature = "hybrid_hash_join_scheduler")]
-mod scheduler;
-mod shared_bounds;
-pub mod shared_bounds;
 mod stream;
