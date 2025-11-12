@@ -1828,11 +1828,19 @@ impl PartitionedHashJoinStream {
     ) -> Result<StatefulStreamResult<Option<RecordBatch>>> {
         if self.partition_pass == 0 {
             self.join_metrics.build_input_batches.add(1);
-            let total_rows = build_data.total_rows();
+            let total_rows: usize = build_data
+                .original_batches()
+                .iter()
+                .map(|b| b.num_rows())
+                .sum();
             self.join_metrics.build_input_rows.add(total_rows);
         }
 
-        let build_total_size = build_data.total_input_size();
+        let build_total_size: usize = build_data
+            .original_batches()
+            .iter()
+            .map(|batch| batch.get_array_memory_size())
+            .sum();
         if build_total_size <= self.memory_threshold {
             self.num_partitions = 1;
             self.max_partition_count = 1;
@@ -1903,10 +1911,10 @@ impl PartitionedHashJoinStream {
         let mut max_spilled_bytes: usize = 0;
         let mut any_spilled = false;
 
-        build_data.for_each_original_batch(|batch| {
+        for batch in build_data.original_batches() {
             let mut keys_values: Vec<ArrayRef> = Vec::with_capacity(self.on_left.len());
             for expr in &self.on_left {
-                keys_values.push(expr.evaluate(&batch)?.into_array(batch.num_rows())?);
+                keys_values.push(expr.evaluate(batch)?.into_array(batch.num_rows())?);
             }
             let mut hashes = vec![0u64; batch.num_rows()];
             create_hashes(&keys_values, &self.random_state, &mut hashes)?;
@@ -1963,7 +1971,7 @@ impl PartitionedHashJoinStream {
                                             )
                                         });
                                         repartition_request = Some(next_count);
-                                        return Ok(false);
+                                        break;
                                     }
                                 }
                             }
@@ -1988,7 +1996,7 @@ impl PartitionedHashJoinStream {
                                         )
                                     });
                                     repartition_request = Some(next_count);
-                                    return Ok(false);
+                                    break;
                                 }
                             }
                         }
@@ -2003,16 +2011,14 @@ impl PartitionedHashJoinStream {
                 }
 
                 if repartition_request.is_some() {
-                    return Ok(false);
+                    break;
                 }
             }
 
             if repartition_request.is_some() {
-                Ok(false)
-            } else {
-                Ok(true)
+                break;
             }
-        })?;
+        }
 
         if let Some(next_count) = repartition_request {
             hhj_debug(|| {

@@ -52,7 +52,6 @@ use futures::{FutureExt as _, Stream};
 /// file read (instead of each batch). This approach does not work because when
 /// the number of concurrent reads exceeds the Tokio thread pool limit,
 /// deadlocks can occur and block progress.
-
 struct SpillReaderStream {
     schema: SchemaRef,
     state: SpillReaderStreamState,
@@ -65,7 +64,7 @@ type NextRecordBatchResult = Result<(StreamReader<BufReader<File>>, Option<Recor
 enum SpillReaderStreamState {
     /// Initial state: the stream was not initialized yet
     /// and the file was not opened
-    Uninitialized(Arc<RefCountedTempFile>),
+    Uninitialized(RefCountedTempFile),
 
     /// A read is in progress in a spawned blocking task for which we hold the handle.
     ReadInProgress(SpawnedTask<NextRecordBatchResult>),
@@ -79,10 +78,6 @@ enum SpillReaderStreamState {
 
 impl SpillReaderStream {
     fn new(schema: SchemaRef, spill_file: RefCountedTempFile) -> Self {
-        Self::new_from_shared(schema, Arc::new(spill_file))
-    }
-
-    fn new_from_shared(schema: SchemaRef, spill_file: Arc<RefCountedTempFile>) -> Self {
         Self {
             schema,
             state: SpillReaderStreamState::Uninitialized(spill_file),
@@ -102,9 +97,8 @@ impl SpillReaderStream {
                     unreachable!()
                 };
 
-                let file_ref = spill_file.clone();
                 let task = SpawnedTask::spawn_blocking(move || {
-                    let file = BufReader::new(File::open(file_ref.path())?);
+                    let file = BufReader::new(File::open(spill_file.path())?);
                     // SAFETY: DataFusion's spill writer strictly follows Arrow IPC specifications
                     // with validated schemas and buffers. Skip redundant validation during read
                     // to speedup read operation. This is safe for DataFusion as input guaranteed to be correct when written.
