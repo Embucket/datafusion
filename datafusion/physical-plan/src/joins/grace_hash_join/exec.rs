@@ -20,9 +20,7 @@ use crate::filter_pushdown::{
     ChildPushdownResult, FilterDescription, FilterPushdownPhase,
     FilterPushdownPropagation,
 };
-use crate::joins::utils::{
-    reorder_output_after_swap, swap_join_projection, OnceFut,
-};
+use crate::joins::utils::{reorder_output_after_swap, swap_join_projection, OnceFut};
 use crate::joins::{JoinOn, JoinOnRef, PartitionMode};
 use crate::projection::{
     try_embed_projection, try_pushdown_through_join, EmbeddedProjection, JoinData,
@@ -33,12 +31,12 @@ use crate::{
     common::can_project,
     joins::utils::{
         build_join_schema, check_join_is_valid, estimate_join_statistics,
-        symmetric_join_output_partitioning,
-        BuildProbeJoinMetrics, ColumnIndex, JoinFilter,
+        symmetric_join_output_partitioning, BuildProbeJoinMetrics, ColumnIndex,
+        JoinFilter,
     },
     metrics::{ExecutionPlanMetricsSet, MetricsSet},
-    DisplayAs, DisplayFormatType, Distribution, ExecutionPlan,
-    PlanProperties, SendableRecordBatchStream, Statistics,
+    DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, PlanProperties,
+    SendableRecordBatchStream, Statistics,
 };
 use crate::{ExecutionPlanProperties, SpillManager};
 use std::fmt;
@@ -52,8 +50,7 @@ use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::{
-    internal_err, plan_err, project_schema, JoinSide, JoinType,
-    NullEquality, Result,
+    internal_err, plan_err, project_schema, JoinSide, JoinType, NullEquality, Result,
 };
 use datafusion_execution::TaskContext;
 use datafusion_functions_aggregate_common::min_max::{MaxAccumulator, MinAccumulator};
@@ -550,6 +547,7 @@ impl ExecutionPlan for GraceHashJoinExec {
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        let new_partition_count = children[0].output_partitioning().partition_count();
         Ok(Arc::new(GraceHashJoinExec {
             left: Arc::clone(&children[0]),
             right: Arc::clone(&children[1]),
@@ -572,11 +570,12 @@ impl ExecutionPlan for GraceHashJoinExec {
             )?,
             // Keep the dynamic filter, bounds accumulator will be reset
             dynamic_filter: self.dynamic_filter.clone(),
-            accumulator: Arc::clone(&self.accumulator),
+            accumulator: GraceAccumulator::new(new_partition_count),
         }))
     }
 
     fn reset_state(self: Arc<Self>) -> Result<Arc<dyn ExecutionPlan>> {
+        let partition_count = self.left.output_partitioning().partition_count();
         Ok(Arc::new(GraceHashJoinExec {
             left: Arc::clone(&self.left),
             right: Arc::clone(&self.right),
@@ -592,7 +591,7 @@ impl ExecutionPlan for GraceHashJoinExec {
             cache: self.cache.clone(),
             // Reset dynamic filter and bounds accumulator to initial state
             dynamic_filter: None,
-            accumulator: Arc::clone(&self.accumulator),
+            accumulator: GraceAccumulator::new(partition_count),
         }))
     }
 
@@ -854,7 +853,6 @@ impl ExecutionPlan for GraceHashJoinExec {
         Ok(result)
     }
 }
-
 
 #[allow(clippy::too_many_arguments)]
 pub async fn partition_and_spill(

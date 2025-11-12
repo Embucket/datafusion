@@ -40,7 +40,9 @@ use datafusion_physical_plan::filter::FilterExec;
 use datafusion_physical_plan::joins::utils::{
     calculate_join_output_ordering, ColumnIndex,
 };
-use datafusion_physical_plan::joins::{HashJoinExec, SortMergeJoinExec};
+use datafusion_physical_plan::joins::{
+    GraceHashJoinExec, HashJoinExec, SortMergeJoinExec,
+};
 use datafusion_physical_plan::projection::ProjectionExec;
 use datafusion_physical_plan::repartition::RepartitionExec;
 use datafusion_physical_plan::sorts::sort::SortExec;
@@ -381,7 +383,9 @@ fn pushdown_requirement_to_children(
             Ok(None)
         }
     } else if let Some(hash_join) = plan.as_any().downcast_ref::<HashJoinExec>() {
-        handle_hash_join(hash_join, parent_required)
+        handle_hash_like_join(hash_join, parent_required)
+    } else if let Some(grace_join) = plan.as_any().downcast_ref::<GraceHashJoinExec>() {
+        handle_hash_like_join(grace_join, parent_required)
     } else {
         handle_custom_pushdown(plan, parent_required, maintains_input_order)
     }
@@ -698,10 +702,71 @@ fn handle_custom_pushdown(
     }
 }
 
-// For hash join we only maintain the input order for the right child
+trait HashJoinLike {
+    fn maintains_input_order(&self) -> Vec<bool>;
+    fn projection(&self) -> &Option<Vec<usize>>;
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>>;
+    fn join_type(&self) -> &JoinType;
+    fn left(&self) -> &Arc<dyn ExecutionPlan>;
+    fn right(&self) -> &Arc<dyn ExecutionPlan>;
+}
+
+impl HashJoinLike for HashJoinExec {
+    fn maintains_input_order(&self) -> Vec<bool> {
+        ExecutionPlan::maintains_input_order(self)
+    }
+
+    fn projection(&self) -> &Option<Vec<usize>> {
+        &self.projection
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        ExecutionPlan::children(self)
+    }
+
+    fn join_type(&self) -> &JoinType {
+        self.join_type()
+    }
+
+    fn left(&self) -> &Arc<dyn ExecutionPlan> {
+        self.left()
+    }
+
+    fn right(&self) -> &Arc<dyn ExecutionPlan> {
+        self.right()
+    }
+}
+
+impl HashJoinLike for GraceHashJoinExec {
+    fn maintains_input_order(&self) -> Vec<bool> {
+        ExecutionPlan::maintains_input_order(self)
+    }
+
+    fn projection(&self) -> &Option<Vec<usize>> {
+        &self.projection
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        ExecutionPlan::children(self)
+    }
+
+    fn join_type(&self) -> &JoinType {
+        self.join_type()
+    }
+
+    fn left(&self) -> &Arc<dyn ExecutionPlan> {
+        self.left()
+    }
+
+    fn right(&self) -> &Arc<dyn ExecutionPlan> {
+        self.right()
+    }
+}
+
+// For hash-based joins we only maintain the input order for the right child
 // for join type: Inner, Right, RightSemi, RightAnti
-fn handle_hash_join(
-    plan: &HashJoinExec,
+fn handle_hash_like_join<J: HashJoinLike>(
+    plan: &J,
     parent_required: OrderingRequirements,
 ) -> Result<Option<Vec<Option<OrderingRequirements>>>> {
     // If the plan has no children or does not maintain the right side ordering,
@@ -723,7 +788,7 @@ fn handle_hash_join(
         .collect();
 
     let column_indices = build_join_column_index(plan);
-    let projected_indices: Vec<_> = if let Some(projection) = &plan.projection {
+    let projected_indices: Vec<_> = if let Some(projection) = plan.projection() {
         projection.iter().map(|&i| &column_indices[i]).collect()
     } else {
         column_indices.iter().collect()
@@ -770,9 +835,9 @@ fn handle_hash_join(
     }
 }
 
-// this function is used to build the column index for the hash join
+// this function is used to build the column index for hash-based joins so we can
 // push down sort requirements to the right child
-fn build_join_column_index(plan: &HashJoinExec) -> Vec<ColumnIndex> {
+fn build_join_column_index<J: HashJoinLike>(plan: &J) -> Vec<ColumnIndex> {
     let map_fields = |schema: SchemaRef, side: JoinSide| {
         schema
             .fields()

@@ -77,8 +77,8 @@ use datafusion::physical_plan::expressions::PhysicalSortExpr;
 use datafusion::physical_plan::filter::FilterExec;
 use datafusion::physical_plan::joins::utils::{ColumnIndex, JoinFilter};
 use datafusion::physical_plan::joins::{
-    CrossJoinExec, NestedLoopJoinExec, SortMergeJoinExec, StreamJoinPartitionMode,
-    SymmetricHashJoinExec,
+    CrossJoinExec, GraceHashJoinExec, NestedLoopJoinExec, SortMergeJoinExec,
+    StreamJoinPartitionMode, SymmetricHashJoinExec,
 };
 use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
 use datafusion::physical_plan::limit::{GlobalLimitExec, LocalLimitExec};
@@ -210,6 +210,13 @@ impl AsExecutionPlan for protobuf::PhysicalPlanNode {
             PhysicalPlanType::HashJoin(hashjoin) => self
                 .try_into_hash_join_physical_plan(
                     hashjoin,
+                    ctx,
+                    runtime,
+                    extension_codec,
+                ),
+            PhysicalPlanType::GraceHashJoin(grace_hash_join) => self
+                .try_into_grace_hash_join_physical_plan(
+                    grace_hash_join,
                     ctx,
                     runtime,
                     extension_codec,
@@ -360,6 +367,13 @@ impl AsExecutionPlan for protobuf::PhysicalPlanNode {
 
         if let Some(exec) = plan.downcast_ref::<HashJoinExec>() {
             return protobuf::PhysicalPlanNode::try_from_hash_join_exec(
+                exec,
+                extension_codec,
+            );
+        }
+
+        if let Some(exec) = plan.downcast_ref::<GraceHashJoinExec>() {
+            return protobuf::PhysicalPlanNode::try_from_grace_hash_join_exec(
                 exec,
                 extension_codec,
             );
@@ -1262,6 +1276,116 @@ impl protobuf::PhysicalPlanNode {
             &join_type.into(),
             projection,
             partition_mode,
+            null_equality.into(),
+        )?))
+    }
+
+    fn try_into_grace_hash_join_physical_plan(
+        &self,
+        grace_join: &protobuf::GraceHashJoinExecNode,
+        ctx: &SessionContext,
+        runtime: &RuntimeEnv,
+        extension_codec: &dyn PhysicalExtensionCodec,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let left = into_physical_plan(&grace_join.left, ctx, runtime, extension_codec)?;
+        let right = into_physical_plan(&grace_join.right, ctx, runtime, extension_codec)?;
+        let left_schema = left.schema();
+        let right_schema = right.schema();
+        let on = grace_join
+            .on
+            .iter()
+            .map(|col| {
+                let left_expr = parse_physical_expr(
+                    col.left.as_ref().ok_or_else(|| {
+                        proto_error("GraceHashJoinExecNode missing left expr")
+                    })?,
+                    ctx,
+                    left_schema.as_ref(),
+                    extension_codec,
+                )?;
+                let right_expr = parse_physical_expr(
+                    col.right.as_ref().ok_or_else(|| {
+                        proto_error("GraceHashJoinExecNode missing right expr")
+                    })?,
+                    ctx,
+                    right_schema.as_ref(),
+                    extension_codec,
+                )?;
+                Ok((left_expr, right_expr))
+            })
+            .collect::<Result<_>>()?;
+        let join_type =
+            protobuf::JoinType::try_from(grace_join.join_type).map_err(|_| {
+                proto_error(format!(
+                    "Received a GraceHashJoinExecNode with unknown JoinType {}",
+                    grace_join.join_type
+                ))
+            })?;
+        let null_equality = protobuf::NullEquality::try_from(grace_join.null_equality)
+            .map_err(|_| {
+                proto_error(format!(
+                    "Received a GraceHashJoinExecNode with unknown NullEquality {}",
+                    grace_join.null_equality
+                ))
+            })?;
+        let filter = grace_join
+            .filter
+            .as_ref()
+            .map(|f| {
+                let schema = f
+                    .schema
+                    .as_ref()
+                    .ok_or_else(|| proto_error("Missing JoinFilter schema"))?
+                    .try_into()?;
+
+                let expression = parse_physical_expr(
+                    f.expression.as_ref().ok_or_else(|| {
+                        proto_error("Unexpected empty filter expression")
+                    })?,
+                    ctx,
+                    &schema,
+                    extension_codec,
+                )?;
+                let column_indices = f
+                    .column_indices
+                    .iter()
+                    .map(|i| {
+                        let side = protobuf::JoinSide::try_from(i.side).map_err(|_| {
+                            proto_error(format!(
+                                "Received a GraceHashJoinExecNode message with JoinSide in Filter {}",
+                                i.side
+                            ))
+                        })?;
+
+                        Ok(ColumnIndex {
+                            index: i.index as usize,
+                            side: side.into(),
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+
+                Ok(JoinFilter::new(expression, column_indices, Arc::new(schema)))
+            })
+            .map_or(Ok(None), |v: Result<JoinFilter>| v.map(Some))?;
+        let projection = if !grace_join.projection.is_empty() {
+            Some(
+                grace_join
+                    .projection
+                    .iter()
+                    .map(|i| *i as usize)
+                    .collect::<Vec<_>>(),
+            )
+        } else {
+            None
+        };
+
+        Ok(Arc::new(GraceHashJoinExec::try_new(
+            left,
+            right,
+            on,
+            filter,
+            &join_type.into(),
+            projection,
             null_equality.into(),
         )?))
     }
@@ -2213,6 +2337,75 @@ impl protobuf::PhysicalPlanNode {
                     on,
                     join_type: join_type.into(),
                     partition_mode: partition_mode.into(),
+                    null_equality: null_equality.into(),
+                    filter,
+                    projection: exec.projection.as_ref().map_or_else(Vec::new, |v| {
+                        v.iter().map(|x| *x as u32).collect::<Vec<u32>>()
+                    }),
+                },
+            ))),
+        })
+    }
+
+    fn try_from_grace_hash_join_exec(
+        exec: &GraceHashJoinExec,
+        extension_codec: &dyn PhysicalExtensionCodec,
+    ) -> Result<Self> {
+        let left = protobuf::PhysicalPlanNode::try_from_physical_plan(
+            exec.left().to_owned(),
+            extension_codec,
+        )?;
+        let right = protobuf::PhysicalPlanNode::try_from_physical_plan(
+            exec.right().to_owned(),
+            extension_codec,
+        )?;
+        let on: Vec<protobuf::JoinOn> = exec
+            .on()
+            .iter()
+            .map(|tuple| {
+                let l = serialize_physical_expr(&tuple.0, extension_codec)?;
+                let r = serialize_physical_expr(&tuple.1, extension_codec)?;
+                Ok::<_, DataFusionError>(protobuf::JoinOn {
+                    left: Some(l),
+                    right: Some(r),
+                })
+            })
+            .collect::<Result<_>>()?;
+        let join_type: protobuf::JoinType = exec.join_type().to_owned().into();
+        let null_equality: protobuf::NullEquality = exec.null_equality().into();
+        let filter = exec
+            .filter()
+            .as_ref()
+            .map(|f| {
+                let expression =
+                    serialize_physical_expr(f.expression(), extension_codec)?;
+                let column_indices = f
+                    .column_indices()
+                    .iter()
+                    .map(|i| {
+                        let side: protobuf::JoinSide = i.side.to_owned().into();
+                        protobuf::ColumnIndex {
+                            index: i.index as u32,
+                            side: side.into(),
+                        }
+                    })
+                    .collect();
+                let schema = f.schema().as_ref().try_into()?;
+                Ok(protobuf::JoinFilter {
+                    expression: Some(expression),
+                    column_indices,
+                    schema: Some(schema),
+                })
+            })
+            .map_or(Ok(None), |v: Result<protobuf::JoinFilter>| v.map(Some))?;
+
+        Ok(protobuf::PhysicalPlanNode {
+            physical_plan_type: Some(PhysicalPlanType::GraceHashJoin(Box::new(
+                protobuf::GraceHashJoinExecNode {
+                    left: Some(Box::new(left)),
+                    right: Some(Box::new(right)),
+                    on,
+                    join_type: join_type.into(),
                     null_equality: null_equality.into(),
                     filter,
                     projection: exec.projection.as_ref().map_or_else(Vec::new, |v| {

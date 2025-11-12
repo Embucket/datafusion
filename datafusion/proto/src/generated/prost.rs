@@ -1055,7 +1055,7 @@ pub mod table_reference {
 pub struct PhysicalPlanNode {
     #[prost(
         oneof = "physical_plan_node::PhysicalPlanType",
-        tags = "1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35"
+        tags = "1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36"
     )]
     pub physical_plan_type: ::core::option::Option<physical_plan_node::PhysicalPlanType>,
 }
@@ -1133,6 +1133,8 @@ pub mod physical_plan_node {
         SortMergeJoin(::prost::alloc::boxed::Box<super::SortMergeJoinExecNode>),
         #[prost(message, tag = "35")]
         MemoryScan(super::MemoryScanExecNode),
+        #[prost(message, tag = "36")]
+        GraceHashJoin(::prost::alloc::boxed::Box<super::GraceHashJoinExecNode>),
     }
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1633,6 +1635,23 @@ pub struct HashJoinExecNode {
     #[prost(message, optional, tag = "8")]
     pub filter: ::core::option::Option<JoinFilter>,
     #[prost(uint32, repeated, tag = "9")]
+    pub projection: ::prost::alloc::vec::Vec<u32>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GraceHashJoinExecNode {
+    #[prost(message, optional, boxed, tag = "1")]
+    pub left: ::core::option::Option<::prost::alloc::boxed::Box<PhysicalPlanNode>>,
+    #[prost(message, optional, boxed, tag = "2")]
+    pub right: ::core::option::Option<::prost::alloc::boxed::Box<PhysicalPlanNode>>,
+    #[prost(message, repeated, tag = "3")]
+    pub on: ::prost::alloc::vec::Vec<JoinOn>,
+    #[prost(enumeration = "super::datafusion_common::JoinType", tag = "4")]
+    pub join_type: i32,
+    #[prost(enumeration = "super::datafusion_common::NullEquality", tag = "5")]
+    pub null_equality: i32,
+    #[prost(message, optional, tag = "6")]
+    pub filter: ::core::option::Option<JoinFilter>,
+    #[prost(uint32, repeated, tag = "7")]
     pub projection: ::prost::alloc::vec::Vec<u32>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]

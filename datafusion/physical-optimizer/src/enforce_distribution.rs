@@ -48,7 +48,7 @@ use datafusion_physical_plan::aggregates::{
 use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion_physical_plan::execution_plan::EmissionType;
 use datafusion_physical_plan::joins::{
-    CrossJoinExec, HashJoinExec, PartitionMode, SortMergeJoinExec,
+    CrossJoinExec, GraceHashJoinExec, HashJoinExec, PartitionMode, SortMergeJoinExec,
 };
 use datafusion_physical_plan::projection::{ProjectionExec, ProjectionExpr};
 use datafusion_physical_plan::repartition::RepartitionExec;
@@ -376,6 +376,29 @@ pub fn adjust_input_keys_ordering(
                 .map(Transformed::yes);
             }
         }
+    } else if let Some(grace_join) = plan.as_any().downcast_ref::<GraceHashJoinExec>() {
+        let join_constructor = |new_conditions: (
+            Vec<(PhysicalExprRef, PhysicalExprRef)>,
+            Vec<SortOptions>,
+        )| {
+            GraceHashJoinExec::try_new(
+                Arc::clone(grace_join.left()),
+                Arc::clone(grace_join.right()),
+                new_conditions.0,
+                grace_join.filter().cloned(),
+                grace_join.join_type(),
+                grace_join.projection.clone(),
+                grace_join.null_equality(),
+            )
+            .map(|e| Arc::new(e) as _)
+        };
+        return reorder_partitioned_join_keys(
+            requirements,
+            grace_join.on(),
+            &[],
+            &join_constructor,
+        )
+        .map(Transformed::yes);
     } else if let Some(CrossJoinExec { left, .. }) =
         plan.as_any().downcast_ref::<CrossJoinExec>()
     {
@@ -682,6 +705,30 @@ pub fn reorder_join_keys_to_inputs(
                     *null_equality,
                 )?));
             }
+        }
+    } else if let Some(grace_join) = plan_any.downcast_ref::<GraceHashJoinExec>() {
+        let (join_keys, positions) = reorder_current_join_keys(
+            extract_join_keys(grace_join.on()),
+            Some(grace_join.left().output_partitioning()),
+            Some(grace_join.right().output_partitioning()),
+            grace_join.left().equivalence_properties(),
+            grace_join.right().equivalence_properties(),
+        );
+        if positions.is_some_and(|idxs| !idxs.is_empty()) {
+            let JoinKeyPairs {
+                left_keys,
+                right_keys,
+            } = join_keys;
+            let new_join_on = new_join_conditions(&left_keys, &right_keys);
+            return Ok(Arc::new(GraceHashJoinExec::try_new(
+                Arc::clone(grace_join.left()),
+                Arc::clone(grace_join.right()),
+                new_join_on,
+                grace_join.filter().cloned(),
+                grace_join.join_type(),
+                grace_join.projection.clone(),
+                grace_join.null_equality(),
+            )?));
         }
     } else if let Some(SortMergeJoinExec {
         left,

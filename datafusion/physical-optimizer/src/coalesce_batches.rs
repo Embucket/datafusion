@@ -26,8 +26,11 @@ use datafusion_common::config::ConfigOptions;
 use datafusion_common::error::Result;
 use datafusion_physical_expr::Partitioning;
 use datafusion_physical_plan::{
-    coalesce_batches::CoalesceBatchesExec, filter::FilterExec, joins::HashJoinExec,
-    repartition::RepartitionExec, ExecutionPlan,
+    coalesce_batches::CoalesceBatchesExec,
+    filter::FilterExec,
+    joins::{GraceHashJoinExec, HashJoinExec},
+    repartition::RepartitionExec,
+    ExecutionPlan,
 };
 
 use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
@@ -62,6 +65,7 @@ impl PhysicalOptimizerRule for CoalesceBatches {
             // See https://github.com/apache/datafusion/issues/139
             let wrap_in_coalesce = plan_any.downcast_ref::<FilterExec>().is_some()
                 || plan_any.downcast_ref::<HashJoinExec>().is_some()
+                || plan_any.downcast_ref::<GraceHashJoinExec>().is_some()
                 // Don't need to add CoalesceBatchesExec after a round robin RepartitionExec
                 || plan_any
                     .downcast_ref::<RepartitionExec>()

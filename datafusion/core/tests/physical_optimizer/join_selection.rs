@@ -40,7 +40,9 @@ use datafusion_physical_optimizer::PhysicalOptimizerRule;
 use datafusion_physical_plan::displayable;
 use datafusion_physical_plan::joins::utils::ColumnIndex;
 use datafusion_physical_plan::joins::utils::JoinFilter;
-use datafusion_physical_plan::joins::{HashJoinExec, NestedLoopJoinExec, PartitionMode};
+use datafusion_physical_plan::joins::{
+    GraceHashJoinExec, HashJoinExec, NestedLoopJoinExec, PartitionMode,
+};
 use datafusion_physical_plan::projection::ProjectionExec;
 use datafusion_physical_plan::ExecutionPlanProperties;
 use datafusion_physical_plan::{
@@ -263,6 +265,76 @@ async fn test_join_with_swap() {
             .unwrap()
             .total_byte_size,
         Precision::Inexact(2097152)
+    );
+}
+
+#[tokio::test]
+async fn test_grace_hash_join_enabled() {
+    let (big, small) = create_big_and_small();
+    let join = Arc::new(
+        HashJoinExec::try_new(
+            Arc::clone(&small),
+            Arc::clone(&big),
+            vec![(
+                Arc::new(Column::new_with_schema("small_col", &small.schema()).unwrap()),
+                Arc::new(Column::new_with_schema("big_col", &big.schema()).unwrap()),
+            )],
+            None,
+            &JoinType::Inner,
+            None,
+            PartitionMode::Auto,
+            NullEquality::NullEqualsNothing,
+        )
+        .unwrap(),
+    );
+
+    let mut config = ConfigOptions::new();
+    config.optimizer.enable_grace_hash_join = true;
+    config.optimizer.enable_spillable_hash_join = true;
+    config.optimizer.hash_join_single_partition_threshold = 1;
+    config.optimizer.hash_join_single_partition_threshold_rows = 1;
+
+    let optimized = JoinSelection::new().optimize(join, &config).unwrap();
+    assert!(
+        optimized.as_any().is::<GraceHashJoinExec>(),
+        "expected GraceHashJoinExec when grace hash join is enabled"
+    );
+}
+
+#[tokio::test]
+async fn test_grace_hash_join_disabled() {
+    let (big, small) = create_big_and_small();
+    let join = Arc::new(
+        HashJoinExec::try_new(
+            Arc::clone(&small),
+            Arc::clone(&big),
+            vec![(
+                Arc::new(Column::new_with_schema("small_col", &small.schema()).unwrap()),
+                Arc::new(Column::new_with_schema("big_col", &big.schema()).unwrap()),
+            )],
+            None,
+            &JoinType::Inner,
+            None,
+            PartitionMode::Auto,
+            NullEquality::NullEqualsNothing,
+        )
+        .unwrap(),
+    );
+
+    let mut config = ConfigOptions::new();
+    config.optimizer.enable_grace_hash_join = false;
+    config.optimizer.enable_spillable_hash_join = true;
+    config.optimizer.hash_join_single_partition_threshold = 1;
+    config.optimizer.hash_join_single_partition_threshold_rows = 1;
+
+    let optimized = JoinSelection::new().optimize(join, &config).unwrap();
+    let hash_join = optimized
+        .as_any()
+        .downcast_ref::<HashJoinExec>()
+        .expect("Grace disabled should keep HashJoinExec");
+    assert_eq!(
+        hash_join.partition_mode(),
+        &PartitionMode::PartitionedSpillable
     );
 }
 

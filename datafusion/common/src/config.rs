@@ -766,6 +766,11 @@ config_namespace! {
         /// when memory pressure occurs during join execution.
         pub enable_spillable_hash_join: bool, default = true
 
+        /// When set to true, spillable partitioned hash joins will be replaced with the experimental
+        /// Grace hash join operator which repartitions both inputs to disk before performing the join.
+        /// This trades additional IO for predictable memory usage on very large joins.
+        pub enable_grace_hash_join: bool, default = false
+
         /// Should DataFusion allow symmetric hash joins for unbounded data sources even when
         /// its inputs do not have any ordering or filtering If the flag is not enabled,
         /// the SymmetricHashJoin operator will be unable to prune its internal buffers,

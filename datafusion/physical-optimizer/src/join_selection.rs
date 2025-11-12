@@ -34,7 +34,7 @@ use datafusion_physical_expr::LexOrdering;
 use datafusion_physical_plan::execution_plan::EmissionType;
 use datafusion_physical_plan::joins::utils::ColumnIndex;
 use datafusion_physical_plan::joins::{
-    CrossJoinExec, HashJoinExec, NestedLoopJoinExec, PartitionMode,
+    CrossJoinExec, GraceHashJoinExec, HashJoinExec, NestedLoopJoinExec, PartitionMode,
     StreamJoinPartitionMode, SymmetricHashJoinExec,
 };
 use datafusion_physical_plan::{ExecutionPlan, ExecutionPlanProperties};
@@ -135,6 +135,7 @@ impl PhysicalOptimizerRule for JoinSelection {
         let collect_threshold_byte_size = config.hash_join_single_partition_threshold;
         let collect_threshold_num_rows = config.hash_join_single_partition_threshold_rows;
         let enable_spillable = config.enable_spillable_hash_join;
+        let enable_grace = config.enable_grace_hash_join;
         new_plan
             .transform_up(|plan| {
                 statistical_join_selection_subrule(
@@ -142,6 +143,7 @@ impl PhysicalOptimizerRule for JoinSelection {
                     collect_threshold_byte_size,
                     collect_threshold_num_rows,
                     enable_spillable,
+                    enable_grace,
                 )
             })
             .data()
@@ -232,6 +234,7 @@ pub(crate) fn try_collect_left(
 pub(crate) fn partitioned_hash_join(
     hash_join: &HashJoinExec,
     enable_spillable: bool,
+    enable_grace: bool,
 ) -> Result<Arc<dyn ExecutionPlan>> {
     let left = hash_join.left();
     let right = hash_join.right();
@@ -241,8 +244,26 @@ pub(crate) fn partitioned_hash_join(
         PartitionMode::Partitioned
     };
 
-    if hash_join.join_type().supports_swap() && should_swap_join_order(&**left, &**right)?
-    {
+    let should_swap = hash_join.join_type().supports_swap()
+        && should_swap_join_order(&**left, &**right)?;
+    if enable_grace && matches!(partition_mode, PartitionMode::PartitionedSpillable) {
+        let grace = Arc::new(GraceHashJoinExec::try_new(
+            Arc::clone(left),
+            Arc::clone(right),
+            hash_join.on().to_vec(),
+            hash_join.filter().cloned(),
+            hash_join.join_type(),
+            hash_join.projection.clone(),
+            hash_join.null_equality(),
+        )?);
+        return if should_swap {
+            grace.swap_inputs(partition_mode)
+        } else {
+            Ok(grace)
+        };
+    }
+
+    if should_swap {
         hash_join.swap_inputs(partition_mode)
     } else {
         Ok(Arc::new(HashJoinExec::try_new(
@@ -265,75 +286,83 @@ fn statistical_join_selection_subrule(
     collect_threshold_byte_size: usize,
     collect_threshold_num_rows: usize,
     enable_spillable: bool,
+    enable_grace: bool,
 ) -> Result<Transformed<Arc<dyn ExecutionPlan>>> {
-    let transformed =
-        if let Some(hash_join) = plan.as_any().downcast_ref::<HashJoinExec>() {
-            match hash_join.partition_mode() {
-                PartitionMode::Auto => try_collect_left(
-                    hash_join,
-                    false,
-                    collect_threshold_byte_size,
-                    collect_threshold_num_rows,
-                )?
+    let transformed = if let Some(hash_join) =
+        plan.as_any().downcast_ref::<HashJoinExec>()
+    {
+        match hash_join.partition_mode() {
+            PartitionMode::Auto => try_collect_left(
+                hash_join,
+                false,
+                collect_threshold_byte_size,
+                collect_threshold_num_rows,
+            )?
+            .map_or_else(
+                || {
+                    partitioned_hash_join(hash_join, enable_spillable, enable_grace)
+                        .map(Some)
+                },
+                |v| Ok(Some(v)),
+            )?,
+            PartitionMode::CollectLeft => try_collect_left(hash_join, true, 0, 0)?
                 .map_or_else(
-                    || partitioned_hash_join(hash_join, enable_spillable).map(Some),
+                    || {
+                        partitioned_hash_join(hash_join, enable_spillable, enable_grace)
+                            .map(Some)
+                    },
                     |v| Ok(Some(v)),
                 )?,
-                PartitionMode::CollectLeft => try_collect_left(hash_join, true, 0, 0)?
-                    .map_or_else(
-                        || partitioned_hash_join(hash_join, enable_spillable).map(Some),
-                        |v| Ok(Some(v)),
-                    )?,
-                PartitionMode::Partitioned => {
-                    let left = hash_join.left();
-                    let right = hash_join.right();
-                    if hash_join.join_type().supports_swap()
-                        && should_swap_join_order(&**left, &**right)?
-                    {
-                        hash_join
-                            .swap_inputs(PartitionMode::Partitioned)
-                            .map(Some)?
-                    } else {
-                        None
-                    }
-                }
-                PartitionMode::PartitionedSpillable => {
-                    println!("Using PartitionMode::PartitionedSpillable");
-                    // For partitioned spillable, use the same logic as regular partitioned
-                    let left = hash_join.left();
-                    let right = hash_join.right();
-                    if hash_join.join_type().supports_swap()
-                        && should_swap_join_order(&**left, &**right)?
-                    {
-                        hash_join
-                            .swap_inputs(PartitionMode::PartitionedSpillable)
-                            .map(Some)?
-                    } else {
-                        None
-                    }
+            PartitionMode::Partitioned => {
+                let left = hash_join.left();
+                let right = hash_join.right();
+                if hash_join.join_type().supports_swap()
+                    && should_swap_join_order(&**left, &**right)?
+                {
+                    hash_join
+                        .swap_inputs(PartitionMode::Partitioned)
+                        .map(Some)?
+                } else {
+                    None
                 }
             }
-        } else if let Some(cross_join) = plan.as_any().downcast_ref::<CrossJoinExec>() {
-            let left = cross_join.left();
-            let right = cross_join.right();
-            if should_swap_join_order(&**left, &**right)? {
-                cross_join.swap_inputs().map(Some)?
-            } else {
-                None
+            PartitionMode::PartitionedSpillable => {
+                println!("Using PartitionMode::PartitionedSpillable");
+                // For partitioned spillable, use the same logic as regular partitioned
+                let left = hash_join.left();
+                let right = hash_join.right();
+                if hash_join.join_type().supports_swap()
+                    && should_swap_join_order(&**left, &**right)?
+                {
+                    hash_join
+                        .swap_inputs(PartitionMode::PartitionedSpillable)
+                        .map(Some)?
+                } else {
+                    None
+                }
             }
-        } else if let Some(nl_join) = plan.as_any().downcast_ref::<NestedLoopJoinExec>() {
-            let left = nl_join.left();
-            let right = nl_join.right();
-            if nl_join.join_type().supports_swap()
-                && should_swap_join_order(&**left, &**right)?
-            {
-                nl_join.swap_inputs().map(Some)?
-            } else {
-                None
-            }
+        }
+    } else if let Some(cross_join) = plan.as_any().downcast_ref::<CrossJoinExec>() {
+        let left = cross_join.left();
+        let right = cross_join.right();
+        if should_swap_join_order(&**left, &**right)? {
+            cross_join.swap_inputs().map(Some)?
         } else {
             None
-        };
+        }
+    } else if let Some(nl_join) = plan.as_any().downcast_ref::<NestedLoopJoinExec>() {
+        let left = nl_join.left();
+        let right = nl_join.right();
+        if nl_join.join_type().supports_swap()
+            && should_swap_join_order(&**left, &**right)?
+        {
+            nl_join.swap_inputs().map(Some)?
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
     Ok(if let Some(transformed) = transformed {
         Transformed::yes(transformed)

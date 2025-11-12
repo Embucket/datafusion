@@ -732,6 +732,7 @@ message PhysicalPlanNode {
     GenerateSeriesNode generate_series = 33;
     SortMergeJoinExecNode sort_merge_join = 34;
     MemoryScanExecNode memory_scan = 35;
+    GraceHashJoinExecNode grace_hash_join = 36;
   }
 }
 
@@ -1072,6 +1073,16 @@ message HashJoinExecNode {
   datafusion_common.NullEquality null_equality = 7;
   JoinFilter filter = 8;
   repeated uint32 projection = 9;
+}
+
+message GraceHashJoinExecNode {
+  PhysicalPlanNode left = 1;
+  PhysicalPlanNode right = 2;
+  repeated JoinOn on = 3;
+  datafusion_common.JoinType join_type = 4;
+  datafusion_common.NullEquality null_equality = 5;
+  JoinFilter filter = 6;
+  repeated uint32 projection = 7;
 }
 
 enum StreamPartitionMode {

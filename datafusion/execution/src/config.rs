@@ -240,6 +240,11 @@ impl SessionConfig {
         self.options.optimizer.enable_spillable_hash_join
     }
 
+    /// Should spillable hash joins be executed via the Grace hash join operator?
+    pub fn enable_grace_hash_join(&self) -> bool {
+        self.options.optimizer.enable_grace_hash_join
+    }
+
     /// Are aggregates repartitioned during execution?
     pub fn repartition_aggregations(&self) -> bool {
         self.options.optimizer.repartition_aggregations
@@ -306,6 +311,12 @@ impl SessionConfig {
     /// Enables or disables spillable partitioned hash joins for handling larger datasets
     pub fn with_enable_spillable_hash_join(mut self, enabled: bool) -> Self {
         self.options_mut().optimizer.enable_spillable_hash_join = enabled;
+        self
+    }
+
+    /// Enables or disables the Grace hash join operator for spillable hash joins
+    pub fn with_enable_grace_hash_join(mut self, enabled: bool) -> Self {
+        self.options_mut().optimizer.enable_grace_hash_join = enabled;
         self
     }
 
