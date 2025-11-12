@@ -41,10 +41,7 @@ use crate::projection::{
     try_embed_projection, try_pushdown_through_join, EmbeddedProjection, JoinData,
     ProjectionExec,
 };
-use crate::spill::{
-    get_record_batch_memory_size, in_progress_spill_file::InProgressSpillFile,
-    spill_manager::SpillManager,
-};
+use crate::spill::{get_record_batch_memory_size, spill_manager::SpillManager};
 use crate::ExecutionPlanProperties;
 use crate::{
     common::can_project,
@@ -67,8 +64,7 @@ use arrow_schema::DataType;
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::utils::memory::estimate_memory_size;
 use datafusion_common::{
-    internal_datafusion_err, internal_err, plan_err, project_schema, JoinSide, JoinType,
-    NullEquality, Result,
+    internal_err, plan_err, project_schema, JoinSide, JoinType, NullEquality, Result,
 };
 use datafusion_execution::disk_manager::RefCountedTempFile;
 use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
@@ -83,7 +79,7 @@ use datafusion_physical_expr::{PhysicalExpr, PhysicalExprRef};
 
 use ahash::RandomState;
 use datafusion_physical_expr_common::physical_expr::fmt_sql;
-use futures::{executor::block_on, pin_mut, StreamExt};
+use futures::{executor::block_on, StreamExt, TryStreamExt};
 use parking_lot::Mutex;
 
 /// Hard-coded seed to ensure hash values from the hash join differ from `RepartitionExec`, avoiding collisions.
@@ -129,7 +125,7 @@ pub(super) struct JoinLeftData {
     pub(super) bounds: Option<Vec<ColumnBounds>>,
 }
 
-pub(super) enum OriginalBuildInput {
+enum OriginalBuildInput {
     InMemory(Arc<Vec<RecordBatch>>),
     Spilled {
         spill_manager: Arc<SpillManager>,
@@ -137,29 +133,27 @@ pub(super) enum OriginalBuildInput {
     },
 }
 
-enum CollectLeftMode {
-    InMemory,
-    SpillToDisk { spill_manager: Arc<SpillManager> },
-}
-
 impl JoinLeftData {
     /// Create a new `JoinLeftData` from its parts
     pub(super) fn new(
         hash_map: Box<dyn JoinHashMapType>,
         batch: RecordBatch,
-        original_input: OriginalBuildInput,
-        total_rows: usize,
-        total_input_size: usize,
+        original_batches: Arc<Vec<RecordBatch>>,
         values: Vec<ArrayRef>,
         visited_indices_bitmap: SharedBitmapBuilder,
         probe_threads_counter: AtomicUsize,
         reservation: MemoryReservation,
         bounds: Option<Vec<ColumnBounds>>,
     ) -> Self {
+        let total_rows = original_batches.iter().map(|b| b.num_rows()).sum();
+        let total_input_size = original_batches
+            .iter()
+            .map(|batch| batch.get_array_memory_size())
+            .sum();
         Self {
             hash_map,
             batch,
-            original_input,
+            original_input: OriginalBuildInput::InMemory(original_batches),
             total_rows,
             total_input_size,
             values,
@@ -1028,7 +1022,6 @@ impl ExecutionPlan for HashJoinExec {
                     need_produce_result_in_final(self.join_type),
                     self.right().output_partitioning().partition_count(),
                     enable_dynamic_filter_pushdown,
-                    CollectLeftMode::InMemory,
                 ))
             })?,
             PartitionMode::Partitioned => {
@@ -1047,7 +1040,6 @@ impl ExecutionPlan for HashJoinExec {
                     need_produce_result_in_final(self.join_type),
                     1,
                     enable_dynamic_filter_pushdown,
-                    CollectLeftMode::InMemory,
                 ))
             }
             PartitionMode::Auto => {
@@ -1079,7 +1071,6 @@ impl ExecutionPlan for HashJoinExec {
                         need_produce_result_in_final(self.join_type),
                         1,
                         enable_dynamic_filter_pushdown,
-                        CollectLeftMode::InMemory,
                     ))
                 } else {
                     // Spillable enabled: coalesce left to a single stream
@@ -1093,11 +1084,6 @@ impl ExecutionPlan for HashJoinExec {
                     let left_stream = left_plan.execute(0, Arc::clone(&context))?;
                     let reservation = MemoryConsumer::new("HashJoinInput")
                         .register(context.memory_pool());
-                    let build_input_spill_manager = Arc::new(SpillManager::new(
-                        Arc::clone(&context.runtime_env()),
-                        SpillMetrics::new(&self.metrics, partition),
-                        build_schema.clone(),
-                    ));
                     let left_fut = self.left_fut.try_once(|| {
                         Ok(collect_left_input(
                             self.random_state.clone(),
@@ -1108,9 +1094,6 @@ impl ExecutionPlan for HashJoinExec {
                             need_produce_result_in_final(self.join_type),
                             self.right().output_partitioning().partition_count(),
                             enable_dynamic_filter_pushdown,
-                            CollectLeftMode::SpillToDisk {
-                                spill_manager: Arc::clone(&build_input_spill_manager),
-                            },
                         ))
                     })?;
 
@@ -1766,53 +1749,44 @@ async fn collect_left_input(
     with_visited_indices_bitmap: bool,
     probe_threads_count: usize,
     should_compute_bounds: bool,
-    collect_mode: CollectLeftMode,
 ) -> Result<JoinLeftData> {
     let schema = left_stream.schema();
 
-    let mut state = BuildSideState::try_new(
+    // This operation performs 2 steps at once:
+    // 1. creates a [JoinHashMap] of all batches from the stream
+    // 2. stores the batches in a vector.
+    let initial = BuildSideState::try_new(
         metrics,
         reservation,
         on_left.clone(),
         &schema,
         should_compute_bounds,
     )?;
-    let mut total_input_size = 0usize;
-    let mut spill_writer: Option<InProgressSpillFile> = None;
 
-    pin_mut!(left_stream);
-    while let Some(batch) = left_stream.next().await {
-        let batch = batch?;
-        if let Some(ref mut accumulators) = state.bounds_accumulators {
-            for accumulator in accumulators {
-                accumulator.update_batch(&batch)?;
-            }
-        }
-
-        let batch_size = get_record_batch_memory_size(&batch);
-        state.reservation.try_grow(batch_size)?;
-        state.metrics.build_mem_used.add(batch_size);
-        state.metrics.build_input_batches.add(1);
-        state.metrics.build_input_rows.add(batch.num_rows());
-        state.num_rows += batch.num_rows();
-        total_input_size = total_input_size.saturating_add(batch_size);
-
-        match &collect_mode {
-            CollectLeftMode::InMemory => {
-                state.batches.push(batch);
-            }
-            CollectLeftMode::SpillToDisk { spill_manager } => {
-                if spill_writer.is_none() {
-                    spill_writer = Some(
-                        spill_manager.create_in_progress_file("hash_join_build_input")?,
-                    );
-                }
-                if let Some(writer) = spill_writer.as_mut() {
-                    writer.append_batch(&batch)?;
+    let state = left_stream
+        .try_fold(initial, |mut state, batch| async move {
+            // Update accumulators if computing bounds
+            if let Some(ref mut accumulators) = state.bounds_accumulators {
+                for accumulator in accumulators {
+                    accumulator.update_batch(&batch)?;
                 }
             }
-        }
-    }
+
+            // Decide if we spill or not
+            let batch_size = get_record_batch_memory_size(&batch);
+            // Reserve memory for incoming batch
+            state.reservation.try_grow(batch_size)?;
+            // Update metrics
+            state.metrics.build_mem_used.add(batch_size);
+            state.metrics.build_input_batches.add(1);
+            state.metrics.build_input_rows.add(batch.num_rows());
+            // Update row count
+            state.num_rows += batch.num_rows();
+            // Push batch to output
+            state.batches.push(batch);
+            Ok(state)
+        })
+        .await?;
 
     // Extract fields from state
     let BuildSideState {
@@ -1823,113 +1797,70 @@ async fn collect_left_input(
         bounds_accumulators,
     } = state;
     let batches_arc = Arc::new(batches);
-    let (hashmap, single_batch, left_values, visited_indices_bitmap, original_input) =
-        match collect_mode {
-            CollectLeftMode::InMemory => {
-                let fixed_size_u32 = size_of::<JoinHashMapU32>();
-                let fixed_size_u64 = size_of::<JoinHashMapU64>();
-                let mut hashmap: Box<dyn JoinHashMapType> =
-                    if num_rows > u32::MAX as usize {
-                        let estimated_hashtable_size =
-                            estimate_memory_size::<(u64, u64)>(num_rows, fixed_size_u64)?;
-                        reservation.try_grow(estimated_hashtable_size)?;
-                        metrics.build_mem_used.add(estimated_hashtable_size);
-                        Box::new(JoinHashMapU64::with_capacity(num_rows))
-                    } else {
-                        let estimated_hashtable_size =
-                            estimate_memory_size::<(u32, u64)>(num_rows, fixed_size_u32)?;
-                        reservation.try_grow(estimated_hashtable_size)?;
-                        metrics.build_mem_used.add(estimated_hashtable_size);
-                        Box::new(JoinHashMapU32::with_capacity(num_rows))
-                    };
+    // Estimation of memory size, required for hashtable, prior to allocation.
+    // Final result can be verified using `RawTable.allocation_info()`
+    let fixed_size_u32 = size_of::<JoinHashMapU32>();
+    let fixed_size_u64 = size_of::<JoinHashMapU64>();
 
-                let mut hashes_buffer = Vec::new();
-                let mut offset = 0;
-                let batches_iter = batches_arc.iter().rev();
-                for batch in batches_iter.clone() {
-                    hashes_buffer.clear();
-                    hashes_buffer.resize(batch.num_rows(), 0);
-                    update_hash(
-                        &on_left,
-                        batch,
-                        &mut *hashmap,
-                        offset,
-                        &random_state,
-                        &mut hashes_buffer,
-                        0,
-                        true,
-                    )?;
-                    offset += batch.num_rows();
-                }
-                let single_batch = concat_batches(&schema, batches_iter)?;
-                let visited_indices_bitmap = if with_visited_indices_bitmap {
-                    let bitmap_size = bit_util::ceil(single_batch.num_rows(), 8);
-                    reservation.try_grow(bitmap_size)?;
-                    metrics.build_mem_used.add(bitmap_size);
+    // Use `u32` indices for the JoinHashMap when num_rows ≤ u32::MAX, otherwise use the
+    // `u64` indice variant
+    let mut hashmap: Box<dyn JoinHashMapType> = if num_rows > u32::MAX as usize {
+        let estimated_hashtable_size =
+            estimate_memory_size::<(u64, u64)>(num_rows, fixed_size_u64)?;
+        reservation.try_grow(estimated_hashtable_size)?;
+        metrics.build_mem_used.add(estimated_hashtable_size);
+        Box::new(JoinHashMapU64::with_capacity(num_rows))
+    } else {
+        let estimated_hashtable_size =
+            estimate_memory_size::<(u32, u64)>(num_rows, fixed_size_u32)?;
+        reservation.try_grow(estimated_hashtable_size)?;
+        metrics.build_mem_used.add(estimated_hashtable_size);
+        Box::new(JoinHashMapU32::with_capacity(num_rows))
+    };
 
-                    let mut bitmap_buffer =
-                        BooleanBufferBuilder::new(single_batch.num_rows());
-                    bitmap_buffer.append_n(num_rows, false);
-                    bitmap_buffer
-                } else {
-                    BooleanBufferBuilder::new(0)
-                };
+    let mut hashes_buffer = Vec::new();
+    let mut offset = 0;
 
-                let left_values = on_left
-                    .iter()
-                    .map(|c| {
-                        c.evaluate(&single_batch)?
-                            .into_array(single_batch.num_rows())
-                    })
-                    .collect::<Result<Vec<_>>>()?;
+    // Updating hashmap starting from the last batch
+    let batches_iter = batches_arc.iter().rev();
+    for batch in batches_iter.clone() {
+        hashes_buffer.clear();
+        hashes_buffer.resize(batch.num_rows(), 0);
+        update_hash(
+            &on_left,
+            batch,
+            &mut *hashmap,
+            offset,
+            &random_state,
+            &mut hashes_buffer,
+            0,
+            true,
+        )?;
+        offset += batch.num_rows();
+    }
+    // Merge all batches into a single batch, so we can directly index into the arrays
+    let single_batch = concat_batches(&schema, batches_iter)?;
 
-                (
-                    hashmap,
-                    single_batch,
-                    left_values,
-                    visited_indices_bitmap,
-                    OriginalBuildInput::InMemory(Arc::clone(&batches_arc)),
-                )
-            }
-            CollectLeftMode::SpillToDisk { spill_manager } => {
-                if num_rows == 0 {
-                    (
-                        Box::new(JoinHashMapU32::with_capacity(0))
-                            as Box<dyn JoinHashMapType>,
-                        RecordBatch::new_empty(schema.clone()),
-                        Vec::new(),
-                        BooleanBufferBuilder::new(0),
-                        OriginalBuildInput::InMemory(Arc::new(vec![])),
-                    )
-                } else {
-                    let mut writer = spill_writer.ok_or_else(|| {
-                        internal_datafusion_err!("missing build spill writer")
-                    })?;
-                    let spill_file = writer.finish()?.ok_or_else(|| {
-                        internal_datafusion_err!(
-                            "expected spill file when spilling build input"
-                        )
-                    })?;
-                    metrics.build_spill_count.add(1);
-                    metrics.build_spilled_rows.add(num_rows);
-                    metrics
-                        .build_spilled_bytes
-                        .add(spill_file.current_disk_usage() as usize);
-                    let _ = reservation.try_shrink(reservation.size());
-                    (
-                        Box::new(JoinHashMapU32::with_capacity(0))
-                            as Box<dyn JoinHashMapType>,
-                        RecordBatch::new_empty(schema.clone()),
-                        Vec::new(),
-                        BooleanBufferBuilder::new(0),
-                        OriginalBuildInput::Spilled {
-                            spill_manager,
-                            spill_file: Arc::new(spill_file),
-                        },
-                    )
-                }
-            }
-        };
+    // Reserve additional memory for visited indices bitmap and create shared builder
+    let visited_indices_bitmap = if with_visited_indices_bitmap {
+        let bitmap_size = bit_util::ceil(single_batch.num_rows(), 8);
+        reservation.try_grow(bitmap_size)?;
+        metrics.build_mem_used.add(bitmap_size);
+
+        let mut bitmap_buffer = BooleanBufferBuilder::new(single_batch.num_rows());
+        bitmap_buffer.append_n(num_rows, false);
+        bitmap_buffer
+    } else {
+        BooleanBufferBuilder::new(0)
+    };
+
+    let left_values = on_left
+        .iter()
+        .map(|c| {
+            c.evaluate(&single_batch)?
+                .into_array(single_batch.num_rows())
+        })
+        .collect::<Result<Vec<_>>>()?;
 
     // Compute bounds for dynamic filter if enabled
     let bounds = match bounds_accumulators {
@@ -1946,9 +1877,7 @@ async fn collect_left_input(
     let data = JoinLeftData::new(
         hashmap,
         single_batch,
-        original_input,
-        num_rows,
-        total_input_size,
+        Arc::clone(&batches_arc),
         left_values,
         Mutex::new(visited_indices_bitmap),
         AtomicUsize::new(probe_threads_count),
