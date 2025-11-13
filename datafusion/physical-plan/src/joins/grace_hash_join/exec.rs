@@ -26,7 +26,6 @@ use crate::projection::{
     try_embed_projection, try_pushdown_through_join, EmbeddedProjection, JoinData,
     ProjectionExec,
 };
-use crate::spill::get_record_batch_memory_size;
 use crate::{
     common::can_project,
     joins::utils::{
@@ -41,7 +40,7 @@ use crate::{
 use crate::{ExecutionPlanProperties, SpillManager};
 use std::fmt;
 use std::fmt::Formatter;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::{any::Any, vec};
 
 use arrow::array::UInt32Array;
@@ -98,19 +97,8 @@ pub struct GraceHashJoinExec {
     pub null_equality: NullEquality,
     /// Cache holding plan properties like equivalences, output partitioning etc.
     cache: PlanProperties,
-    /// Dynamic filter for pushing down to the probe side
-    /// Set when dynamic filter pushdown is detected in handle_child_pushdown_result.
-    /// HashJoinExec also needs to keep a shared bounds accumulator for coordinating updates.
-    dynamic_filter: Option<HashJoinExecDynamicFilter>,
-}
-
-#[derive(Clone)]
-struct HashJoinExecDynamicFilter {
-    /// Dynamic filter that we'll update with the results of the build side once that is done.
-    filter: Arc<DynamicFilterPhysicalExpr>,
-    /// Bounds accumulator to keep track of the min/max bounds on the join keys for each partition.
-    /// It is lazily initialized during execution to make sure we use the actual execution time partition counts.
-    bounds_accumulator: OnceLock<Arc<SharedBoundsAccumulator>>,
+    /// Indicates whether dynamic filter pushdown is enabled for this join.
+    dynamic_filter_enabled: bool,
 }
 
 impl fmt::Debug for GraceHashJoinExec {
@@ -128,7 +116,7 @@ impl fmt::Debug for GraceHashJoinExec {
             .field("column_indices", &self.column_indices)
             .field("null_equality", &self.null_equality)
             .field("cache", &self.cache)
-            // Explicitly exclude dynamic_filter to avoid runtime state differences in tests
+            // Intentionally omit dynamic_filter_enabled to keep debug output stable
             .finish()
     }
 }
@@ -195,7 +183,7 @@ impl GraceHashJoinExec {
             column_indices,
             null_equality,
             cache,
-            dynamic_filter: None,
+            dynamic_filter_enabled: false,
         })
     }
 
@@ -559,8 +547,8 @@ impl ExecutionPlan for GraceHashJoinExec {
                 &self.on,
                 self.projection.as_ref(),
             )?,
-            // Keep the dynamic filter, bounds accumulator will be reset
-            dynamic_filter: self.dynamic_filter.clone(),
+            // Preserve dynamic filter enablement; state will be refreshed as needed
+            dynamic_filter_enabled: self.dynamic_filter_enabled,
         }))
     }
 
@@ -578,8 +566,8 @@ impl ExecutionPlan for GraceHashJoinExec {
             column_indices: self.column_indices.clone(),
             null_equality: self.null_equality,
             cache: self.cache.clone(),
-            // Reset dynamic filter and bounds accumulator to initial state
-            dynamic_filter: None,
+            // Reset dynamic filter state to initial configuration
+            dynamic_filter_enabled: false,
         }))
     }
 
@@ -598,7 +586,7 @@ impl ExecutionPlan for GraceHashJoinExec {
             );
         }
 
-        let enable_dynamic_filter_pushdown = self.dynamic_filter.is_some();
+        let enable_dynamic_filter_pushdown = self.dynamic_filter_enabled;
 
         let join_metrics = Arc::new(BuildProbeJoinMetrics::new(partition, &self.metrics));
 
@@ -812,9 +800,7 @@ impl ExecutionPlan for GraceHashJoinExec {
             // Note that we don't check PushdDownPredicate::discrimnant because even if nothing said
             // "yes, I can fully evaluate this filter" things might still use it for statistics -> it's worth updating
             let predicate = Arc::clone(&filter.predicate);
-            if let Ok(dynamic_filter) =
-                Arc::downcast::<DynamicFilterPhysicalExpr>(predicate)
-            {
+            if Arc::downcast::<DynamicFilterPhysicalExpr>(predicate).is_ok() {
                 // We successfully pushed down our self filter - we need to make a new node with the dynamic filter
                 let new_node = Arc::new(GraceHashJoinExec {
                     left: Arc::clone(&self.left),
@@ -829,10 +815,7 @@ impl ExecutionPlan for GraceHashJoinExec {
                     column_indices: self.column_indices.clone(),
                     null_equality: self.null_equality,
                     cache: self.cache.clone(),
-                    dynamic_filter: Some(HashJoinExecDynamicFilter {
-                        filter: dynamic_filter,
-                        bounds_accumulator: OnceLock::new(),
-                    }),
+                    dynamic_filter_enabled: true,
                 });
                 result = result.with_updated_node(new_node as Arc<dyn ExecutionPlan>);
             }
@@ -959,8 +942,8 @@ async fn partition_and_spill_one_side(
 
     // Prepare indexes
     let mut result = Vec::with_capacity(partitions.len());
-    for (i, writer) in partitions.into_iter().enumerate() {
-        result.push(writer.finish(i)?);
+    for writer in partitions.into_iter() {
+        result.push(writer.finish()?);
     }
     // println!("spill_manager {:?}", spill_manager.metrics);
     Ok(result)
@@ -969,8 +952,6 @@ async fn partition_and_spill_one_side(
 #[derive(Debug)]
 pub struct PartitionWriter {
     spill_manager: Arc<SpillManager>,
-    total_rows: usize,
-    total_bytes: usize,
     chunks: Vec<SpillLocation>,
 }
 
@@ -978,8 +959,6 @@ impl PartitionWriter {
     pub fn new(spill_manager: Arc<SpillManager>) -> Self {
         Self {
             spill_manager,
-            total_rows: 0,
-            total_bytes: 0,
             chunks: vec![],
         }
     }
@@ -990,18 +969,13 @@ impl PartitionWriter {
         request_msg: &str,
     ) -> Result<()> {
         let loc = self.spill_manager.spill_batch_auto(batch, request_msg)?;
-        self.total_rows += batch.num_rows();
-        self.total_bytes += get_record_batch_memory_size(batch);
         self.chunks.push(loc);
         Ok(())
     }
 
-    pub fn finish(self, part_id: usize) -> Result<PartitionIndex> {
+    pub fn finish(self) -> Result<PartitionIndex> {
         Ok(PartitionIndex {
-            part_id,
             chunks: self.chunks,
-            total_rows: self.total_rows,
-            total_bytes: self.total_bytes,
         })
     }
 }
@@ -1016,15 +990,6 @@ impl PartitionWriter {
 /// Partition 3 -> [ spill_chunk_3_0.arrow, spill_chunk_3_1.arrow ]
 #[derive(Debug, Clone)]
 pub struct PartitionIndex {
-    /// Unique partition identifier (0..N-1)
-    pub part_id: usize,
-
-    /// Total number of rows in this partition
-    pub total_rows: usize,
-
-    /// Total size in bytes of all batches in this partition
-    pub total_bytes: usize,
-
     /// Collection of spill locations (each corresponds to one batch written
     /// by [`PartitionWriter::spill_batch_auto`])
     pub chunks: Vec<SpillLocation>,
@@ -1034,9 +999,7 @@ pub struct PartitionIndex {
 mod tests {
     use super::*;
     use crate::test::TestMemoryExec;
-    use crate::{
-        common, expressions::Column, repartition::RepartitionExec, test::build_table_i32,
-    };
+    use crate::{common, expressions::Column, repartition::RepartitionExec};
 
     use crate::joins::HashJoinExec;
     use arrow::array::{ArrayRef, Int32Array};
@@ -1078,28 +1041,8 @@ mod tests {
         Arc::new(TestMemoryExec::try_new(&[vec![batch]], schema, None).unwrap())
     }
 
-    fn build_table(
-        a: (&str, &Vec<i32>),
-        b: (&str, &Vec<i32>),
-        c: (&str, &Vec<i32>),
-    ) -> Arc<dyn ExecutionPlan> {
-        let batch = build_table_i32(a, b, c);
-        let schema = batch.schema();
-        TestMemoryExec::try_new_exec(&[vec![batch]], schema, None).unwrap()
-    }
-
     #[tokio::test]
     async fn simple_grace_hash_join() -> Result<()> {
-        // let left = build_table(
-        //     ("a1", &vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 0]),
-        //     ("b1", &vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 0]),
-        //     ("c1", &vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 0]),
-        // );
-        // let right = build_table(
-        //     ("a2", &vec![1, 2]),
-        //     ("b2", &vec![1, 2]),
-        //     ("c2", &vec![14, 15]),
-        // );
         let left = build_large_table("a1", "b1", "c1", 2000000);
         let right = build_large_table("a2", "b2", "c2", 5000000);
         let on = vec![(
@@ -1153,7 +1096,7 @@ mod tests {
             batches.extend(v);
         }
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-        println!("TOTAL ROWS = {}", total_rows);
+        assert_eq!(total_rows, 1_000_000);
 
         // print_batches(&*batches).unwrap();
         // Asserting that operator-level reservation attempting to overallocate
@@ -1216,7 +1159,7 @@ mod tests {
             );
         }
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-        println!("TOTAL ROWS = {}", total_rows);
+        assert_eq!(total_rows, 1_000_000);
 
         // print_batches(&*batches).unwrap();
         Ok(())

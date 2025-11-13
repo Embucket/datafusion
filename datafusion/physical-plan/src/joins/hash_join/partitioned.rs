@@ -43,12 +43,6 @@
 //! - Generates join results and handles unmatched rows for outer joins
 //! - Tracks matched rows for proper outer join semantics
 
-use std::collections::VecDeque;
-use std::mem::{self, size_of};
-use std::sync::Arc;
-use std::task::{Context, Poll};
-use std::time::SystemTime;
-
 #[cfg(feature = "hybrid_hash_join_scheduler")]
 use super::scheduler::{
     HybridTaskScheduler, ProbeDataPoll, ProbePartitionState, ProbeStageTask,
@@ -66,6 +60,10 @@ use crate::metrics::SpillMetrics;
 use crate::spill::in_progress_spill_file::InProgressSpillFile;
 use crate::spill::spill_manager::SpillManager;
 use crate::{RecordBatchStream, SendableRecordBatchStream};
+use std::collections::VecDeque;
+use std::mem::{self, size_of};
+use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use arrow::array::{Array, ArrayRef, BooleanBufferBuilder, UInt32Array, UInt64Array};
 use arrow::compute::{concat_batches, take};
@@ -125,12 +123,15 @@ fn per_partition_budget_bytes(memory_threshold: usize, partitions: usize) -> usi
 
 #[inline]
 fn hhj_debug<F: FnOnce() -> String>(builder: F) {
-    if std::env::var("DATAFUSION_HHJ_DEBUG").is_ok() {
-        let ts = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0);
-        println!("[hhj-debug {ts}] {}", builder());
+    if log::log_enabled!(
+        target: "datafusion::physical_plan::hash_join::partitioned",
+        log::Level::Debug
+    ) {
+        log::debug!(
+            target: "datafusion::physical_plan::hash_join::partitioned",
+            "{}",
+            builder()
+        );
     }
 }
 
@@ -623,7 +624,7 @@ impl PartitionedHashJoinStream {
             return None;
         }
 
-        let mut per_partition_budget =
+        let per_partition_budget =
             per_partition_budget_bytes(self.memory_threshold, self.num_partitions);
 
         let rows_budget = self
