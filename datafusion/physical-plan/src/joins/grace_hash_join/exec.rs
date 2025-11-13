@@ -53,16 +53,13 @@ use datafusion_common::{
     internal_err, plan_err, project_schema, JoinSide, JoinType, NullEquality, Result,
 };
 use datafusion_execution::TaskContext;
-use datafusion_functions_aggregate_common::min_max::{MaxAccumulator, MinAccumulator};
 use datafusion_physical_expr::equivalence::{
     join_equivalence_properties, ProjectionMapping,
 };
 use datafusion_physical_expr::expressions::{lit, DynamicFilterPhysicalExpr};
 use datafusion_physical_expr::{PhysicalExpr, PhysicalExprRef};
 
-use crate::joins::grace_hash_join::stream::{
-    GraceAccumulator, GraceHashJoinStream, SpillFut,
-};
+use crate::joins::grace_hash_join::stream::{GraceHashJoinStream, SpillFut};
 use crate::joins::hash_join::shared_bounds::SharedBoundsAccumulator;
 use crate::metrics::SpillMetrics;
 use crate::spill::spill_manager::SpillLocation;
@@ -105,7 +102,6 @@ pub struct GraceHashJoinExec {
     /// Set when dynamic filter pushdown is detected in handle_child_pushdown_result.
     /// HashJoinExec also needs to keep a shared bounds accumulator for coordinating updates.
     dynamic_filter: Option<HashJoinExecDynamicFilter>,
-    accumulator: Arc<GraceAccumulator>,
 }
 
 #[derive(Clone)]
@@ -183,9 +179,6 @@ impl GraceHashJoinExec {
             &on,
             projection.as_ref(),
         )?;
-        let partitions = left.output_partitioning().partition_count();
-        let accumulator = GraceAccumulator::new(partitions);
-
         let metrics = ExecutionPlanMetricsSet::new();
         // Initialize both dynamic filter and bounds accumulator to None
         // They will be set later if dynamic filtering is enabled
@@ -203,7 +196,6 @@ impl GraceHashJoinExec {
             null_equality,
             cache,
             dynamic_filter: None,
-            accumulator,
         })
     }
 
@@ -547,7 +539,6 @@ impl ExecutionPlan for GraceHashJoinExec {
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let new_partition_count = children[0].output_partitioning().partition_count();
         Ok(Arc::new(GraceHashJoinExec {
             left: Arc::clone(&children[0]),
             right: Arc::clone(&children[1]),
@@ -570,12 +561,10 @@ impl ExecutionPlan for GraceHashJoinExec {
             )?,
             // Keep the dynamic filter, bounds accumulator will be reset
             dynamic_filter: self.dynamic_filter.clone(),
-            accumulator: GraceAccumulator::new(new_partition_count),
         }))
     }
 
     fn reset_state(self: Arc<Self>) -> Result<Arc<dyn ExecutionPlan>> {
-        let partition_count = self.left.output_partitioning().partition_count();
         Ok(Arc::new(GraceHashJoinExec {
             left: Arc::clone(&self.left),
             right: Arc::clone(&self.right),
@@ -591,7 +580,6 @@ impl ExecutionPlan for GraceHashJoinExec {
             cache: self.cache.clone(),
             // Reset dynamic filter and bounds accumulator to initial state
             dynamic_filter: None,
-            accumulator: GraceAccumulator::new(partition_count),
         }))
     }
 
@@ -654,7 +642,6 @@ impl ExecutionPlan for GraceHashJoinExec {
         let on = self.on.clone();
         let spill_left_clone = Arc::clone(&spill_left);
         let spill_right_clone = Arc::clone(&spill_right);
-        let accumulator_clone = Arc::clone(&self.accumulator);
         let join_metrics_clone = Arc::clone(&join_metrics);
         let spill_fut = OnceFut::new(async move {
             let (left_idx, right_idx) = partition_and_spill(
@@ -670,14 +657,16 @@ impl ExecutionPlan for GraceHashJoinExec {
                 partition,
             )
             .await?;
-            accumulator_clone
-                .report_partition(partition, left_idx.clone(), right_idx.clone())
-                .await;
             Ok(SpillFut::new(partition, left_idx, right_idx))
         });
 
+        let left_input_schema = self.left.schema();
+        let right_input_schema = self.right.schema();
+
         Ok(Box::pin(GraceHashJoinStream::new(
             self.schema(),
+            left_input_schema,
+            right_input_schema,
             spill_fut,
             spill_left,
             spill_right,
@@ -689,7 +678,6 @@ impl ExecutionPlan for GraceHashJoinExec {
             column_indices_after_projection,
             join_metrics,
             context,
-            Arc::clone(&self.accumulator),
         )))
     }
 
@@ -845,7 +833,6 @@ impl ExecutionPlan for GraceHashJoinExec {
                         filter: dynamic_filter,
                         bounds_accumulator: OnceLock::new(),
                     }),
-                    accumulator: Arc::clone(&self.accumulator),
                 });
                 result = result.with_updated_node(new_node as Arc<dyn ExecutionPlan>);
             }

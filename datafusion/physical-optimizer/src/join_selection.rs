@@ -27,12 +27,12 @@ use crate::PhysicalOptimizerRule;
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::error::Result;
 use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
-use datafusion_common::{internal_err, JoinSide, JoinType};
+use datafusion_common::{internal_err, DataFusionError, JoinSide, JoinType};
 use datafusion_expr_common::sort_properties::SortProperties;
 use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_expr::LexOrdering;
 use datafusion_physical_plan::execution_plan::EmissionType;
-use datafusion_physical_plan::joins::utils::ColumnIndex;
+use datafusion_physical_plan::joins::utils::{check_join_is_valid, ColumnIndex};
 use datafusion_physical_plan::joins::{
     CrossJoinExec, GraceHashJoinExec, HashJoinExec, NestedLoopJoinExec, PartitionMode,
     StreamJoinPartitionMode, SymmetricHashJoinExec,
@@ -173,6 +173,13 @@ pub(crate) fn try_collect_left(
     let left = hash_join.left();
     let right = hash_join.right();
 
+    // Skip collect-left rewrite if the join currently has inconsistent schemas (e.g. required
+    // columns were projected away temporarily). This mirrors the legacy hash join behavior where
+    // collect-left is only attempted once the join inputs are fully valid.
+    if check_join_is_valid(&left.schema(), &right.schema(), hash_join.on()).is_err() {
+        return Ok(None);
+    }
+
     let left_can_collect = ignore_threshold
         || supports_collect_by_thresholds(
             &**left,
@@ -191,38 +198,57 @@ pub(crate) fn try_collect_left(
             if hash_join.join_type().supports_swap()
                 && should_swap_join_order(&**left, &**right)?
             {
-                Ok(Some(hash_join.swap_inputs(PartitionMode::CollectLeft)?))
+                match hash_join.swap_inputs(PartitionMode::CollectLeft) {
+                    Ok(plan) => Ok(Some(plan)),
+                    Err(err) if is_missing_join_columns(&err) => Ok(None),
+                    Err(err) => Err(err),
+                }
             } else {
-                Ok(Some(Arc::new(HashJoinExec::try_new(
-                    Arc::clone(left),
-                    Arc::clone(right),
-                    hash_join.on().to_vec(),
-                    hash_join.filter().cloned(),
-                    hash_join.join_type(),
-                    hash_join.projection.clone(),
-                    PartitionMode::CollectLeft,
-                    hash_join.null_equality(),
-                )?)))
+                build_collect_left_exec(hash_join, left, right)
             }
         }
-        (true, false) => Ok(Some(Arc::new(HashJoinExec::try_new(
-            Arc::clone(left),
-            Arc::clone(right),
-            hash_join.on().to_vec(),
-            hash_join.filter().cloned(),
-            hash_join.join_type(),
-            hash_join.projection.clone(),
-            PartitionMode::CollectLeft,
-            hash_join.null_equality(),
-        )?))),
+        (true, false) => build_collect_left_exec(hash_join, left, right),
         (false, true) => {
             if hash_join.join_type().supports_swap() {
-                hash_join.swap_inputs(PartitionMode::CollectLeft).map(Some)
+                match hash_join.swap_inputs(PartitionMode::CollectLeft) {
+                    Ok(plan) => Ok(Some(plan)),
+                    Err(err) if is_missing_join_columns(&err) => Ok(None),
+                    Err(err) => Err(err),
+                }
             } else {
                 Ok(None)
             }
         }
         (false, false) => Ok(None),
+    }
+}
+
+fn is_missing_join_columns(err: &DataFusionError) -> bool {
+    matches!(
+        err,
+        DataFusionError::Plan(msg)
+            if msg.contains("The left or right side of the join does not have all columns")
+    )
+}
+
+fn build_collect_left_exec(
+    hash_join: &HashJoinExec,
+    left: &Arc<dyn ExecutionPlan>,
+    right: &Arc<dyn ExecutionPlan>,
+) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+    match HashJoinExec::try_new(
+        Arc::clone(left),
+        Arc::clone(right),
+        hash_join.on().to_vec(),
+        hash_join.filter().cloned(),
+        hash_join.join_type(),
+        hash_join.projection.clone(),
+        PartitionMode::CollectLeft,
+        hash_join.null_equality(),
+    ) {
+        Ok(exec) => Ok(Some(Arc::new(exec))),
+        Err(err) if is_missing_join_columns(&err) => Ok(None),
+        Err(err) => Err(err),
     }
 }
 
