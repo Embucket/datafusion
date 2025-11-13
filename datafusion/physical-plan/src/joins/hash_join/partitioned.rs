@@ -121,20 +121,6 @@ fn per_partition_budget_bytes(memory_threshold: usize, partitions: usize) -> usi
     budget.max(HYBRID_HASH_MIN_PARTITION_BYTES)
 }
 
-#[inline]
-fn hhj_debug<F: FnOnce() -> String>(builder: F) {
-    if log::log_enabled!(
-        target: "datafusion::physical_plan::hash_join::partitioned",
-        log::Level::Debug
-    ) {
-        log::debug!(
-            target: "datafusion::physical_plan::hash_join::partitioned",
-            "{}",
-            builder()
-        );
-    }
-}
-
 /// State of the partitioned hash join stream
 #[derive(Debug, Clone)]
 pub(super) enum PartitionedHashJoinState {
@@ -576,7 +562,6 @@ impl PartitionedHashJoinStream {
         let part_id = descriptor.build_index;
         self.ensure_probe_scheduler_capacity(part_id);
         if self.probe_scheduler_inflight[part_id] {
-            hhj_debug(|| format!("schedule_probe_task skip part {part_id} (inflight)"));
             return;
         }
         let task = SchedulerTask::Probe(ProbeStageTask::new(
@@ -585,7 +570,6 @@ impl PartitionedHashJoinStream {
         ));
         self.probe_task_scheduler.push_task(task);
         self.probe_scheduler_inflight[part_id] = true;
-        hhj_debug(|| format!("schedule_probe_task queued part {part_id}"));
     }
 
     fn finalize_spilled_partition(&mut self, part_id: usize) -> Result<bool> {
@@ -1491,9 +1475,6 @@ impl PartitionedHashJoinStream {
             #[cfg(feature = "hybrid_hash_join_scheduler")]
             {
                 if !self.probe_scheduler_waiting_for_stream.is_empty() {
-                    hhj_debug(|| {
-                        "transition_to_next_partition -> WaitingForProbe".to_string()
-                    });
                     self.state = PartitionedHashJoinState::WaitingForProbe;
                     return;
                 }
@@ -1849,41 +1830,17 @@ impl PartitionedHashJoinStream {
 
         let mut allow_repartition = !self.partition_pass_output_started;
         loop {
-            hhj_debug(|| {
-                format!(
-                    "partition_build_side pass={} num_partitions={} allow_repartition={}",
-                    self.partition_pass, self.num_partitions, allow_repartition
-                )
-            });
             self.reset_partition_state();
 
             match self.try_partition_build_side(&build_data, allow_repartition)? {
                 PartitionBuildStatus::Ready(result) => {
-                    hhj_debug(|| {
-                        format!(
-                            "partition_build_side pass {} completed (num_partitions={})",
-                            self.partition_pass, self.num_partitions
-                        )
-                    });
                     return Ok(result);
                 }
                 PartitionBuildStatus::NeedMorePartitions { next_count } => {
-                    hhj_debug(|| {
-                        format!(
-                            "partition_build_side requesting repartition to {} (current={})",
-                            next_count, self.num_partitions
-                        )
-                    });
                     if next_count <= self.num_partitions
                         || next_count == 0
                         || next_count > self.max_partition_count
                     {
-                        hhj_debug(|| {
-                            format!(
-                                "repartition request invalid (max={} current={}); forcing spill",
-                                self.max_partition_count, self.num_partitions
-                            )
-                        });
                         allow_repartition = false;
                         continue;
                     }
@@ -1965,12 +1922,6 @@ impl PartitionedHashJoinStream {
                                 if self.repartition_worthwhile(partition_estimate) {
                                     if let Some(next_count) = self.next_partition_count()
                                     {
-                                        hhj_debug(|| {
-                                            format!(
-                                                "partition {} exceeded budget (bytes={}) -> requesting repartition to {}",
-                                                build_index, partition_estimate, next_count
-                                            )
-                                        });
                                         repartition_request = Some(next_count);
                                         break;
                                     }
@@ -1990,12 +1941,6 @@ impl PartitionedHashJoinStream {
                                 accum.buffered_bytes.saturating_add(batch_size);
                             if self.repartition_worthwhile(partition_estimate) {
                                 if let Some(next_count) = self.next_partition_count() {
-                                    hhj_debug(|| {
-                                        format!(
-                                            "allocation failure for partition {} (bytes={}) -> requesting repartition to {}",
-                                            build_index, partition_estimate, next_count
-                                        )
-                                    });
                                     repartition_request = Some(next_count);
                                     break;
                                 }
@@ -2022,11 +1967,6 @@ impl PartitionedHashJoinStream {
         }
 
         if let Some(next_count) = repartition_request {
-            hhj_debug(|| {
-                format!(
-                    "try_partition_build_side early repartition request next_count={next_count}"
-                )
-            });
             return Ok(PartitionBuildStatus::NeedMorePartitions { next_count });
         }
 
@@ -2149,15 +2089,6 @@ impl PartitionedHashJoinStream {
             && self.repartition_worthwhile(max_spilled_bytes)
         {
             if let Some(next_count) = self.next_partition_count() {
-                hhj_debug(|| {
-                    format!(
-                        "try_partition_build_side repartition due to spill (max_spilled_bytes={} threshold={} any_spilled={}) next_count={}",
-                        max_spilled_bytes,
-                        self.memory_threshold,
-                        any_spilled,
-                        next_count
-                    )
-                });
                 return Ok(PartitionBuildStatus::NeedMorePartitions { next_count });
             }
         }
@@ -2328,14 +2259,10 @@ impl PartitionedHashJoinStream {
     fn wake_stream_waiter(&mut self) {
         while self.probe_scheduler_active_streams < self.probe_scheduler_max_streams {
             if let Some(next_part) = self.probe_scheduler_waiting_for_stream.pop_front() {
-                hhj_debug(|| format!("wake_stream_waiter considering part {next_part}"));
                 if next_part >= self.partition_pending.len() {
                     continue;
                 }
                 if self.partition_pending[next_part] {
-                    hhj_debug(|| {
-                        format!("wake_stream_waiter skipping part {next_part} (already pending)")
-                    });
                     continue;
                 }
                 if let Some(Some(desc)) =
@@ -2345,18 +2272,12 @@ impl PartitionedHashJoinStream {
                     let waiting_for_probe =
                         matches!(self.state, PartitionedHashJoinState::WaitingForProbe);
                     self.pending_partitions.push_back(desc);
-                    hhj_debug(|| {
-                        format!(
-                            "wake_stream_waiter scheduled part {next_part}, waiting_for_probe={waiting_for_probe}"
-                        )
-                    });
                     if waiting_for_probe {
                         self.transition_to_next_partition();
                     }
                     break;
                 }
             } else {
-                hhj_debug(|| "wake_stream_waiter nothing to wake".to_string());
                 break;
             }
         }
@@ -2370,12 +2291,6 @@ impl PartitionedHashJoinStream {
     ) -> Result<ProbeTaskStatus> {
         let part_id = descriptor.build_index;
         self.schedule_probe_task(descriptor);
-        hhj_debug(|| {
-            format!(
-                "poll_probe_stage_task part {part_id} start, queue_len={}",
-                self.probe_task_scheduler.len()
-            )
-        });
 
         let mut iterations = self.probe_task_scheduler.len();
         while iterations > 0 {
@@ -2388,9 +2303,6 @@ impl PartitionedHashJoinStream {
                     match SchedulerTask::Probe(probe_task).poll(self, Some(cx))? {
                         TaskPoll::ProbeReady(desc) => {
                             let ready_part = desc.build_index;
-                            hhj_debug(|| {
-                                format!("probe task ready for part {ready_part}")
-                            });
                             if ready_part >= self.probe_scheduler_inflight.len() {
                                 self.probe_scheduler_inflight
                                     .resize(ready_part + 1, false);
@@ -2409,7 +2321,6 @@ impl PartitionedHashJoinStream {
                             }
                         }
                         TaskPoll::Pending(next_task) => {
-                            hhj_debug(|| "probe task pending, requeue".to_string());
                             self.probe_task_scheduler.push_task(next_task);
                         }
                         TaskPoll::YieldProbe {
@@ -2427,9 +2338,6 @@ impl PartitionedHashJoinStream {
                         }
                         TaskPoll::ProbeFinished(desc) => {
                             let finished_part = desc.build_index;
-                            hhj_debug(|| {
-                                format!("probe task finished for part {finished_part}")
-                            });
                             if finished_part >= self.probe_scheduler_inflight.len() {
                                 self.probe_scheduler_inflight
                                     .resize(finished_part + 1, false);
@@ -2449,7 +2357,6 @@ impl PartitionedHashJoinStream {
                             }
                         }
                         TaskPoll::YieldFinalize(task) => {
-                            hhj_debug(|| "finalize task yielded".to_string());
                             self.probe_task_scheduler.push_task(task);
                         }
                         TaskPoll::Ready(_) => {
@@ -2460,9 +2367,6 @@ impl PartitionedHashJoinStream {
                     }
                 }
                 other_task => {
-                    hhj_debug(|| {
-                        "non-probe task encountered in probe scheduler".to_string()
-                    });
                     // Unexpected task type for probe scheduling; push back to preserve semantics.
                     self.probe_task_scheduler.push_task(other_task);
                 }
@@ -2470,12 +2374,6 @@ impl PartitionedHashJoinStream {
         }
 
         let queue_len = self.probe_task_scheduler.len();
-        hhj_debug(|| {
-            format!(
-                "poll_probe_stage_task part {part_id} returning Pending (queue_len={})",
-                queue_len
-            )
-        });
         if queue_len > 0 {
             cx.waker().wake_by_ref();
         }
@@ -2619,7 +2517,6 @@ impl PartitionedHashJoinStream {
         partition_state: &ProcessPartitionState,
     ) -> Poll<Result<StatefulStreamResult<Option<RecordBatch>>>> {
         let build_index = partition_state.descriptor.build_index;
-        hhj_debug(|| format!("process_partition enter part {build_index}"));
 
         // Guard against invalid partition ids (off-by-one protection)
         if build_index >= self.build_partitions.len() {
@@ -2676,30 +2573,18 @@ impl PartitionedHashJoinStream {
             if !has_active_batch {
                 match self.poll_probe_stage_task(cx, &partition_state.descriptor)? {
                     ProbeTaskStatus::Ready => {
-                        hhj_debug(|| {
-                            format!("process_partition part {build_index} -> Ready")
-                        });
                         has_active_batch = true;
                     }
                     ProbeTaskStatus::Pending => {
-                        hhj_debug(|| {
-                            format!("process_partition part {build_index} -> Pending")
-                        });
                         return Poll::Pending;
                     }
                     ProbeTaskStatus::WaitingForStream => {
-                        hhj_debug(|| {
-                            format!("process_partition part {build_index} -> WaitingForStream")
-                        });
                         self.enqueue_stream_waiter(build_index);
                         self.current_partition = None;
                         self.transition_to_next_partition();
                         return Poll::Ready(Ok(StatefulStreamResult::Continue));
                     }
                     ProbeTaskStatus::Finished => {
-                        hhj_debug(|| {
-                            format!("process_partition part {build_index} -> Finished")
-                        });
                         self.release_partition_resources(build_index);
                         self.advance_to_next_partition();
                         return Poll::Ready(Ok(StatefulStreamResult::Continue));
@@ -3736,7 +3621,6 @@ impl Stream for PartitionedHashJoinStream {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Self::Item>> {
         loop {
-            hhj_debug(|| format!("poll_next state {:?}", self.state));
             match self.state.clone() {
                 PartitionedHashJoinState::PartitionBuildSide => {
                     // Collect build side and partition it
@@ -3749,7 +3633,6 @@ impl Stream for PartitionedHashJoinStream {
                         Poll::Ready(Err(e)) => return Poll::Ready(Some(Err(e))),
                         Poll::Pending => return Poll::Pending,
                     }
-                    hhj_debug(|| format!("restarting build pass state={:?}", self.state));
                     match self.partition_build_side(left_data) {
                         Ok(StatefulStreamResult::Continue) => continue,
                         Ok(StatefulStreamResult::Ready(Some(batch))) => {
@@ -3798,24 +3681,11 @@ impl Stream for PartitionedHashJoinStream {
                 PartitionedHashJoinState::WaitingForProbe => {
                     if self.pending_partitions.is_empty() {
                         if self.probe_scheduler_waiting_for_stream.is_empty() {
-                            hhj_debug(|| {
-                                "WaitingForProbe -> HandleUnmatchedRows (no waiters)"
-                                    .to_string()
-                            });
                             self.state = PartitionedHashJoinState::HandleUnmatchedRows;
                             continue;
                         }
-                        hhj_debug(|| {
-                            "WaitingForProbe pending=0 waiters>0, parking".to_string()
-                        });
                         return Poll::Pending;
                     } else {
-                        hhj_debug(|| {
-                            format!(
-                                "WaitingForProbe woke with {} pending partitions",
-                                self.pending_partitions.len()
-                            )
-                        });
                         self.transition_to_next_partition();
                         continue;
                     }
