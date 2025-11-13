@@ -38,36 +38,14 @@ use datafusion_execution::disk_manager::RefCountedTempFile;
 use crate::joins::join_hash_map::JoinHashMapOffset;
 use crate::spill::in_progress_spill_file::InProgressSpillFile;
 
-/// Configuration shared across scheduler components.
-#[derive(Clone, Debug)]
-pub(super) struct SchedulerConfig {
-    pub memory_threshold: usize,
-    pub batch_size: usize,
-    pub max_partition_count: usize,
-    pub max_probe_streams: usize,
-}
-
-impl SchedulerConfig {
-    pub fn from_stream(stream: &PartitionedHashJoinStream) -> Self {
-        Self {
-            memory_threshold: stream.memory_threshold,
-            batch_size: stream.batch_size,
-            max_partition_count: stream.max_partition_count,
-            max_probe_streams: std::cmp::max(1, std::cmp::min(4, stream.num_partitions)),
-        }
-    }
-}
-
 /// Minimal scheduler capable of running build / probe / finalize tasks.
 pub(super) struct HybridTaskScheduler {
-    config: SchedulerConfig,
     ready_queue: VecDeque<SchedulerTask>,
 }
 
 impl HybridTaskScheduler {
-    pub fn new(config: SchedulerConfig) -> Self {
+    pub fn new() -> Self {
         Self {
-            config,
             ready_queue: VecDeque::new(),
         }
     }
@@ -84,37 +62,12 @@ impl HybridTaskScheduler {
         self.ready_queue.len()
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.ready_queue.is_empty()
-    }
-
-    pub fn with_build_task(
-        config: SchedulerConfig,
-        build_data: Arc<JoinLeftData>,
-    ) -> Self {
-        let mut scheduler = Self::new(config.clone());
+    pub fn with_build_task(build_data: Arc<JoinLeftData>) -> Self {
+        let mut scheduler = Self::new();
         scheduler
             .ready_queue
-            .push_back(SchedulerTask::Build(BuildStageTask::new(
-                config, build_data,
-            )));
+            .push_back(SchedulerTask::Build(BuildStageTask::new(build_data)));
         scheduler
-    }
-
-    pub fn enqueue_probe_task(&mut self, descriptor: PartitionDescriptor) {
-        self.ready_queue
-            .push_back(SchedulerTask::Probe(ProbeStageTask::new(
-                self.config.clone(),
-                descriptor,
-            )));
-    }
-
-    pub fn enqueue_finalize_task(&mut self, descriptor: PartitionDescriptor) {
-        self.ready_queue
-            .push_back(SchedulerTask::Finalize(FinalizeStageTask::new(
-                self.config.clone(),
-                descriptor,
-            )));
     }
 
     pub fn run_until_build_finished(
@@ -123,13 +76,11 @@ impl HybridTaskScheduler {
     ) -> Result<StatefulStreamResult<Option<RecordBatch>>> {
         while let Some(task) = self.ready_queue.pop_front() {
             match task.poll(stream, None)? {
-                TaskPoll::Ready(_) => continue,
                 TaskPoll::ProbeReady(_) => continue,
                 TaskPoll::Pending(task) => self.ready_queue.push_back(task),
                 TaskPoll::BuildFinished(result) => return Ok(result),
                 TaskPoll::YieldProbe { task, .. } => self.ready_queue.push_back(task),
-                TaskPoll::YieldFinalize(task) => self.ready_queue.push_back(task),
-                TaskPoll::ProbeFinished(_) | TaskPoll::FinalizeFinished => continue,
+                TaskPoll::ProbeFinished(_) => continue,
             }
         }
         Err(internal_datafusion_err!(
@@ -141,11 +92,9 @@ impl HybridTaskScheduler {
 pub(super) enum SchedulerTask {
     Build(BuildStageTask),
     Probe(ProbeStageTask),
-    Finalize(FinalizeStageTask),
 }
 
 pub(super) enum TaskPoll {
-    Ready(Option<RecordBatch>),
     ProbeReady(PartitionDescriptor),
     Pending(SchedulerTask),
     BuildFinished(StatefulStreamResult<Option<RecordBatch>>),
@@ -154,10 +103,7 @@ pub(super) enum TaskPoll {
         task: SchedulerTask,
         descriptor: PartitionDescriptor,
     },
-    /// Finalize task yielded without producing output.
-    YieldFinalize(SchedulerTask),
     ProbeFinished(PartitionDescriptor),
-    FinalizeFinished,
 }
 
 impl SchedulerTask {
@@ -191,19 +137,12 @@ impl SchedulerTask {
                     ProbeTaskEvent::Finished => Ok(TaskPoll::ProbeFinished(descriptor)),
                 }
             }
-            SchedulerTask::Finalize(task) => match task.poll(stream)? {
-                FinalizeTaskEvent::Pending(next_task) => {
-                    Ok(TaskPoll::YieldFinalize(SchedulerTask::Finalize(next_task)))
-                }
-                FinalizeTaskEvent::Finished => Ok(TaskPoll::FinalizeFinished),
-            },
         }
     }
 }
 
 /// Build stage broken into multiple cooperative steps so the scheduler can interleave it.
 struct BuildStageTask {
-    config: SchedulerConfig,
     build_data: Option<Arc<JoinLeftData>>,
     step: BuildTaskStep,
     warmup_remaining: usize,
@@ -217,9 +156,8 @@ enum BuildTaskStep {
 }
 
 impl BuildStageTask {
-    fn new(config: SchedulerConfig, build_data: Arc<JoinLeftData>) -> Self {
+    fn new(build_data: Arc<JoinLeftData>) -> Self {
         Self {
-            config,
             build_data: Some(build_data),
             step: BuildTaskStep::Init,
             warmup_remaining: 2, // allow a couple of yields before heavy work
@@ -312,15 +250,13 @@ enum ProbeTaskState {
 }
 
 pub(super) struct ProbeStageTask {
-    _config: SchedulerConfig,
     descriptor: PartitionDescriptor,
     state: ProbeTaskState,
 }
 
 impl ProbeStageTask {
-    pub fn new(config: SchedulerConfig, descriptor: PartitionDescriptor) -> Self {
+    pub fn new(descriptor: PartitionDescriptor) -> Self {
         Self {
-            _config: config,
             descriptor,
             state: ProbeTaskState::Init,
         }
@@ -362,37 +298,5 @@ enum ProbeTaskEvent {
     Pending(ProbeStageTask),
     Ready,
     NeedStream(ProbeStageTask),
-    Finished,
-}
-
-struct FinalizeStageTask {
-    config: SchedulerConfig,
-    descriptor: PartitionDescriptor,
-    yielded_once: bool,
-}
-
-impl FinalizeStageTask {
-    fn new(config: SchedulerConfig, descriptor: PartitionDescriptor) -> Self {
-        Self {
-            config,
-            descriptor,
-            yielded_once: false,
-        }
-    }
-
-    fn poll(self, _stream: &mut PartitionedHashJoinStream) -> Result<FinalizeTaskEvent> {
-        if self.yielded_once {
-            Ok(FinalizeTaskEvent::Finished)
-        } else {
-            Ok(FinalizeTaskEvent::Pending(Self {
-                yielded_once: true,
-                ..self
-            }))
-        }
-    }
-}
-
-enum FinalizeTaskEvent {
-    Pending(FinalizeStageTask),
     Finished,
 }

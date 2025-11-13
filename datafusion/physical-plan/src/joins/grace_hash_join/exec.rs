@@ -59,7 +59,6 @@ use datafusion_physical_expr::expressions::{lit, DynamicFilterPhysicalExpr};
 use datafusion_physical_expr::{PhysicalExpr, PhysicalExprRef};
 
 use crate::joins::grace_hash_join::stream::{GraceHashJoinStream, SpillFut};
-use crate::joins::hash_join::shared_bounds::SharedBoundsAccumulator;
 use crate::metrics::SpillMetrics;
 use crate::spill::spill_manager::SpillLocation;
 use ahash::RandomState;

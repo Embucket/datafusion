@@ -46,7 +46,7 @@
 #[cfg(feature = "hybrid_hash_join_scheduler")]
 use super::scheduler::{
     HybridTaskScheduler, ProbeDataPoll, ProbePartitionState, ProbeStageTask,
-    SchedulerConfig, SchedulerTask, TaskPoll,
+    SchedulerTask, TaskPoll,
 };
 use crate::joins::hash_join::exec::JoinLeftData;
 use crate::joins::join_hash_map::{JoinHashMapType, JoinHashMapU32, JoinHashMapU64};
@@ -461,8 +461,7 @@ impl PartitionedHashJoinStream {
             self.probe_scheduler_waiting_for_stream = VecDeque::new();
             self.probe_scheduler_active_streams = 0;
             self.probe_scheduler_max_streams = std::cmp::max(1, std::cmp::min(4, n));
-            self.probe_task_scheduler =
-                HybridTaskScheduler::new(SchedulerConfig::from_stream(self));
+            self.probe_task_scheduler = HybridTaskScheduler::new();
         }
         self.matched_rows_per_part = vec![0; n];
         self.emitted_rows_per_part = vec![0; n];
@@ -556,10 +555,7 @@ impl PartitionedHashJoinStream {
         if self.probe_scheduler_inflight[part_id] {
             return;
         }
-        let task = SchedulerTask::Probe(ProbeStageTask::new(
-            SchedulerConfig::from_stream(self),
-            descriptor.clone(),
-        ));
+        let task = SchedulerTask::Probe(ProbeStageTask::new(descriptor.clone()));
         self.probe_task_scheduler.push_task(task);
         self.probe_scheduler_inflight[part_id] = true;
     }
@@ -1326,8 +1322,7 @@ impl PartitionedHashJoinStream {
         self.probe_states.clear();
         #[cfg(feature = "hybrid_hash_join_scheduler")]
         {
-            self.probe_task_scheduler =
-                HybridTaskScheduler::new(SchedulerConfig::from_stream(self));
+            self.probe_task_scheduler = HybridTaskScheduler::new();
             self.probe_scheduler_inflight.clear();
             self.probe_scheduler_waiting_for_stream.clear();
             self.probe_scheduler_active_streams = 0;
@@ -1696,12 +1691,8 @@ impl PartitionedHashJoinStream {
             .min(max_partition_count);
 
         #[cfg(feature = "hybrid_hash_join_scheduler")]
-        let scheduler_config = SchedulerConfig {
-            memory_threshold,
-            batch_size,
-            max_partition_count,
-            max_probe_streams: std::cmp::max(1, std::cmp::min(4, num_partitions)),
-        };
+        let scheduler_max_probe_streams =
+            std::cmp::max(1, std::cmp::min(4, num_partitions));
 
         Ok(Self {
             partition,
@@ -1726,7 +1717,7 @@ impl PartitionedHashJoinStream {
                 .map(|_| ProbePartitionState::new())
                 .collect(),
             #[cfg(feature = "hybrid_hash_join_scheduler")]
-            probe_task_scheduler: HybridTaskScheduler::new(scheduler_config.clone()),
+            probe_task_scheduler: HybridTaskScheduler::new(),
             #[cfg(feature = "hybrid_hash_join_scheduler")]
             probe_scheduler_inflight: vec![false; num_partitions],
             #[cfg(feature = "hybrid_hash_join_scheduler")]
@@ -1734,7 +1725,7 @@ impl PartitionedHashJoinStream {
             #[cfg(feature = "hybrid_hash_join_scheduler")]
             probe_scheduler_active_streams: 0,
             #[cfg(feature = "hybrid_hash_join_scheduler")]
-            probe_scheduler_max_streams: scheduler_config.max_probe_streams,
+            probe_scheduler_max_streams: scheduler_max_probe_streams,
             current_partition: None,
             pending_partitions: VecDeque::new(),
             probe_spill_manager,
@@ -1774,9 +1765,7 @@ impl PartitionedHashJoinStream {
         &mut self,
         build_data: Arc<JoinLeftData>,
     ) -> Result<StatefulStreamResult<Option<RecordBatch>>> {
-        let config = SchedulerConfig::from_stream(self);
-        HybridTaskScheduler::with_build_task(config, build_data)
-            .run_until_build_finished(self)
+        HybridTaskScheduler::with_build_task(build_data).run_until_build_finished(self)
     }
 
     /// Partition build-side data into multiple partitions (legacy serial path)
@@ -2341,14 +2330,7 @@ impl PartitionedHashJoinStream {
                                 }
                             }
                         }
-                        TaskPoll::YieldFinalize(task) => {
-                            self.probe_task_scheduler.push_task(task);
-                        }
-                        TaskPoll::Ready(_) => {
-                            // Build/finalize ready events are ignored in probe context.
-                        }
                         TaskPoll::BuildFinished(_) => {}
-                        TaskPoll::FinalizeFinished => {}
                     }
                 }
                 other_task => {
