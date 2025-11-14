@@ -27,15 +27,15 @@ use crate::PhysicalOptimizerRule;
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::error::Result;
 use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
-use datafusion_common::{internal_err, JoinSide, JoinType};
+use datafusion_common::{DataFusionError, JoinSide, JoinType, internal_err};
 use datafusion_expr_common::sort_properties::SortProperties;
 use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_expr::LexOrdering;
 use datafusion_physical_plan::execution_plan::EmissionType;
 use datafusion_physical_plan::joins::utils::ColumnIndex;
 use datafusion_physical_plan::joins::{
-    CrossJoinExec, HashJoinExec, NestedLoopJoinExec, PartitionMode,
-    StreamJoinPartitionMode, SymmetricHashJoinExec,
+    CrossJoinExec, HashJoinExec, GraceHashJoinExec, NestedLoopJoinExec, PartitionMode,
+    StreamJoinPartitionMode, SymmetricHashJoinExec
 };
 use datafusion_physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 use std::sync::Arc;
@@ -134,12 +134,14 @@ impl PhysicalOptimizerRule for JoinSelection {
         let config = &config.optimizer;
         let collect_threshold_byte_size = config.hash_join_single_partition_threshold;
         let collect_threshold_num_rows = config.hash_join_single_partition_threshold_rows;
+        let enable_grace_hash_join = config.enable_grace_hash_join;
         new_plan
             .transform_up(|plan| {
                 statistical_join_selection_subrule(
                     plan,
                     collect_threshold_byte_size,
                     collect_threshold_num_rows,
+                    enable_grace_hash_join,
                 )
             })
             .data()
@@ -187,38 +189,58 @@ pub(crate) fn try_collect_left(
             if hash_join.join_type().supports_swap()
                 && should_swap_join_order(&**left, &**right)?
             {
-                Ok(Some(hash_join.swap_inputs(PartitionMode::CollectLeft)?))
+                match hash_join.swap_inputs(PartitionMode::CollectLeft) {
+                    Ok(plan) => Ok(Some(plan)),
+                    Err(err) if is_missing_join_columns(&err) => Ok(None),
+                    Err(err) => Err(err),
+                }
             } else {
-                Ok(Some(Arc::new(HashJoinExec::try_new(
-                    Arc::clone(left),
-                    Arc::clone(right),
-                    hash_join.on().to_vec(),
-                    hash_join.filter().cloned(),
-                    hash_join.join_type(),
-                    hash_join.projection.clone(),
-                    PartitionMode::CollectLeft,
-                    hash_join.null_equality(),
-                )?)))
+                build_collect_left_exec(hash_join, left, right)
             }
         }
-        (true, false) => Ok(Some(Arc::new(HashJoinExec::try_new(
-            Arc::clone(left),
-            Arc::clone(right),
-            hash_join.on().to_vec(),
-            hash_join.filter().cloned(),
-            hash_join.join_type(),
-            hash_join.projection.clone(),
-            PartitionMode::CollectLeft,
-            hash_join.null_equality(),
-        )?))),
+        (true, false) => build_collect_left_exec(hash_join, left, right),
         (false, true) => {
             if hash_join.join_type().supports_swap() {
-                hash_join.swap_inputs(PartitionMode::CollectLeft).map(Some)
+                match hash_join.swap_inputs(PartitionMode::CollectLeft) {
+                    Ok(plan) => Ok(Some(plan)),
+                    Err(err) if is_missing_join_columns(&err) => Ok(None),
+                    Err(err) => Err(err),
+                }
             } else {
                 Ok(None)
             }
         }
         (false, false) => Ok(None),
+    }
+}
+
+
+fn is_missing_join_columns(err: &DataFusionError) -> bool {
+    matches!(
+        err,
+        DataFusionError::Plan(msg)
+            if msg.contains("The left or right side of the join does not have all columns")
+    )
+}
+
+fn build_collect_left_exec(
+    hash_join: &HashJoinExec,
+    left: &Arc<dyn ExecutionPlan>,
+    right: &Arc<dyn ExecutionPlan>,
+) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+    match HashJoinExec::try_new(
+        Arc::clone(left),
+        Arc::clone(right),
+        hash_join.on().to_vec(),
+        hash_join.filter().cloned(),
+        hash_join.join_type(),
+        hash_join.projection.clone(),
+        PartitionMode::CollectLeft,
+        hash_join.null_equality(),
+    ) {
+        Ok(exec) => Ok(Some(Arc::new(exec))),
+        Err(err) if is_missing_join_columns(&err) => Ok(None),
+        Err(err) => Err(err),
     }
 }
 
@@ -229,11 +251,30 @@ pub(crate) fn try_collect_left(
 /// creates a standard partitioned hash join.
 pub(crate) fn partitioned_hash_join(
     hash_join: &HashJoinExec,
+    enable_grace: bool,
 ) -> Result<Arc<dyn ExecutionPlan>> {
     let left = hash_join.left();
     let right = hash_join.right();
-    if hash_join.join_type().supports_swap() && should_swap_join_order(&**left, &**right)?
-    {
+    let should_swap = hash_join.join_type().supports_swap()
+    && should_swap_join_order(&**left, &**right)?;
+    if enable_grace {
+        let grace = Arc::new(GraceHashJoinExec::try_new(
+           Arc::clone(left),
+           Arc::clone(right),
+           hash_join.on().to_vec(),
+           hash_join.filter().cloned(),
+           hash_join.join_type(),
+           hash_join.projection.clone(),
+           hash_join.null_equality(),
+       )?);
+        return if should_swap {
+            grace.swap_inputs(PartitionMode::Partitioned)
+        } else {
+            Ok(grace)
+        };
+    }
+
+    if should_swap {
         hash_join.swap_inputs(PartitionMode::Partitioned)
     } else {
         Ok(Arc::new(HashJoinExec::try_new(
@@ -255,6 +296,7 @@ fn statistical_join_selection_subrule(
     plan: Arc<dyn ExecutionPlan>,
     collect_threshold_byte_size: usize,
     collect_threshold_num_rows: usize,
+    enable_grace_hash_join: bool,
 ) -> Result<Transformed<Arc<dyn ExecutionPlan>>> {
     let transformed =
         if let Some(hash_join) = plan.as_any().downcast_ref::<HashJoinExec>() {
@@ -266,12 +308,12 @@ fn statistical_join_selection_subrule(
                     collect_threshold_num_rows,
                 )?
                 .map_or_else(
-                    || partitioned_hash_join(hash_join).map(Some),
+                    || partitioned_hash_join(hash_join, enable_grace_hash_join).map(Some),
                     |v| Ok(Some(v)),
                 )?,
                 PartitionMode::CollectLeft => try_collect_left(hash_join, true, 0, 0)?
                     .map_or_else(
-                        || partitioned_hash_join(hash_join).map(Some),
+                        || partitioned_hash_join(hash_join, enable_grace_hash_join).map(Some),
                         |v| Ok(Some(v)),
                     )?,
                 PartitionMode::Partitioned => {

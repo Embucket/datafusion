@@ -761,6 +761,11 @@ config_namespace! {
         /// using the provided `target_partitions` level
         pub repartition_joins: bool, default = true
 
+        /// When set to true, use grace hash join operator instead of hash joins.
+        /// Grace hash join operator which repartitions both inputs to disk before performing the join.
+        /// This trades additional IO for predictable memory usage on very large joins.
+        pub enable_grace_hash_join: bool, default = false
+
         /// Should DataFusion allow symmetric hash joins for unbounded data sources even when
         /// its inputs do not have any ordering or filtering If the flag is not enabled,
         /// the SymmetricHashJoin operator will be unable to prune its internal buffers,
