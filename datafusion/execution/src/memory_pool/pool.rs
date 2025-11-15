@@ -329,6 +329,8 @@ pub struct TrackConsumersPool<I> {
     top: NonZeroUsize,
     /// Maps consumer_id --> TrackedConsumer
     tracked_consumers: Mutex<HashMap<usize, TrackedConsumer>>,
+    /// For optional debug logging of top consumers as memory usage grows
+    debug_last_reported: AtomicUsize,
 }
 
 impl<I: MemoryPool> TrackConsumersPool<I> {
@@ -371,6 +373,7 @@ impl<I: MemoryPool> TrackConsumersPool<I> {
             inner,
             top,
             tracked_consumers: Default::default(),
+            debug_last_reported: AtomicUsize::new(0),
         }
     }
 
@@ -443,6 +446,24 @@ impl<I: MemoryPool> MemoryPool for TrackConsumersPool<I> {
             .and_modify(|tracked_consumer| {
                 tracked_consumer.grow(additional);
             });
+
+        // Optional debug logging: when enabled via DATAFUSION_DEBUG_MEMORY_TOP,
+        // periodically log the top memory consumers as total reserved memory grows.
+        if std::env::var_os("DATAFUSION_DEBUG_MEMORY_TOP").is_some() {
+            let reserved = self.inner.reserved();
+            // Log roughly every 256MB increase in tracked reserved memory
+            const STEP: usize = 256 * 1024 * 1024;
+            let last = self.debug_last_reported.load(Ordering::Relaxed);
+            if reserved / STEP > last / STEP {
+                self.debug_last_reported
+                    .store(reserved, Ordering::Relaxed);
+                debug!(
+                    "Tracked memory ~{} reserved; top consumers:\n{}",
+                    human_readable_size(reserved),
+                    self.report_top(self.top.into())
+                );
+            }
+        }
     }
 
     fn shrink(&self, reservation: &MemoryReservation, shrink: usize) {
