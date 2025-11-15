@@ -301,21 +301,53 @@ fn statistical_join_selection_subrule(
     let transformed =
         if let Some(hash_join) = plan.as_any().downcast_ref::<HashJoinExec>() {
             match hash_join.partition_mode() {
-                PartitionMode::Auto => try_collect_left(
-                    hash_join,
-                    false,
-                    collect_threshold_byte_size,
-                    collect_threshold_num_rows,
-                )?
-                .map_or_else(
-                    || partitioned_hash_join(hash_join, enable_grace_hash_join).map(Some),
-                    |v| Ok(Some(v)),
-                )?,
-                PartitionMode::CollectLeft => try_collect_left(hash_join, true, 0, 0)?
-                    .map_or_else(
-                        || partitioned_hash_join(hash_join, enable_grace_hash_join).map(Some),
-                        |v| Ok(Some(v)),
-                    )?,
+                PartitionMode::Auto => {
+                    if enable_grace_hash_join 
+                    {
+                        Some(partitioned_hash_join(
+                            hash_join,
+                            enable_grace_hash_join,
+                        )?)
+                    } else {
+                        try_collect_left(
+                            hash_join,
+                            false,
+                            collect_threshold_byte_size,
+                            collect_threshold_num_rows,
+                        )?
+                        .map_or_else(
+                            || {
+                                partitioned_hash_join(
+                                    hash_join,
+                                    enable_grace_hash_join,
+                                )
+                                .map(Some)
+                            },
+                            |v| Ok(Some(v)),
+                        )?
+                    }
+                }
+                PartitionMode::CollectLeft => {
+                    if enable_grace_hash_join
+                    {
+                        Some(partitioned_hash_join(
+                            hash_join,
+                            enable_grace_hash_join,
+                        )?)
+                    } else {
+                        try_collect_left(hash_join, true, 0, 0)?
+                            .map_or_else(
+                                || {
+                                    partitioned_hash_join(
+                                        hash_join,
+                                        enable_grace_hash_join,
+                                    )
+                                    .map(Some)
+                                },
+                                |v| Ok(Some(v)),
+                            )?
+                    }
+                }
                 PartitionMode::Partitioned => {
                     let left = hash_join.left();
                     let right = hash_join.right();
