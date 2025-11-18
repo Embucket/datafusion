@@ -1,5 +1,5 @@
 use crate::memory::MemoryStream;
-use crate::spill::spill_manager::GetSlicedSize;
+use crate::spill::get_record_batch_memory_size;
 use arrow::array::RecordBatch;
 use datafusion_common::Result;
 use datafusion_execution::SendableRecordBatchStream;
@@ -15,7 +15,7 @@ impl InMemorySpillBuffer {
     pub fn from_batch(batch: &RecordBatch) -> Result<Self> {
         Ok(Self {
             batches: vec![batch.clone()],
-            total_bytes: batch.get_sliced_size()?,
+            total_bytes: get_record_batch_memory_size(batch),
         })
     }
 
@@ -23,7 +23,7 @@ impl InMemorySpillBuffer {
         let mut total_bytes = 0;
         let mut owned = Vec::with_capacity(batches.len());
         for b in batches {
-            total_bytes += b.get_sliced_size()?;
+            total_bytes += get_record_batch_memory_size(b);
             owned.push(b.clone());
         }
         Ok(Self {

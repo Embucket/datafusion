@@ -30,6 +30,7 @@ use datafusion_execution::SendableRecordBatchStream;
 
 use super::{in_progress_spill_file::InProgressSpillFile, SpillReaderStream};
 use crate::coop::cooperative;
+use crate::spill::get_record_batch_memory_size;
 use crate::spill::in_memory_spill_buffer::InMemorySpillBuffer;
 use crate::{common::spawn_buffered, metrics::SpillMetrics};
 
@@ -184,7 +185,7 @@ impl SpillManager {
         // };
         // Ok(SpillLocation::Disk(Arc::new(file)))
         // //
-        let size = batch.get_sliced_size()?;
+        let size = get_record_batch_memory_size(batch);
 
         // Check current memory usage and total limit from the runtime memory pool
         let used = self.env.memory_pool.reserved();
