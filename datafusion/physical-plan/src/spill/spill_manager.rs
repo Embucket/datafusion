@@ -232,21 +232,23 @@ impl SpillManager {
         &self,
         spill_file_path: RefCountedTempFile,
     ) -> Result<SendableRecordBatchStream> {
-        let stream = Box::pin(cooperative(SpillReaderStream::new(
-            Arc::clone(&self.schema),
-            spill_file_path,
-        )));
-
-        Ok(spawn_buffered(stream, self.batch_read_buffer_capacity))
+        self.read_spill_as_stream_with_arc(Arc::new(spill_file_path))
     }
 
     pub fn read_spill_as_stream_ref(
         &self,
-        spill_file_path: &RefCountedTempFile,
+        spill_file_path: &Arc<RefCountedTempFile>,
+    ) -> Result<SendableRecordBatchStream> {
+        self.read_spill_as_stream_with_arc(Arc::clone(spill_file_path))
+    }
+
+    fn read_spill_as_stream_with_arc(
+        &self,
+        spill_file: Arc<RefCountedTempFile>,
     ) -> Result<SendableRecordBatchStream> {
         let stream = Box::pin(cooperative(SpillReaderStream::new(
             Arc::clone(&self.schema),
-            spill_file_path.clone_refcounted()?,
+            spill_file,
         )));
 
         Ok(spawn_buffered(stream, self.batch_read_buffer_capacity))
