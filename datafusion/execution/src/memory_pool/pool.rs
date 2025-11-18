@@ -455,8 +455,7 @@ impl<I: MemoryPool> MemoryPool for TrackConsumersPool<I> {
             const STEP: usize = 256 * 1024 * 1024;
             let last = self.debug_last_reported.load(Ordering::Relaxed);
             if reserved / STEP > last / STEP {
-                self.debug_last_reported
-                    .store(reserved, Ordering::Relaxed);
+                self.debug_last_reported.store(reserved, Ordering::Relaxed);
                 debug!(
                     "Tracked memory ~{} reserved; top consumers:\n{}",
                     human_readable_size(reserved),

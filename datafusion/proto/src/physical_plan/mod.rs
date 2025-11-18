@@ -77,8 +77,8 @@ use datafusion::physical_plan::expressions::PhysicalSortExpr;
 use datafusion::physical_plan::filter::FilterExec;
 use datafusion::physical_plan::joins::utils::{ColumnIndex, JoinFilter};
 use datafusion::physical_plan::joins::{
-    CrossJoinExec, GraceHashJoinExec, NestedLoopJoinExec, SortMergeJoinExec, StreamJoinPartitionMode,
-    SymmetricHashJoinExec,
+    CrossJoinExec, GraceHashJoinExec, NestedLoopJoinExec, SortMergeJoinExec,
+    StreamJoinPartitionMode, SymmetricHashJoinExec,
 };
 use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
 use datafusion::physical_plan::limit::{GlobalLimitExec, LocalLimitExec};
@@ -220,7 +220,7 @@ impl AsExecutionPlan for protobuf::PhysicalPlanNode {
                     ctx,
                     runtime,
                     extension_codec,
-                ),    
+                ),
             PhysicalPlanType::SymmetricHashJoin(sym_join) => self
                 .try_into_symmetric_hash_join_physical_plan(
                     sym_join,

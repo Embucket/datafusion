@@ -33,13 +33,16 @@ use crate::{
 use crate::empty::EmptyExec;
 use crate::joins::grace_hash_join::exec::PartitionIndex;
 use crate::joins::{HashJoinExec, PartitionMode};
+use crate::spill::get_record_batch_memory_size;
 use crate::test::TestMemoryExec;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use datafusion_common::{JoinType, NullEquality, Result};
+use datafusion_execution::memory_pool::MemoryReservation;
 use datafusion_execution::TaskContext;
 use datafusion_physical_expr::PhysicalExprRef;
 use futures::{ready, Stream, StreamExt};
+use parking_lot::Mutex;
 
 enum GraceJoinState {
     /// Waiting for the partitioning phase (Phase 1) to finish
@@ -52,6 +55,12 @@ enum GraceJoinState {
         current_stream: Option<SendableRecordBatchStream>,
         left_fut: Option<OnceFut<Vec<RecordBatch>>>,
         right_fut: Option<OnceFut<Vec<RecordBatch>>>,
+        /// Bytes reserved in the memory pool for the current partition's
+        /// loaded left batches
+        left_bytes: Arc<Mutex<usize>>,
+        /// Bytes reserved in the memory pool for the current partition's
+        /// loaded right batches
+        right_bytes: Arc<Mutex<usize>>,
     },
 
     Done,
@@ -72,6 +81,8 @@ pub struct GraceHashJoinStream {
     column_indices: Vec<ColumnIndex>,
     join_metrics: Arc<BuildProbeJoinMetrics>,
     context: Arc<TaskContext>,
+    /// Memory reservation tracking in-memory buffers used by the join stream
+    reservation: Arc<Mutex<MemoryReservation>>,
     state: GraceJoinState,
 }
 
@@ -112,6 +123,7 @@ impl GraceHashJoinStream {
         column_indices: Vec<ColumnIndex>,
         join_metrics: Arc<BuildProbeJoinMetrics>,
         context: Arc<TaskContext>,
+        reservation: MemoryReservation,
     ) -> Self {
         Self {
             schema,
@@ -128,6 +140,7 @@ impl GraceHashJoinStream {
             column_indices,
             join_metrics,
             context,
+            reservation: Arc::new(Mutex::new(reservation)),
             state: GraceJoinState::WaitPartitioning,
         }
     }
@@ -142,12 +155,16 @@ impl GraceHashJoinStream {
                 GraceJoinState::WaitPartitioning => {
                     let shared = ready!(self.spill_fut.get_shared(cx))?;
                     let parts = Arc::new(vec![(*shared).clone()]);
+                    let left_bytes = Arc::new(Mutex::new(0usize));
+                    let right_bytes = Arc::new(Mutex::new(0usize));
                     self.state = GraceJoinState::JoinPartition {
                         current: 0,
                         all_parts: parts,
                         current_stream: None,
                         left_fut: None,
                         right_fut: None,
+                        left_bytes,
+                        right_bytes,
                     };
                     continue;
                 }
@@ -157,6 +174,8 @@ impl GraceHashJoinStream {
                     current_stream,
                     left_fut,
                     right_fut,
+                    left_bytes,
+                    right_bytes,
                 } => {
                     if *current >= all_parts.len() {
                         self.state = GraceJoinState::Done;
@@ -170,10 +189,14 @@ impl GraceHashJoinStream {
                             *left_fut = Some(load_partition_async(
                                 Arc::clone(&self.spill_left),
                                 spill_fut.left.clone(),
+                                Arc::clone(&self.reservation),
+                                Arc::clone(left_bytes),
                             ));
                             *right_fut = Some(load_partition_async(
                                 Arc::clone(&self.spill_right),
                                 spill_fut.right.clone(),
+                                Arc::clone(&self.reservation),
+                                Arc::clone(right_bytes),
                             ));
                         }
 
@@ -210,6 +233,20 @@ impl GraceHashJoinStream {
                             Some(Ok(batch)) => return Poll::Ready(Some(Ok(batch))),
                             Some(Err(e)) => return Poll::Ready(Some(Err(e))),
                             None => {
+                                // Partition finished: release the memory reserved for
+                                // loaded batches for this partition.
+                                let bytes_to_free = {
+                                    let mut l = left_bytes.lock();
+                                    let mut r = right_bytes.lock();
+                                    let total = *l + *r;
+                                    *l = 0;
+                                    *r = 0;
+                                    total
+                                };
+                                if bytes_to_free > 0 {
+                                    let mut res = self.reservation.lock();
+                                    res.shrink(bytes_to_free);
+                                }
                                 *current += 1;
                                 *current_stream = None;
                                 continue;
@@ -226,6 +263,8 @@ impl GraceHashJoinStream {
 fn load_partition_async(
     spill_manager: Arc<SpillManager>,
     partitions: Vec<PartitionIndex>,
+    reservation: Arc<Mutex<MemoryReservation>>,
+    bytes_counter: Arc<Mutex<usize>>,
 ) -> OnceFut<Vec<RecordBatch>> {
     OnceFut::new(async move {
         let mut all_batches = Vec::new();
@@ -235,6 +274,15 @@ fn load_partition_async(
                 let mut reader = spill_manager.load_spilled_batch(&chunk)?;
                 while let Some(batch_result) = reader.next().await {
                     let batch = batch_result?;
+                    // Use de-duplicated record batch memory size to avoid
+                    // drastically overestimating memory when arrays share buffers.
+                    let batch_size = get_record_batch_memory_size(&batch);
+                    {
+                        let mut res = reservation.lock();
+                        res.try_grow(batch_size)?;
+                        let mut b = bytes_counter.lock();
+                        *b += batch_size;
+                    }
                     all_batches.push(batch);
                 }
             }

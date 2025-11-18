@@ -27,15 +27,15 @@ use crate::PhysicalOptimizerRule;
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::error::Result;
 use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
-use datafusion_common::{DataFusionError, JoinSide, JoinType, internal_err};
+use datafusion_common::{internal_err, DataFusionError, JoinSide, JoinType};
 use datafusion_expr_common::sort_properties::SortProperties;
 use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_expr::LexOrdering;
 use datafusion_physical_plan::execution_plan::EmissionType;
 use datafusion_physical_plan::joins::utils::ColumnIndex;
 use datafusion_physical_plan::joins::{
-    CrossJoinExec, HashJoinExec, GraceHashJoinExec, NestedLoopJoinExec, PartitionMode,
-    StreamJoinPartitionMode, SymmetricHashJoinExec
+    CrossJoinExec, GraceHashJoinExec, HashJoinExec, NestedLoopJoinExec, PartitionMode,
+    StreamJoinPartitionMode, SymmetricHashJoinExec,
 };
 use datafusion_physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 use std::sync::Arc;
@@ -214,7 +214,6 @@ pub(crate) fn try_collect_left(
     }
 }
 
-
 fn is_missing_join_columns(err: &DataFusionError) -> bool {
     matches!(
         err,
@@ -256,17 +255,17 @@ pub(crate) fn partitioned_hash_join(
     let left = hash_join.left();
     let right = hash_join.right();
     let should_swap = hash_join.join_type().supports_swap()
-    && should_swap_join_order(&**left, &**right)?;
+        && should_swap_join_order(&**left, &**right)?;
     if enable_grace {
         let grace = Arc::new(GraceHashJoinExec::try_new(
-           Arc::clone(left),
-           Arc::clone(right),
-           hash_join.on().to_vec(),
-           hash_join.filter().cloned(),
-           hash_join.join_type(),
-           hash_join.projection.clone(),
-           hash_join.null_equality(),
-       )?);
+            Arc::clone(left),
+            Arc::clone(right),
+            hash_join.on().to_vec(),
+            hash_join.filter().cloned(),
+            hash_join.join_type(),
+            hash_join.projection.clone(),
+            hash_join.null_equality(),
+        )?);
         return if should_swap {
             grace.swap_inputs(PartitionMode::Partitioned)
         } else {
@@ -302,12 +301,8 @@ fn statistical_join_selection_subrule(
         if let Some(hash_join) = plan.as_any().downcast_ref::<HashJoinExec>() {
             match hash_join.partition_mode() {
                 PartitionMode::Auto => {
-                    if enable_grace_hash_join 
-                    {
-                        Some(partitioned_hash_join(
-                            hash_join,
-                            enable_grace_hash_join,
-                        )?)
+                    if enable_grace_hash_join {
+                        Some(partitioned_hash_join(hash_join, enable_grace_hash_join)?)
                     } else {
                         try_collect_left(
                             hash_join,
@@ -317,35 +312,24 @@ fn statistical_join_selection_subrule(
                         )?
                         .map_or_else(
                             || {
-                                partitioned_hash_join(
-                                    hash_join,
-                                    enable_grace_hash_join,
-                                )
-                                .map(Some)
+                                partitioned_hash_join(hash_join, enable_grace_hash_join)
+                                    .map(Some)
                             },
                             |v| Ok(Some(v)),
                         )?
                     }
                 }
                 PartitionMode::CollectLeft => {
-                    if enable_grace_hash_join
-                    {
-                        Some(partitioned_hash_join(
-                            hash_join,
-                            enable_grace_hash_join,
-                        )?)
+                    if enable_grace_hash_join {
+                        Some(partitioned_hash_join(hash_join, enable_grace_hash_join)?)
                     } else {
-                        try_collect_left(hash_join, true, 0, 0)?
-                            .map_or_else(
-                                || {
-                                    partitioned_hash_join(
-                                        hash_join,
-                                        enable_grace_hash_join,
-                                    )
+                        try_collect_left(hash_join, true, 0, 0)?.map_or_else(
+                            || {
+                                partitioned_hash_join(hash_join, enable_grace_hash_join)
                                     .map(Some)
-                                },
-                                |v| Ok(Some(v)),
-                            )?
+                            },
+                            |v| Ok(Some(v)),
+                        )?
                     }
                 }
                 PartitionMode::Partitioned => {

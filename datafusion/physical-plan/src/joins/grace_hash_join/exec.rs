@@ -38,20 +38,22 @@ use crate::{
     SendableRecordBatchStream, Statistics,
 };
 use crate::{ExecutionPlanProperties, SpillManager};
+use std::any::Any;
 use std::fmt;
 use std::fmt::Formatter;
+use std::mem::size_of;
 use std::sync::Arc;
-use std::{any::Any, vec};
 
 use arrow::array::UInt32Array;
-use arrow::compute::{concat_batches, take};
+use arrow::compute::take;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::{
     internal_err, plan_err, project_schema, JoinSide, JoinType, NullEquality, Result,
 };
-use datafusion_execution::TaskContext;
+use datafusion_execution::memory_pool::MemoryReservation;
+use datafusion_execution::{memory_pool::MemoryConsumer, TaskContext};
 use datafusion_physical_expr::equivalence::{
     join_equivalence_properties, ProjectionMapping,
 };
@@ -60,6 +62,7 @@ use datafusion_physical_expr::{PhysicalExpr, PhysicalExprRef};
 
 use crate::joins::grace_hash_join::stream::{GraceHashJoinStream, SpillFut};
 use crate::metrics::SpillMetrics;
+use crate::spill::get_record_batch_memory_size;
 use crate::spill::spill_manager::SpillLocation;
 use ahash::RandomState;
 use datafusion_common::hash_utils::create_hashes;
@@ -630,7 +633,18 @@ impl ExecutionPlan for GraceHashJoinExec {
         let spill_left_clone = Arc::clone(&spill_left);
         let spill_right_clone = Arc::clone(&spill_right);
         let join_metrics_clone = Arc::clone(&join_metrics);
+        let context_for_partition = Arc::clone(&context);
         let spill_fut = OnceFut::new(async move {
+            // Track memory used during the partitioning phase for this join
+            let mut left_reservation =
+                MemoryConsumer::new(format!("GraceHashJoinPartitionLeft[{partition}]"))
+                    .with_can_spill(true)
+                    .register(context_for_partition.memory_pool());
+            let mut right_reservation =
+                MemoryConsumer::new(format!("GraceHashJoinPartitionRight[{partition}]"))
+                    .with_can_spill(true)
+                    .register(context_for_partition.memory_pool());
+
             let (left_idx, right_idx) = partition_and_spill(
                 random_state,
                 on,
@@ -642,6 +656,8 @@ impl ExecutionPlan for GraceHashJoinExec {
                 spill_left_clone,
                 spill_right_clone,
                 partition,
+                &mut left_reservation,
+                &mut right_reservation,
             )
             .await?;
             Ok(SpillFut::new(partition, left_idx, right_idx))
@@ -649,6 +665,14 @@ impl ExecutionPlan for GraceHashJoinExec {
 
         let left_input_schema = self.left.schema();
         let right_input_schema = self.right.schema();
+
+        // Register a memory consumer to account for in-memory buffers used by the
+        // grace hash join stream (loaded partitions and local join state). Mark it
+        // as spillable so it participates fairly in the FairSpillPool.
+        let reservation =
+            MemoryConsumer::new(format!("GraceHashJoinStream[{partition}]"))
+                .with_can_spill(true)
+                .register(context.memory_pool());
 
         Ok(Box::pin(GraceHashJoinStream::new(
             self.schema(),
@@ -664,7 +688,8 @@ impl ExecutionPlan for GraceHashJoinExec {
             self.join_type,
             column_indices_after_projection,
             join_metrics,
-            context,
+            Arc::clone(&context),
+            reservation,
         )))
     }
 
@@ -835,6 +860,8 @@ pub async fn partition_and_spill(
     spill_left: Arc<SpillManager>,
     spill_right: Arc<SpillManager>,
     partition: usize,
+    left_reservation: &mut MemoryReservation,
+    right_reservation: &mut MemoryReservation,
 ) -> Result<(Vec<PartitionIndex>, Vec<PartitionIndex>)> {
     let on_left: Vec<_> = on.iter().map(|(l, _)| Arc::clone(l)).collect();
     let on_right: Vec<_> = on.iter().map(|(_, r)| Arc::clone(r)).collect();
@@ -849,6 +876,7 @@ pub async fn partition_and_spill(
         &format!("left_{partition}"),
         &join_metrics,
         enable_dynamic_filter_pushdown,
+        left_reservation,
     )
     .await?;
 
@@ -862,6 +890,7 @@ pub async fn partition_and_spill(
         &format!("right_{partition}"),
         &join_metrics,
         enable_dynamic_filter_pushdown,
+        right_reservation,
     )
     .await?;
     Ok((left_index, right_index))
@@ -877,66 +906,93 @@ async fn partition_and_spill_one_side(
     spilling_request_msg: &str,
     join_metrics: &BuildProbeJoinMetrics,
     _enable_dynamic_filter_pushdown: bool,
+    reservation: &mut MemoryReservation,
 ) -> Result<Vec<PartitionIndex>> {
     let mut partitions: Vec<PartitionWriter> = (0..partition_count)
         .map(|_| PartitionWriter::new(Arc::clone(&spill_manager)))
         .collect();
 
-    let mut buffered_batches = Vec::new();
-
     let schema = input.schema();
+    let mut saw_batches = false;
+
     while let Some(batch) = input.next().await {
         let batch = batch?;
         if batch.num_rows() == 0 {
             continue;
         }
+        saw_batches = true;
         join_metrics.build_input_batches.add(1);
         join_metrics.build_input_rows.add(batch.num_rows());
-        buffered_batches.push(batch);
-    }
-    if buffered_batches.is_empty() {
-        return Ok(Vec::new());
-    }
-    // Create single batch to reduce number of spilled files
-    let single_batch = concat_batches(&schema, &buffered_batches)?;
-    let num_rows = single_batch.num_rows();
-    if num_rows == 0 {
-        return Ok(Vec::new());
-    }
 
-    // Calculate hashes
-    let keys = on_exprs
-        .iter()
-        .map(|c| c.evaluate(&single_batch)?.into_array(num_rows))
-        .collect::<Result<Vec<_>>>()?;
+        let num_rows = batch.num_rows();
+        let batch_bytes = get_record_batch_memory_size(&batch);
+        // Reserve for the batch plus hashing and indexing structures for this batch.
+        let mut reserved_bytes = batch_bytes
+            .saturating_add(num_rows * size_of::<u64>())
+            .saturating_add(
+                partition_count * size_of::<Vec<u32>>() + num_rows * size_of::<u32>(),
+            );
+        reservation.try_grow(reserved_bytes)?;
 
-    let mut hashes = vec![0u64; num_rows];
-    create_hashes(&keys, random_state, &mut hashes)?;
+        // Calculate hashes
+        let keys = on_exprs
+            .iter()
+            .map(|c| c.evaluate(&batch)?.into_array(num_rows))
+            .collect::<Result<Vec<_>>>()?;
 
-    // Spread to partitions
-    let mut indices: Vec<Vec<u32>> = vec![Vec::new(); partition_count];
-    for (row, h) in hashes.iter().enumerate() {
-        let bucket = (*h as usize) % partition_count;
-        indices[bucket].push(row as u32);
-    }
+        let mut hashes = vec![0u64; num_rows];
+        create_hashes(&keys, random_state, &mut hashes)?;
 
-    // Collect and spill
-    for (i, idxs) in indices.into_iter().enumerate() {
-        if idxs.is_empty() {
-            continue;
+        // Spread to partitions
+        let mut indices: Vec<Vec<u32>> = vec![Vec::new(); partition_count];
+        for (row, h) in hashes.iter().enumerate() {
+            let bucket = (*h as usize) % partition_count;
+            indices[bucket].push(row as u32);
         }
 
-        let idx_array = UInt32Array::from(idxs);
-        let taken = single_batch
-            .columns()
+        // Adjust reservation to the actual in-memory structures we built for this batch.
+        let actual_hash_bytes = hashes.capacity() * size_of::<u64>();
+        let actual_index_bytes = indices
             .iter()
-            .map(|c| take(c.as_ref(), &idx_array, None))
-            .collect::<arrow::error::Result<Vec<_>>>()?;
+            .map(|idxs| idxs.capacity() * size_of::<u32>())
+            .sum::<usize>()
+            + partition_count * size_of::<Vec<u32>>();
 
-        let part_batch = RecordBatch::try_new(single_batch.schema(), taken)?;
-        // We need unique name for spilling
-        let request_msg = format!("grace_partition_{spilling_request_msg}_{i}");
-        partitions[i].spill_batch_auto(&part_batch, &request_msg)?;
+        let actual_reserved = batch_bytes
+            .saturating_add(actual_hash_bytes)
+            .saturating_add(actual_index_bytes);
+        if actual_reserved > reserved_bytes {
+            reservation.try_grow(actual_reserved - reserved_bytes)?;
+        } else if reserved_bytes > actual_reserved {
+            reservation.shrink(reserved_bytes - actual_reserved);
+        }
+        reserved_bytes = actual_reserved;
+
+        // Collect and spill
+        for (i, idxs) in indices.into_iter().enumerate() {
+            if idxs.is_empty() {
+                continue;
+            }
+
+            let idx_array = UInt32Array::from(idxs);
+            let taken = batch
+                .columns()
+                .iter()
+                .map(|c| take(c.as_ref(), &idx_array, None))
+                .collect::<arrow::error::Result<Vec<_>>>()?;
+
+            let part_batch = RecordBatch::try_new(Arc::clone(&schema), taken)?;
+            let part_batch_size = get_record_batch_memory_size(&part_batch);
+            reservation.try_grow(part_batch_size)?;
+            // We need unique name for spilling
+            let request_msg = format!("grace_partition_{spilling_request_msg}_{i}");
+            partitions[i].spill_batch_auto(&part_batch, &request_msg)?;
+            reservation.try_shrink(part_batch_size)?;
+        }
+        reservation.try_shrink(reserved_bytes)?;
+    }
+    if !saw_batches {
+        return Ok(Vec::new());
     }
 
     // Prepare indexes
@@ -967,6 +1023,9 @@ impl PartitionWriter {
         batch: &RecordBatch,
         request_msg: &str,
     ) -> Result<()> {
+        // Preserve the original hybrid behavior of `SpillManager::spill_batch_auto`,
+        // which may keep spills in memory or spill to disk depending on the
+        // runtime memory pool and disk manager configuration.
         let loc = self.spill_manager.spill_batch_auto(batch, request_msg)?;
         self.chunks.push(loc);
         Ok(())
