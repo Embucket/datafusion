@@ -112,6 +112,25 @@ impl CommonOpt {
                 .with_memory_pool(pool)
                 .with_disk_manager_builder(DiskManagerBuilder::default());
         }
+
+        // Apply runtime disk and temp directory configuration from environment, to
+        // match the documented `datafusion.runtime.*` settings.
+        //
+        // DATAFUSION_RUNTIME_MAX_TEMP_DIRECTORY_SIZE is interpreted as a raw byte
+        // count (e.g. 300000000000 for ~300GB) to align with your current usage.
+        if let Ok(size_str) = std::env::var("DATAFUSION_RUNTIME_MAX_TEMP_DIRECTORY_SIZE")
+        {
+            if let Ok(size) = size_str.parse::<u64>() {
+                rt_builder = rt_builder.with_max_temp_directory_size(size);
+            }
+        }
+
+        // If DATAFUSION_RUNTIME_TEMP_DIRECTORY is set, direct spill files there.
+        if let Ok(dir) = std::env::var("DATAFUSION_RUNTIME_TEMP_DIRECTORY") {
+            if !dir.is_empty() {
+                rt_builder = rt_builder.with_temp_file_path(dir);
+            }
+        }
         Ok(rt_builder)
     }
 }
