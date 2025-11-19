@@ -634,6 +634,7 @@ impl ExecutionPlan for GraceHashJoinExec {
         let spill_right_clone = Arc::clone(&spill_right);
         let join_metrics_clone = Arc::clone(&join_metrics);
         let context_for_partition = Arc::clone(&context);
+        let partition_batch_size = context_for_partition.session_config().batch_size();
         let spill_fut = OnceFut::new(async move {
             // Track memory used during the partitioning phase for this join
             let mut left_reservation =
@@ -658,6 +659,7 @@ impl ExecutionPlan for GraceHashJoinExec {
                 partition,
                 &mut left_reservation,
                 &mut right_reservation,
+                partition_batch_size,
             )
             .await?;
             Ok(SpillFut::new(partition, left_idx, right_idx))
@@ -862,6 +864,7 @@ pub async fn partition_and_spill(
     partition: usize,
     left_reservation: &mut MemoryReservation,
     right_reservation: &mut MemoryReservation,
+    partition_batch_size: usize,
 ) -> Result<(Vec<PartitionIndex>, Vec<PartitionIndex>)> {
     let on_left: Vec<_> = on.iter().map(|(l, _)| Arc::clone(l)).collect();
     let on_right: Vec<_> = on.iter().map(|(_, r)| Arc::clone(r)).collect();
@@ -877,6 +880,7 @@ pub async fn partition_and_spill(
         &join_metrics,
         enable_dynamic_filter_pushdown,
         left_reservation,
+        partition_batch_size,
     )
     .await?;
 
@@ -891,6 +895,7 @@ pub async fn partition_and_spill(
         &join_metrics,
         enable_dynamic_filter_pushdown,
         right_reservation,
+        partition_batch_size,
     )
     .await?;
     Ok((left_index, right_index))
@@ -907,6 +912,7 @@ async fn partition_and_spill_one_side(
     join_metrics: &BuildProbeJoinMetrics,
     _enable_dynamic_filter_pushdown: bool,
     reservation: &mut MemoryReservation,
+    partition_batch_size: usize,
 ) -> Result<Vec<PartitionIndex>> {
     let mut partitions: Vec<PartitionWriter> = (0..partition_count)
         .map(|_| PartitionWriter::new(Arc::clone(&spill_manager)))
@@ -914,6 +920,7 @@ async fn partition_and_spill_one_side(
 
     let schema = input.schema();
     let mut saw_batches = false;
+    let chunk_size = partition_batch_size.max(1);
 
     while let Some(batch) = input.next().await {
         let batch = batch?;
@@ -923,73 +930,22 @@ async fn partition_and_spill_one_side(
         saw_batches = true;
         join_metrics.build_input_batches.add(1);
         join_metrics.build_input_rows.add(batch.num_rows());
-
-        let num_rows = batch.num_rows();
-        let batch_bytes = get_record_batch_memory_size(&batch);
-        // Reserve for the batch plus hashing and indexing structures for this batch.
-        let mut reserved_bytes = batch_bytes
-            .saturating_add(num_rows * size_of::<u64>())
-            .saturating_add(
-                partition_count * size_of::<Vec<u32>>() + num_rows * size_of::<u32>(),
-            );
-        reservation.try_grow(reserved_bytes)?;
-
-        // Calculate hashes
-        let keys = on_exprs
-            .iter()
-            .map(|c| c.evaluate(&batch)?.into_array(num_rows))
-            .collect::<Result<Vec<_>>>()?;
-
-        let mut hashes = vec![0u64; num_rows];
-        create_hashes(&keys, random_state, &mut hashes)?;
-
-        // Spread to partitions
-        let mut indices: Vec<Vec<u32>> = vec![Vec::new(); partition_count];
-        for (row, h) in hashes.iter().enumerate() {
-            let bucket = (*h as usize) % partition_count;
-            indices[bucket].push(row as u32);
+        let mut offset = 0;
+        while offset < batch.num_rows() {
+            let len = std::cmp::min(chunk_size, batch.num_rows() - offset);
+            let chunk = batch.slice(offset, len);
+            process_partition_chunk(
+                &chunk,
+                Arc::clone(&schema),
+                on_exprs,
+                random_state,
+                partition_count,
+                partitions.as_mut_slice(),
+                spilling_request_msg,
+                reservation,
+            )?;
+            offset += len;
         }
-
-        // Adjust reservation to the actual in-memory structures we built for this batch.
-        let actual_hash_bytes = hashes.capacity() * size_of::<u64>();
-        let actual_index_bytes = indices
-            .iter()
-            .map(|idxs| idxs.capacity() * size_of::<u32>())
-            .sum::<usize>()
-            + partition_count * size_of::<Vec<u32>>();
-
-        let actual_reserved = batch_bytes
-            .saturating_add(actual_hash_bytes)
-            .saturating_add(actual_index_bytes);
-        if actual_reserved > reserved_bytes {
-            reservation.try_grow(actual_reserved - reserved_bytes)?;
-        } else if reserved_bytes > actual_reserved {
-            reservation.shrink(reserved_bytes - actual_reserved);
-        }
-        reserved_bytes = actual_reserved;
-
-        // Collect and spill
-        for (i, idxs) in indices.into_iter().enumerate() {
-            if idxs.is_empty() {
-                continue;
-            }
-
-            let idx_array = UInt32Array::from(idxs);
-            let taken = batch
-                .columns()
-                .iter()
-                .map(|c| take(c.as_ref(), &idx_array, None))
-                .collect::<arrow::error::Result<Vec<_>>>()?;
-
-            let part_batch = RecordBatch::try_new(Arc::clone(&schema), taken)?;
-            let part_batch_size = get_record_batch_memory_size(&part_batch);
-            reservation.try_grow(part_batch_size)?;
-            // We need unique name for spilling
-            let request_msg = format!("grace_partition_{spilling_request_msg}_{i}");
-            partitions[i].spill_batch_auto(&part_batch, &request_msg)?;
-            reservation.try_shrink(part_batch_size)?;
-        }
-        reservation.try_shrink(reserved_bytes)?;
     }
     if !saw_batches {
         return Ok(Vec::new());
@@ -1002,6 +958,83 @@ async fn partition_and_spill_one_side(
     }
     // println!("spill_manager {:?}", spill_manager.metrics);
     Ok(result)
+}
+
+fn process_partition_chunk(
+    batch: &RecordBatch,
+    schema: SchemaRef,
+    on_exprs: &[PhysicalExprRef],
+    random_state: &RandomState,
+    partition_count: usize,
+    partitions: &mut [PartitionWriter],
+    spilling_request_msg: &str,
+    reservation: &mut MemoryReservation,
+) -> Result<()> {
+    let num_rows = batch.num_rows();
+    if num_rows == 0 {
+        return Ok(());
+    }
+    let batch_bytes = get_record_batch_memory_size(batch);
+    let mut reserved_bytes = batch_bytes
+        .saturating_add(num_rows * size_of::<u64>())
+        .saturating_add(
+            partition_count * size_of::<Vec<u32>>() + num_rows * size_of::<u32>(),
+        );
+    reservation.try_grow(reserved_bytes)?;
+
+    let keys = on_exprs
+        .iter()
+        .map(|c| c.evaluate(batch)?.into_array(num_rows))
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut hashes = vec![0u64; num_rows];
+    create_hashes(&keys, random_state, &mut hashes)?;
+
+    let mut indices: Vec<Vec<u32>> = vec![Vec::new(); partition_count];
+    for (row, h) in hashes.iter().enumerate() {
+        let bucket = (*h as usize) % partition_count;
+        indices[bucket].push(row as u32);
+    }
+
+    let actual_hash_bytes = hashes.capacity() * size_of::<u64>();
+    let actual_index_bytes = indices
+        .iter()
+        .map(|idxs| idxs.capacity() * size_of::<u32>())
+        .sum::<usize>()
+        + partition_count * size_of::<Vec<u32>>();
+
+    let actual_reserved = batch_bytes
+        .saturating_add(actual_hash_bytes)
+        .saturating_add(actual_index_bytes);
+    if actual_reserved > reserved_bytes {
+        reservation.try_grow(actual_reserved - reserved_bytes)?;
+    } else if reserved_bytes > actual_reserved {
+        reservation.shrink(reserved_bytes - actual_reserved);
+    }
+    reserved_bytes = actual_reserved;
+
+    for (i, idxs) in indices.into_iter().enumerate() {
+        if idxs.is_empty() {
+            continue;
+        }
+
+        let idx_array = UInt32Array::from(idxs);
+        let taken = batch
+            .columns()
+            .iter()
+            .map(|c| take(c.as_ref(), &idx_array, None))
+            .collect::<arrow::error::Result<Vec<_>>>()?;
+
+        let part_batch = RecordBatch::try_new(Arc::clone(&schema), taken)?;
+        let part_batch_size = get_record_batch_memory_size(&part_batch);
+        reservation.try_grow(part_batch_size)?;
+        let request_msg = format!("grace_partition_{spilling_request_msg}_{i}");
+        partitions[i].spill_batch_auto(&part_batch, &request_msg)?;
+        reservation.try_shrink(part_batch_size)?;
+    }
+
+    reservation.try_shrink(reserved_bytes)?;
+    Ok(())
 }
 
 #[derive(Debug)]
