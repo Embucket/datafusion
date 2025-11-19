@@ -233,6 +233,10 @@ impl RepartitionExecState {
         for (i, (stream, metrics)) in
             std::mem::take(streams_and_metrics).into_iter().enumerate()
         {
+            let enable_repartition_spill =
+                context.session_config().enable_repartition_spill();
+            let repartition_spill_threshold_bytes =
+                context.session_config().repartition_spill_threshold_bytes();
             let txs: HashMap<_, _> = channels
                 .iter()
                 .map(|(partition, (tx, _rx, reservation))| {
@@ -248,6 +252,8 @@ impl RepartitionExecState {
                 Arc::clone(&context),
                 Arc::clone(&schema),
                 name.clone(),
+                enable_repartition_spill,
+                repartition_spill_threshold_bytes,
             ));
 
             // In a separate task, wait for each input to be done
@@ -994,6 +1000,8 @@ impl RepartitionExec {
         context: Arc<TaskContext>,
         schema: SchemaRef,
         operator_name: String,
+        enable_repartition_spill: bool,
+        repartition_spill_threshold_bytes: usize,
     ) -> Result<()> {
         let mut partitioner =
             BatchPartitioner::try_new(partitioning, metrics.repartition_time.clone())?;
@@ -1027,33 +1035,42 @@ impl RepartitionExec {
                 let timer = metrics.send_time[partition].timer();
                 // if there is still a receiver, send to it
                 if let Some((tx, reservation)) = output_channels.get_mut(&partition) {
-                    let (data, tracked_size) = match reservation.lock().try_grow(size) {
-                        Ok(_) => (RepartitionedData::Batch { batch, size }, Some(size)),
-                        Err(DataFusionError::ResourcesExhausted(_)) => {
-                            let spill_request = format!(
-                                "{operator_name}[input {} -> output {partition}]",
-                                metrics.input_partition
-                            );
-                            let location = spill_manager
-                                .spill_batch_auto(&batch, &spill_request)
-                                .map_err(|e| {
-                                    e.context(format!(
-                                        "Failed to spill batch while repartitioning {spill_request}"
-                                    ))
-                                })?;
-                            trace!(
-                                "Spilled repartition batch for {operator_name} input {} output {partition}: {location:?}",
-                                metrics.input_partition
-                            );
-                            (
-                                RepartitionedData::Spilled(SpilledRepartitionBatch {
-                                    spill: Arc::clone(&spill_manager),
-                                    location,
-                                }),
-                                None,
-                            )
-                        }
-                        Err(e) => return Err(e),
+                    let should_spill = if enable_repartition_spill
+                        && repartition_spill_threshold_bytes > 0
+                    {
+                        let current_size = reservation.lock().size();
+                        current_size.saturating_add(size)
+                            > repartition_spill_threshold_bytes
+                    } else {
+                        false
+                    };
+
+                    let (data, tracked_size) = if should_spill {
+                        let spill_request = format!(
+                            "{operator_name}[input {} -> output {partition}]",
+                            metrics.input_partition
+                        );
+                        let location = spill_manager
+                            .spill_batch_auto(&batch, &spill_request)
+                            .map_err(|e| {
+                                e.context(format!(
+                                    "Failed to spill batch while repartitioning {spill_request}"
+                                ))
+                            })?;
+                        trace!(
+                            "Spilled repartition batch for {operator_name} input {} output {partition}: {location:?}",
+                            metrics.input_partition
+                        );
+                        (
+                            RepartitionedData::Spilled(SpilledRepartitionBatch {
+                                spill: Arc::clone(&spill_manager),
+                                location,
+                            }),
+                            None,
+                        )
+                    } else {
+                        reservation.lock().try_grow(size)?;
+                        (RepartitionedData::Batch { batch, size }, Some(size))
                     };
 
                     if tx.send(Some(Ok(data))).await.is_err() {
@@ -1318,6 +1335,7 @@ mod tests {
     use datafusion_common::exec_err;
     use datafusion_common::test_util::batches_to_sort_string;
     use datafusion_common_runtime::JoinSet;
+    use datafusion_execution::config::SessionConfig;
     use datafusion_execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
     use datafusion_execution::runtime_env::RuntimeEnvBuilder;
     use insta::assert_snapshot;
@@ -1835,6 +1853,34 @@ mod tests {
         }
 
         assert_eq!(total_rows, 50 * create_batch().num_rows());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn repartition_spills_when_enabled_without_pool_limit() -> Result<()> {
+        let schema = test_schema();
+        let input_partitions = vec![create_vec_batches(5)];
+        let partitioning = Partitioning::RoundRobinBatch(2);
+
+        let session_config = SessionConfig::new()
+            .with_enable_repartition_spill(true)
+            .with_repartition_spill_threshold_bytes(1);
+        let task_ctx =
+            Arc::new(TaskContext::default().with_session_config(session_config));
+
+        let exec =
+            TestMemoryExec::try_new_exec(&input_partitions, Arc::clone(&schema), None)?;
+        let exec = RepartitionExec::try_new(exec, partitioning)?;
+
+        let mut total_rows = 0;
+        for i in 0..exec.partitioning().partition_count() {
+            let batches =
+                crate::common::collect(exec.execute(i, Arc::clone(&task_ctx))?).await?;
+            total_rows += batches.iter().map(|b| b.num_rows()).sum::<usize>();
+        }
+
+        assert_eq!(total_rows, 5 * create_batch().num_rows());
 
         Ok(())
     }

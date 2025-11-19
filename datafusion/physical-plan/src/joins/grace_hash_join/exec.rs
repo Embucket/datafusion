@@ -1023,9 +1023,6 @@ impl PartitionWriter {
         batch: &RecordBatch,
         request_msg: &str,
     ) -> Result<()> {
-        // Preserve the original hybrid behavior of `SpillManager::spill_batch_auto`,
-        // which may keep spills in memory or spill to disk depending on the
-        // runtime memory pool and disk manager configuration.
         let loc = self.spill_manager.spill_batch_auto(batch, request_msg)?;
         self.chunks.push(loc);
         Ok(())

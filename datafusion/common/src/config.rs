@@ -429,6 +429,18 @@ config_namespace! {
         /// batches and merged.
         pub sort_in_place_threshold_bytes: usize, default = 1024 * 1024
 
+        /// Enable spilling for repartitioning operators even when the global memory pool
+        /// is effectively unbounded. When enabled, repartitioning will spill once the
+        /// buffered bytes per output partition exceed [`repartition_spill_threshold_bytes`].
+        /// This protects the hash router feeding GHJ/aggregates from unbounded buffering.
+        pub enable_repartition_spill: bool, default = false
+
+        /// Soft cap (in bytes) for buffered data per repartition output partition.
+        /// When [`enable_repartition_spill`] is true and the current buffered size would
+        /// exceed this threshold, new batches are spilled instead of being kept in memory,
+        /// regardless of the global memory pool limit.
+        pub repartition_spill_threshold_bytes: usize, default = 512 * 1024 * 1024
+
         /// Number of files to read in parallel when inferring schema and statistics
         pub meta_fetch_concurrency: usize, default = 32
 

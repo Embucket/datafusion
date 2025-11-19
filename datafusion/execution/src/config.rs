@@ -274,6 +274,18 @@ impl SessionConfig {
         self.options.execution.spill_compression
     }
 
+    /// Returns true if repartition operators should spill when the buffered bytes exceed the
+    /// configured threshold even without a global memory limit.
+    pub fn enable_repartition_spill(&self) -> bool {
+        self.options.execution.enable_repartition_spill
+    }
+
+    /// Returns the soft cap for buffered repartition data per output partition when
+    /// repartition spilling is enabled.
+    pub fn repartition_spill_threshold_bytes(&self) -> usize {
+        self.options.execution.repartition_spill_threshold_bytes
+    }
+
     /// Selects a name for the default catalog and schema
     pub fn with_default_catalog_and_schema(
         mut self,
@@ -450,6 +462,24 @@ impl SessionConfig {
     /// [`spill_compression`]: datafusion_common::config::ExecutionOptions::spill_compression
     pub fn with_spill_compression(mut self, spill_compression: SpillCompression) -> Self {
         self.options_mut().execution.spill_compression = spill_compression;
+        self
+    }
+
+    /// Enable spilling for repartitioning buffers even if the global memory pool is unbounded.
+    pub fn with_enable_repartition_spill(mut self, enabled: bool) -> Self {
+        self.options_mut().execution.enable_repartition_spill = enabled;
+        self
+    }
+
+    /// Set the soft cap (in bytes) for buffered repartition data per output partition when
+    /// repartition spilling is enabled.
+    pub fn with_repartition_spill_threshold_bytes(
+        mut self,
+        repartition_spill_threshold_bytes: usize,
+    ) -> Self {
+        self.options_mut()
+            .execution
+            .repartition_spill_threshold_bytes = repartition_spill_threshold_bytes;
         self
     }
 
