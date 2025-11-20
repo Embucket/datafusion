@@ -52,8 +52,8 @@ use datafusion_common::config::ConfigOptions;
 use datafusion_common::{
     internal_err, plan_err, project_schema, JoinSide, JoinType, NullEquality, Result,
 };
-use datafusion_execution::memory_pool::MemoryReservation;
-use datafusion_execution::{memory_pool::MemoryConsumer, TaskContext};
+use datafusion_execution::memory_pool::{MemoryConsumer, MemoryLimit, MemoryReservation};
+use datafusion_execution::TaskContext;
 use datafusion_physical_expr::equivalence::{
     join_equivalence_properties, ProjectionMapping,
 };
@@ -187,6 +187,33 @@ impl GraceHashJoinExec {
             cache,
             dynamic_filter_enabled: false,
         })
+    }
+
+    fn partition_memory_budget(context: &Arc<TaskContext>) -> usize {
+        let pool_limit = match context.memory_pool().memory_limit() {
+            MemoryLimit::Finite(limit) => limit,
+            _ => context
+                .session_config()
+                .grace_hash_join_default_partition_size(),
+        };
+
+        let fraction = context
+            .session_config()
+            .grace_hash_join_partition_memory_fraction()
+            .clamp(0.0, 1.0);
+        let concurrency = context.session_config().target_partitions().max(1);
+
+        let mut budget =
+            ((pool_limit as f64 * fraction) / concurrency as f64).floor() as usize;
+        let min_budget = context
+            .session_config()
+            .grace_hash_join_partition_memory_min();
+        if budget == 0 {
+            budget = min_budget;
+        } else {
+            budget = budget.max(min_budget);
+        }
+        budget
     }
 
     fn create_dynamic_filter(on: &JoinOn) -> Arc<DynamicFilterPhysicalExpr> {
@@ -662,7 +689,7 @@ impl ExecutionPlan for GraceHashJoinExec {
                 partition_batch_size,
             )
             .await?;
-            Ok(SpillFut::new(partition, left_idx, right_idx))
+            Ok(SpillFut::new(left_partitions, left_idx, right_idx))
         });
 
         let left_input_schema = self.left.schema();
@@ -675,6 +702,13 @@ impl ExecutionPlan for GraceHashJoinExec {
             MemoryConsumer::new(format!("GraceHashJoinStream[{partition}]"))
                 .with_can_spill(true)
                 .register(context.memory_pool());
+
+        let partition_budget_bytes = Self::partition_memory_budget(&context);
+        let partition_batch_size = context.session_config().batch_size();
+        let max_partition_passes = context
+            .session_config()
+            .grace_hash_join_max_partition_passes()
+            .max(1);
 
         Ok(Box::pin(GraceHashJoinStream::new(
             self.schema(),
@@ -692,6 +726,10 @@ impl ExecutionPlan for GraceHashJoinExec {
             join_metrics,
             Arc::clone(&context),
             reservation,
+            self.random_state.clone(),
+            partition_batch_size,
+            partition_budget_bytes,
+            max_partition_passes,
         )))
     }
 
@@ -1040,7 +1078,7 @@ fn process_partition_chunk(
 #[derive(Debug)]
 pub struct PartitionWriter {
     spill_manager: Arc<SpillManager>,
-    chunks: Vec<SpillLocation>,
+    chunks: Vec<SpillChunk>,
 }
 
 impl PartitionWriter {
@@ -1056,8 +1094,12 @@ impl PartitionWriter {
         batch: &RecordBatch,
         request_msg: &str,
     ) -> Result<()> {
+        let size = get_record_batch_memory_size(batch);
         let loc = self.spill_manager.spill_batch_auto(batch, request_msg)?;
-        self.chunks.push(loc);
+        self.chunks.push(SpillChunk {
+            location: loc,
+            size,
+        });
         Ok(())
     }
 
@@ -1080,7 +1122,19 @@ impl PartitionWriter {
 pub struct PartitionIndex {
     /// Collection of spill locations (each corresponds to one batch written
     /// by [`PartitionWriter::spill_batch_auto`])
-    pub chunks: Vec<SpillLocation>,
+    pub chunks: Vec<SpillChunk>,
+}
+
+impl PartitionIndex {
+    pub fn total_bytes(&self) -> usize {
+        self.chunks.iter().map(|c| c.size).sum()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SpillChunk {
+    pub location: SpillLocation,
+    pub size: usize,
 }
 
 #[cfg(test)]

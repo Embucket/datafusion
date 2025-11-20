@@ -274,6 +274,30 @@ impl SessionConfig {
         self.options.execution.spill_compression
     }
 
+    /// Fraction of global memory allocated to each Grace Hash Join partition.
+    pub fn grace_hash_join_partition_memory_fraction(&self) -> f64 {
+        self.options
+            .execution
+            .grace_hash_join_partition_memory_fraction
+    }
+
+    /// Minimum per-partition memory budget (in bytes) for Grace Hash Join.
+    pub fn grace_hash_join_partition_memory_min(&self) -> usize {
+        self.options.execution.grace_hash_join_partition_memory_min
+    }
+
+    /// Default per-partition memory budget (in bytes) when no global limit is configured.
+    pub fn grace_hash_join_default_partition_size(&self) -> usize {
+        self.options
+            .execution
+            .grace_hash_join_default_partition_size
+    }
+
+    /// Maximum number of recursive repartition passes for Grace Hash Join.
+    pub fn grace_hash_join_max_partition_passes(&self) -> usize {
+        self.options.execution.grace_hash_join_max_partition_passes
+    }
+
     /// Returns true if repartition operators should spill when the buffered bytes exceed the
     /// configured threshold even without a global memory limit.
     pub fn enable_repartition_spill(&self) -> bool {
@@ -454,6 +478,42 @@ impl SessionConfig {
     ) -> Self {
         self.options_mut().execution.sort_spill_reservation_bytes =
             sort_spill_reservation_bytes;
+        self
+    }
+
+    /// Set the fraction of the global memory pool allocated to a single Grace Hash Join partition.
+    pub fn with_grace_hash_join_partition_memory_fraction(
+        mut self,
+        fraction: f64,
+    ) -> Self {
+        self.options_mut()
+            .execution
+            .grace_hash_join_partition_memory_fraction = fraction;
+        self
+    }
+
+    /// Set the minimum per-partition memory budget (in bytes) for Grace Hash Join.
+    pub fn with_grace_hash_join_partition_memory_min(mut self, bytes: usize) -> Self {
+        self.options_mut()
+            .execution
+            .grace_hash_join_partition_memory_min = bytes;
+        self
+    }
+
+    /// Set the default per-partition memory budget (in bytes) for Grace Hash Join used when
+    /// no global memory limit is configured.
+    pub fn with_grace_hash_join_default_partition_size(mut self, bytes: usize) -> Self {
+        self.options_mut()
+            .execution
+            .grace_hash_join_default_partition_size = bytes;
+        self
+    }
+
+    /// Set the maximum number of recursive repartition passes for Grace Hash Join.
+    pub fn with_grace_hash_join_max_partition_passes(mut self, passes: usize) -> Self {
+        self.options_mut()
+            .execution
+            .grace_hash_join_max_partition_passes = passes;
         self
     }
 

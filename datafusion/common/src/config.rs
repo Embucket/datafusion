@@ -462,6 +462,25 @@ config_namespace! {
         /// memory consumption
         pub max_buffered_batches_per_output_file: usize, default = 2
 
+        /// Fraction of the global memory pool that a single Grace Hash Join partition
+        /// is allowed to consume before it is recursively repartitioned.
+        /// Values should be between 0.0 and 1.0.
+        pub grace_hash_join_partition_memory_fraction: f64, default = 0.2
+
+        /// Minimum per-partition memory budget (in bytes) for Grace Hash Join.
+        /// Even if the computed fraction would yield a smaller amount, this value
+        /// guarantees a reasonable working set for each partition.
+        pub grace_hash_join_partition_memory_min: usize, default = 64 * 1024 * 1024
+
+        /// Per-partition memory budget (in bytes) to use when no global memory limit
+        /// is configured. This prevents uncontrolled memory usage even when the pool
+        /// reports an infinite or unknown limit.
+        pub grace_hash_join_default_partition_size: usize, default = 512 * 1024 * 1024
+
+        /// Maximum number of recursive repartition passes allowed for Grace Hash Join
+        /// when attempting to shrink skewed partitions.
+        pub grace_hash_join_max_partition_passes: usize, default = 3
+
         /// Should sub directories be ignored when scanning directories for data
         /// files. Defaults to true (ignores subdirectories), consistent with
         /// Hive. Note that this setting does not affect reading partitioned
