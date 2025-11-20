@@ -189,31 +189,40 @@ impl GraceHashJoinExec {
         })
     }
 
-    fn partition_memory_budget(context: &Arc<TaskContext>) -> usize {
-        let pool_limit = match context.memory_pool().memory_limit() {
-            MemoryLimit::Finite(limit) => limit,
-            _ => context
-                .session_config()
-                .grace_hash_join_default_partition_size(),
-        };
-
+    fn partition_memory_budget(context: &Arc<TaskContext>) -> (usize, usize, usize) {
+        let min_budget = context
+            .session_config()
+            .grace_hash_join_partition_memory_min()
+            .max(1);
+        let config_cap = context
+            .session_config()
+            .grace_hash_join_max_partition_size()
+            .max(min_budget);
         let fraction = context
             .session_config()
             .grace_hash_join_partition_memory_fraction()
             .clamp(0.0, 1.0);
         let concurrency = context.session_config().target_partitions().max(1);
 
-        let mut budget =
-            ((pool_limit as f64 * fraction) / concurrency as f64).floor() as usize;
-        let min_budget = context
-            .session_config()
-            .grace_hash_join_partition_memory_min();
-        if budget == 0 {
-            budget = min_budget;
-        } else {
-            budget = budget.max(min_budget);
+        match context.memory_pool().memory_limit() {
+            MemoryLimit::Finite(limit) => {
+                let absolute_cap = limit.min(config_cap);
+                // Allow a single partition to borrow at most (limit * fraction) bytes
+                let raw_preferred =
+                    ((limit as f64 * fraction).floor() as usize).max(min_budget);
+                let preferred_cap = raw_preferred.min(absolute_cap).max(min_budget);
+                let per_partition = (preferred_cap / concurrency).max(min_budget);
+                (per_partition, preferred_cap, absolute_cap)
+            }
+            _ => {
+                let default_budget = context
+                    .session_config()
+                    .grace_hash_join_default_partition_size()
+                    .max(min_budget);
+                let base = default_budget.min(config_cap);
+                (base, config_cap, config_cap)
+            }
         }
-        budget
     }
 
     fn create_dynamic_filter(on: &JoinOn) -> Arc<DynamicFilterPhysicalExpr> {
@@ -703,7 +712,11 @@ impl ExecutionPlan for GraceHashJoinExec {
                 .with_can_spill(true)
                 .register(context.memory_pool());
 
-        let partition_budget_bytes = Self::partition_memory_budget(&context);
+        let (
+            base_partition_budget_bytes,
+            preferred_partition_budget_bytes,
+            absolute_partition_cap_bytes,
+        ) = Self::partition_memory_budget(&context);
         let partition_batch_size = context.session_config().batch_size();
         let max_partition_passes = context
             .session_config()
@@ -728,7 +741,9 @@ impl ExecutionPlan for GraceHashJoinExec {
             reservation,
             self.random_state.clone(),
             partition_batch_size,
-            partition_budget_bytes,
+            base_partition_budget_bytes,
+            preferred_partition_budget_bytes,
+            absolute_partition_cap_bytes,
             max_partition_passes,
         )))
     }
@@ -1104,8 +1119,10 @@ impl PartitionWriter {
     }
 
     pub fn finish(self) -> Result<PartitionIndex> {
+        let total_bytes = self.chunks.iter().map(|c| c.size).sum();
         Ok(PartitionIndex {
             chunks: self.chunks,
+            total_bytes,
         })
     }
 }
@@ -1123,11 +1140,12 @@ pub struct PartitionIndex {
     /// Collection of spill locations (each corresponds to one batch written
     /// by [`PartitionWriter::spill_batch_auto`])
     pub chunks: Vec<SpillChunk>,
+    total_bytes: usize,
 }
 
 impl PartitionIndex {
     pub fn total_bytes(&self) -> usize {
-        self.chunks.iter().map(|c| c.size).sum()
+        self.total_bytes
     }
 }
 

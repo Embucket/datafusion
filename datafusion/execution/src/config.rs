@@ -293,6 +293,11 @@ impl SessionConfig {
             .grace_hash_join_default_partition_size
     }
 
+    /// Maximum per-partition memory budget (in bytes) for adaptive Grace Hash Join.
+    pub fn grace_hash_join_max_partition_size(&self) -> usize {
+        self.options.execution.grace_hash_join_max_partition_size
+    }
+
     /// Maximum number of recursive repartition passes for Grace Hash Join.
     pub fn grace_hash_join_max_partition_passes(&self) -> usize {
         self.options.execution.grace_hash_join_max_partition_passes
@@ -506,6 +511,15 @@ impl SessionConfig {
         self.options_mut()
             .execution
             .grace_hash_join_default_partition_size = bytes;
+        self
+    }
+
+    /// Set the maximum per-partition memory budget (in bytes) Grace Hash Join can borrow
+    /// when adaptively raising budgets.
+    pub fn with_grace_hash_join_max_partition_size(mut self, bytes: usize) -> Self {
+        self.options_mut()
+            .execution
+            .grace_hash_join_max_partition_size = bytes;
         self
     }
 

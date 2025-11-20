@@ -477,6 +477,10 @@ config_namespace! {
         /// reports an infinite or unknown limit.
         pub grace_hash_join_default_partition_size: usize, default = 512 * 1024 * 1024
 
+        /// Maximum per-partition memory budget (in bytes) Grace Hash Join can borrow when
+        /// adaptively raising budgets. Acts as a safety cap when no global limit is configured.
+        pub grace_hash_join_max_partition_size: usize, default = 8 * 1024 * 1024 * 1024
+
         /// Maximum number of recursive repartition passes allowed for Grace Hash Join
         /// when attempting to shrink skewed partitions.
         pub grace_hash_join_max_partition_passes: usize, default = 3

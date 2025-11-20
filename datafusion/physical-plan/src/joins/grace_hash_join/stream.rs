@@ -24,6 +24,7 @@ use std::collections::VecDeque;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Instant;
 
 use crate::joins::utils::OnceFut;
 use crate::{
@@ -48,6 +49,7 @@ use datafusion_execution::memory_pool::{
 use datafusion_execution::TaskContext;
 use datafusion_physical_expr::PhysicalExprRef;
 use futures::{ready, Stream, StreamExt};
+use log::{debug, info};
 use parking_lot::Mutex;
 
 enum GraceJoinState {
@@ -59,14 +61,15 @@ enum GraceJoinState {
         work_queue: VecDeque<PartitionWorkItem>,
         current_work: Option<PartitionWorkItem>,
         current_stream: Option<SendableRecordBatchStream>,
-        left_fut: Option<OnceFut<Vec<RecordBatch>>>,
-        right_fut: Option<OnceFut<Vec<RecordBatch>>>,
+        left_fut: Option<OnceFut<LoadedPartitionBatches>>,
+        right_fut: Option<OnceFut<LoadedPartitionBatches>>,
         /// Bytes reserved in the memory pool for the current partition's
         /// loaded left batches
         left_bytes: Arc<Mutex<usize>>,
         /// Bytes reserved in the memory pool for the current partition's
         /// loaded right batches
         right_bytes: Arc<Mutex<usize>>,
+        current_join_start: Option<Instant>,
         repartition_fut: Option<OnceFut<Vec<PartitionWorkItem>>>,
     },
 
@@ -86,6 +89,185 @@ impl PartitionWorkItem {
     fn total_bytes(&self) -> usize {
         self.left.total_bytes() + self.right.total_bytes()
     }
+}
+
+#[derive(Clone, Default)]
+struct PartitionStatsSummary {
+    count: usize,
+    min_bytes: usize,
+    median_bytes: usize,
+    max_bytes: usize,
+}
+
+impl PartitionStatsSummary {
+    fn from_samples(samples: &[usize]) -> Self {
+        if samples.is_empty() {
+            return Self::default();
+        }
+        let mut sorted = samples.to_vec();
+        sorted.sort_unstable();
+        let median = sorted[sorted.len() / 2];
+        let min_bytes = *sorted.first().unwrap();
+        let max_bytes = *sorted.last().unwrap();
+        Self {
+            count: samples.len(),
+            min_bytes,
+            median_bytes: median,
+            max_bytes,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    fn partitions(&self) -> usize {
+        self.count
+    }
+
+    fn min_bytes(&self) -> usize {
+        self.min_bytes
+    }
+
+    fn median_bytes(&self) -> usize {
+        self.median_bytes
+    }
+
+    fn max_bytes(&self) -> usize {
+        self.max_bytes
+    }
+
+    fn max_partition_bytes(&self) -> Option<usize> {
+        if self.is_empty() {
+            None
+        } else {
+            Some(self.max_bytes)
+        }
+    }
+}
+
+#[derive(Debug)]
+struct AdaptivePartitionBudget {
+    base_budget: usize,
+    preferred_cap: usize,
+    absolute_cap: usize,
+    observed_max: usize,
+    current_limit: usize,
+    active_partitions: usize,
+}
+
+impl AdaptivePartitionBudget {
+    fn new(
+        base_budget: usize,
+        preferred_cap: usize,
+        absolute_cap: usize,
+        active_partitions: usize,
+    ) -> Self {
+        let base_budget = base_budget.max(1);
+        let preferred_cap = preferred_cap.max(base_budget);
+        let absolute_cap = absolute_cap.max(preferred_cap);
+        let mut budget = Self {
+            base_budget,
+            preferred_cap,
+            absolute_cap,
+            observed_max: base_budget,
+            current_limit: 1,
+            active_partitions: active_partitions.max(1),
+        };
+        budget.recompute_limit();
+        budget
+    }
+
+    fn observe(&mut self, bytes: usize) {
+        if bytes > self.observed_max {
+            self.observed_max = bytes;
+        }
+    }
+
+    fn update_active_partitions(&mut self, active_partitions: usize) {
+        let active_partitions = active_partitions.max(1);
+        if self.active_partitions != active_partitions {
+            self.active_partitions = active_partitions;
+            self.recompute_limit();
+        }
+    }
+
+    fn current_limit(&self) -> usize {
+        self.current_limit
+    }
+
+    fn current_concurrency(&self) -> usize {
+        self.active_partitions
+    }
+
+    fn prime_with_stats(&mut self, stats: &PartitionStatsSummary) {
+        if let Some(max_bytes) = stats.max_partition_bytes() {
+            self.observe(max_bytes);
+            self.recompute_limit();
+        }
+    }
+
+    fn base_for_current_concurrency(&self) -> usize {
+        let concurrent_share = self.preferred_cap / self.active_partitions;
+        self.base_budget.max(concurrent_share).max(1)
+    }
+
+    fn recompute_limit(&mut self) -> usize {
+        let needed = self.base_for_current_concurrency().max(self.observed_max);
+        let mut limit = needed.min(self.preferred_cap);
+        if needed > limit && self.absolute_cap > limit && self.active_partitions <= 1 {
+            limit = needed.min(self.absolute_cap);
+        }
+        self.current_limit = limit.max(1);
+        self.current_limit
+    }
+
+    fn ensure_fits(&mut self, bytes: usize) -> AdaptiveBudgetOutcome {
+        let previous = self.current_limit;
+        self.observe(bytes);
+        let limit = self.recompute_limit();
+        if bytes <= limit {
+            if limit > previous {
+                AdaptiveBudgetOutcome::Raised {
+                    previous,
+                    new_limit: limit,
+                }
+            } else {
+                AdaptiveBudgetOutcome::Fits
+            }
+        } else {
+            AdaptiveBudgetOutcome::CannotFit { limit }
+        }
+    }
+
+    /// Try to lower concurrency to a single in-flight partition so we can
+    /// safely increase the per-partition budget. Returns the previous
+    /// concurrency and limits when serialization helps, otherwise leaves the
+    /// budget unchanged.
+    fn serialize_if_helpful(&mut self, bytes: usize) -> Option<(usize, usize, usize)> {
+        if self.active_partitions <= 1 {
+            return None;
+        }
+        let previous_concurrency = self.active_partitions;
+        let previous_limit = self.current_limit;
+        self.active_partitions = 1;
+        let new_limit = self.recompute_limit();
+        if bytes <= new_limit {
+            Some((previous_concurrency, previous_limit, new_limit))
+        } else {
+            // Restore previous settings if serialization didn't help
+            self.active_partitions = previous_concurrency;
+            self.recompute_limit();
+            None
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum AdaptiveBudgetOutcome {
+    Fits,
+    Raised { previous: usize, new_limit: usize },
+    CannotFit { limit: usize },
 }
 
 fn build_repartition_future(
@@ -189,8 +371,9 @@ pub struct GraceHashJoinStream {
     reservation: Arc<Mutex<MemoryReservation>>,
     random_state: RandomState,
     partition_batch_size: usize,
-    partition_budget_bytes: usize,
+    adaptive_budget: AdaptivePartitionBudget,
     max_partition_passes: usize,
+    partition_stats: PartitionStatsSummary,
     state: GraceJoinState,
 }
 
@@ -207,6 +390,12 @@ impl SpillFut {
     ) -> Self {
         SpillFut { left, right }
     }
+}
+
+#[derive(Debug, Clone)]
+struct LoadedPartitionBatches {
+    batches: Vec<RecordBatch>,
+    total_bytes: usize,
 }
 
 impl RecordBatchStream for GraceHashJoinStream {
@@ -234,9 +423,17 @@ impl GraceHashJoinStream {
         reservation: MemoryReservation,
         random_state: RandomState,
         partition_batch_size: usize,
-        partition_budget_bytes: usize,
+        base_partition_budget_bytes: usize,
+        preferred_partition_budget_bytes: usize,
+        absolute_partition_cap_bytes: usize,
         max_partition_passes: usize,
     ) -> Self {
+        let adaptive_budget = AdaptivePartitionBudget::new(
+            base_partition_budget_bytes,
+            preferred_partition_budget_bytes,
+            absolute_partition_cap_bytes,
+            1,
+        );
         Self {
             schema,
             left_input_schema,
@@ -255,8 +452,9 @@ impl GraceHashJoinStream {
             reservation: Arc::new(Mutex::new(reservation)),
             random_state,
             partition_batch_size,
-            partition_budget_bytes,
+            adaptive_budget,
             max_partition_passes,
+            partition_stats: PartitionStatsSummary::default(),
             state: GraceJoinState::WaitPartitioning,
         }
     }
@@ -266,25 +464,44 @@ impl GraceHashJoinStream {
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<RecordBatch>>> {
+        let join_time_metric = self.join_metrics.join_time.clone();
         loop {
             match &mut self.state {
                 GraceJoinState::WaitPartitioning => {
                     let shared = ready!(self.spill_fut.get_shared(cx))?;
                     let partition_count = shared.left.len();
-                    let work_queue = shared
+                    let mut partition_samples = Vec::with_capacity(partition_count);
+                    let mut work_queue = VecDeque::with_capacity(partition_count);
+                    for (partition_id, (left, right)) in shared
                         .left
                         .iter()
                         .cloned()
                         .zip(shared.right.iter().cloned())
                         .enumerate()
-                        .map(|(partition_id, (left, right))| PartitionWorkItem {
+                    {
+                        partition_samples.push(left.total_bytes() + right.total_bytes());
+                        work_queue.push_back(PartitionWorkItem {
                             partition_id,
                             pass: 0,
                             partition_count,
                             left,
                             right,
-                        })
-                        .collect::<VecDeque<_>>();
+                        });
+                    }
+                    let stats = PartitionStatsSummary::from_samples(&partition_samples);
+                    if !stats.is_empty() {
+                        debug!(
+                            "Grace hash join partition stats: count={}, min={}, median={}, max={}",
+                            stats.partitions(),
+                            human_readable_size(stats.min_bytes()),
+                            human_readable_size(stats.median_bytes()),
+                            human_readable_size(stats.max_bytes())
+                        );
+                    }
+                    self.partition_stats = stats.clone();
+                    self.adaptive_budget.prime_with_stats(&stats);
+                    self.adaptive_budget
+                        .update_active_partitions(partition_count.max(1));
                     let left_bytes = Arc::new(Mutex::new(0usize));
                     let right_bytes = Arc::new(Mutex::new(0usize));
                     self.state = GraceJoinState::JoinPartition {
@@ -295,6 +512,7 @@ impl GraceHashJoinStream {
                         right_fut: None,
                         left_bytes,
                         right_bytes,
+                        current_join_start: None,
                         repartition_fut: None,
                     };
                     continue;
@@ -307,6 +525,7 @@ impl GraceHashJoinStream {
                     right_fut,
                     left_bytes,
                     right_bytes,
+                    current_join_start,
                     repartition_fut,
                 } => {
                     if current_work.is_none() {
@@ -315,6 +534,9 @@ impl GraceHashJoinStream {
                                 *current_work = Some(work);
                                 *left_bytes.lock() = 0;
                                 *right_bytes.lock() = 0;
+                                self.adaptive_budget.update_active_partitions(
+                                    work_queue.len().saturating_add(1),
+                                );
                             }
                             None => {
                                 self.state = GraceJoinState::Done;
@@ -324,52 +546,6 @@ impl GraceHashJoinStream {
                     }
 
                     if current_stream.is_none() {
-                        if let Some(work) = current_work.as_ref() {
-                            if work.total_bytes() > self.partition_budget_bytes {
-                                if work.pass >= self.max_partition_passes {
-                                    let msg = format!(
-                                        "Grace hash join partition {} requires {} but budget is {} after {} passes",
-                                        work.partition_id,
-                                        human_readable_size(work.total_bytes()),
-                                        human_readable_size(self.partition_budget_bytes),
-                                        self.max_partition_passes
-                                    );
-                                    return Poll::Ready(Some(Err(
-                                        datafusion_common::DataFusionError::ResourcesExhausted(
-                                            msg,
-                                        ),
-                                    )));
-                                }
-                                if repartition_fut.is_none() {
-                                    let to_split = current_work.take().unwrap();
-                                    let future = build_repartition_future(
-                                        to_split,
-                                        self.random_state.clone(),
-                                        self.on_left
-                                            .iter()
-                                            .cloned()
-                                            .zip(self.on_right.iter().cloned())
-                                            .collect(),
-                                        Arc::clone(&self.spill_left),
-                                        Arc::clone(&self.spill_right),
-                                        Arc::clone(&self.join_metrics),
-                                        Arc::clone(&self.context),
-                                        Arc::clone(&self.left_input_schema),
-                                        Arc::clone(&self.right_input_schema),
-                                        self.partition_batch_size,
-                                    );
-                                    *repartition_fut = Some(future);
-                                }
-                                if let Some(fut) = repartition_fut.as_mut() {
-                                    let new_parts =
-                                        (*ready!(fut.get_shared(cx))?).clone();
-                                    *repartition_fut = None;
-                                    work_queue.extend(new_parts.into_iter());
-                                }
-                                continue;
-                            }
-                        }
-
                         if left_fut.is_none() && right_fut.is_none() {
                             if let Some(work) = current_work.as_ref() {
                                 *left_fut = Some(load_partition_async(
@@ -392,13 +568,148 @@ impl GraceHashJoinStream {
                         let right_batches =
                             (*ready!(right_fut.as_mut().unwrap().get_shared(cx))?)
                                 .clone();
+                        let work = current_work.as_ref().expect("work must exist");
+
+                        let total_loaded_bytes = left_batches
+                            .total_bytes
+                            .saturating_add(right_batches.total_bytes);
+                        let mut outcome =
+                            self.adaptive_budget.ensure_fits(total_loaded_bytes);
+                        let mut budget_change_logged = false;
+
+                        if matches!(outcome, AdaptiveBudgetOutcome::CannotFit { .. })
+                            && self.adaptive_budget.current_concurrency() > 1
+                        {
+                            if let Some((
+                                previous_concurrency,
+                                previous_limit,
+                                new_limit,
+                            )) = self
+                                .adaptive_budget
+                                .serialize_if_helpful(total_loaded_bytes)
+                            {
+                                let msg = format!(
+                                    "Grace hash join partition {} switching to serial processing to raise budget from {} to {} ({} -> 1 in-flight partitions, pass {}, loaded {})",
+                                    work.partition_id,
+                                    human_readable_size(previous_limit),
+                                    human_readable_size(new_limit),
+                                    previous_concurrency,
+                                    work.pass,
+                                    human_readable_size(total_loaded_bytes),
+                                );
+                                if new_limit > self.adaptive_budget.preferred_cap {
+                                    info!("{msg}");
+                                } else {
+                                    debug!("{msg}");
+                                }
+                                budget_change_logged = true;
+                                outcome = if new_limit > previous_limit {
+                                    AdaptiveBudgetOutcome::Raised {
+                                        previous: previous_limit,
+                                        new_limit,
+                                    }
+                                } else {
+                                    AdaptiveBudgetOutcome::Fits
+                                };
+                            }
+                        }
+
+                        let mut need_repartition = false;
+                        match outcome {
+                            AdaptiveBudgetOutcome::Fits => {}
+                            AdaptiveBudgetOutcome::Raised {
+                                previous,
+                                new_limit,
+                            } => {
+                                if !budget_change_logged {
+                                    let msg = format!(
+                                        "Grace hash join partition {} raised budget from {} to {} (pass {}, loaded {})",
+                                        work.partition_id,
+                                        human_readable_size(previous),
+                                        human_readable_size(new_limit),
+                                        work.pass,
+                                        human_readable_size(total_loaded_bytes),
+                                    );
+                                    if new_limit > self.adaptive_budget.preferred_cap {
+                                        info!("{msg}");
+                                    } else {
+                                        debug!("{msg}");
+                                    }
+                                }
+                            }
+                            AdaptiveBudgetOutcome::CannotFit { limit, .. } => {
+                                if work.pass >= self.max_partition_passes {
+                                    let msg = format!(
+                                        "Grace hash join partition {} requires {} but maximum budget is {} after {} passes",
+                                        work.partition_id,
+                                        human_readable_size(total_loaded_bytes),
+                                        human_readable_size(limit),
+                                        self.max_partition_passes
+                                    );
+                                    return Poll::Ready(Some(Err(
+                                        datafusion_common::DataFusionError::ResourcesExhausted(msg),
+                                    )));
+                                }
+                                need_repartition = true;
+                            }
+                        }
+
+                        if need_repartition {
+                            // Free loaded bytes before repartitioning
+                            let bytes_to_free = {
+                                let mut l = left_bytes.lock();
+                                let mut r = right_bytes.lock();
+                                let total = *l + *r;
+                                *l = 0;
+                                *r = 0;
+                                total
+                            };
+                            if bytes_to_free > 0 {
+                                let mut res = self.reservation.lock();
+                                res.shrink(bytes_to_free);
+                            }
+                            *left_fut = None;
+                            *right_fut = None;
+
+                            if repartition_fut.is_none() {
+                                let to_split = current_work.take().unwrap();
+                                let future = build_repartition_future(
+                                    to_split,
+                                    self.random_state.clone(),
+                                    self.on_left
+                                        .iter()
+                                        .cloned()
+                                        .zip(self.on_right.iter().cloned())
+                                        .collect(),
+                                    Arc::clone(&self.spill_left),
+                                    Arc::clone(&self.spill_right),
+                                    Arc::clone(&self.join_metrics),
+                                    Arc::clone(&self.context),
+                                    Arc::clone(&self.left_input_schema),
+                                    Arc::clone(&self.right_input_schema),
+                                    self.partition_batch_size,
+                                );
+                                *repartition_fut = Some(future);
+                            }
+                            if let Some(fut) = repartition_fut.as_mut() {
+                                let new_parts = (*ready!(fut.get_shared(cx))?).clone();
+                                *repartition_fut = None;
+                                for part in &new_parts {
+                                    self.adaptive_budget.observe(part.total_bytes());
+                                }
+                                work_queue.extend(new_parts.into_iter());
+                                self.adaptive_budget
+                                    .update_active_partitions(work_queue.len().max(1));
+                            }
+                            continue;
+                        }
 
                         let stream = build_in_memory_join_stream(
                             Arc::clone(&self.schema),
                             Arc::clone(&self.left_input_schema),
                             Arc::clone(&self.right_input_schema),
-                            left_batches,
-                            right_batches,
+                            left_batches.batches,
+                            right_batches.batches,
                             &self.on_left,
                             &self.on_right,
                             self.projection.clone(),
@@ -410,6 +721,7 @@ impl GraceHashJoinStream {
                         )?;
 
                         *current_stream = Some(stream);
+                        *current_join_start = Some(Instant::now());
                         *left_fut = None;
                         *right_fut = None;
                     }
@@ -417,7 +729,12 @@ impl GraceHashJoinStream {
                     if let Some(stream) = current_stream {
                         match ready!(stream.poll_next_unpin(cx)) {
                             Some(Ok(batch)) => return Poll::Ready(Some(Ok(batch))),
-                            Some(Err(e)) => return Poll::Ready(Some(Err(e))),
+                            Some(Err(e)) => {
+                                if let Some(start) = current_join_start.take() {
+                                    join_time_metric.add_elapsed(start);
+                                }
+                                return Poll::Ready(Some(Err(e)));
+                            }
                             None => {
                                 let bytes_to_free = {
                                     let mut l = left_bytes.lock();
@@ -431,8 +748,13 @@ impl GraceHashJoinStream {
                                     let mut res = self.reservation.lock();
                                     res.shrink(bytes_to_free);
                                 }
+                                if let Some(start) = current_join_start.take() {
+                                    join_time_metric.add_elapsed(start);
+                                }
                                 *current_stream = None;
                                 *current_work = None;
+                                self.adaptive_budget
+                                    .update_active_partitions(work_queue.len().max(1));
                                 continue;
                             }
                         }
@@ -449,9 +771,10 @@ fn load_partition_async(
     partition: PartitionIndex,
     reservation: Arc<Mutex<MemoryReservation>>,
     bytes_counter: Arc<Mutex<usize>>,
-) -> OnceFut<Vec<RecordBatch>> {
+) -> OnceFut<LoadedPartitionBatches> {
     OnceFut::new(async move {
         let mut all_batches = Vec::new();
+        let mut total_bytes = 0usize;
 
         for chunk in partition.chunks {
             let mut reader = spill_manager.load_spilled_batch(&chunk.location)?;
@@ -466,10 +789,14 @@ fn load_partition_async(
                     let mut b = bytes_counter.lock();
                     *b += batch_size;
                 }
+                total_bytes = total_bytes.saturating_add(batch_size);
                 all_batches.push(batch);
             }
         }
-        Ok(all_batches)
+        Ok(LoadedPartitionBatches {
+            batches: all_batches,
+            total_bytes,
+        })
     })
 }
 
@@ -599,5 +926,77 @@ impl Stream for GraceHashJoinStream {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Self::Item>> {
         self.poll_next_impl(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn adaptive_budget_scales_up_to_preferred_cap() {
+        let mut budget = AdaptivePartitionBudget::new(
+            512 * 1024 * 1024,
+            2 * 1024 * 1024 * 1024,
+            4 * 1024 * 1024 * 1024,
+            4,
+        );
+        match budget.ensure_fits(768 * 1024 * 1024) {
+            AdaptiveBudgetOutcome::Raised {
+                previous,
+                new_limit,
+            } => {
+                assert_eq!(previous, 512 * 1024 * 1024);
+                assert_eq!(new_limit, 768 * 1024 * 1024);
+            }
+            other => panic!("unexpected outcome: {other:?}"),
+        }
+        assert!(matches!(
+            budget.ensure_fits(512 * 1024 * 1024),
+            AdaptiveBudgetOutcome::Fits
+        ));
+    }
+
+    #[test]
+    fn adaptive_budget_borrows_up_to_absolute_cap() {
+        let mut budget = AdaptivePartitionBudget::new(512, 1024, 2048, 1);
+        match budget.ensure_fits(1500) {
+            AdaptiveBudgetOutcome::Raised {
+                previous,
+                new_limit,
+            } => {
+                assert!(previous >= 1024);
+                assert_eq!(new_limit, 1500);
+            }
+            other => panic!("unexpected outcome {other:?}"),
+        }
+        match budget.ensure_fits(3000) {
+            AdaptiveBudgetOutcome::CannotFit { limit } => {
+                assert_eq!(limit, 2048);
+            }
+            other => panic!("expected absolute cap exhaustion, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn adaptive_budget_serializes_to_raise_limit() {
+        let mut budget = AdaptivePartitionBudget::new(256, 512, 1024, 4);
+        match budget.ensure_fits(800) {
+            AdaptiveBudgetOutcome::CannotFit { limit } => {
+                assert_eq!(limit, 512);
+            }
+            other => panic!("expected initial budget exhaustion, got {other:?}"),
+        }
+
+        match budget.serialize_if_helpful(800) {
+            Some((previous_concurrency, previous_limit, new_limit)) => {
+                assert_eq!(previous_concurrency, 4);
+                assert_eq!(previous_limit, 512);
+                assert_eq!(new_limit, 800);
+                assert_eq!(budget.current_concurrency(), 1);
+                assert_eq!(budget.current_limit(), 800);
+            }
+            None => panic!("expected serialization to help"),
+        }
     }
 }
