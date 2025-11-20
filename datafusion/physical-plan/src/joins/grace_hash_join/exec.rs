@@ -45,7 +45,7 @@ use std::mem::size_of;
 use std::sync::Arc;
 
 use arrow::array::UInt32Array;
-use arrow::compute::take;
+use arrow::compute::{concat_batches, take};
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use datafusion_common::config::ConfigOptions;
@@ -967,11 +967,17 @@ async fn partition_and_spill_one_side(
     reservation: &mut MemoryReservation,
     partition_batch_size: usize,
 ) -> Result<Vec<PartitionIndex>> {
+    let schema = input.schema();
     let mut partitions: Vec<PartitionWriter> = (0..partition_count)
-        .map(|_| PartitionWriter::new(Arc::clone(&spill_manager)))
+        .map(|_| {
+            PartitionWriter::new(
+                Arc::clone(&spill_manager),
+                Arc::clone(&schema),
+                10 * 1024 * 1024, // 10MB buffer threshold
+            )
+        })
         .collect();
 
-    let schema = input.schema();
     let mut saw_batches = false;
     let chunk_size = partition_batch_size.max(1);
 
@@ -1006,8 +1012,9 @@ async fn partition_and_spill_one_side(
 
     // Prepare indexes
     let mut result = Vec::with_capacity(partitions.len());
-    for writer in partitions.into_iter() {
-        result.push(writer.finish()?);
+    for (i, writer) in partitions.into_iter().enumerate() {
+        let request_msg = format!("grace_partition_{spilling_request_msg}_{i}_finish");
+        result.push(writer.finish(reservation, &request_msg)?);
     }
     // println!("spill_manager {:?}", spill_manager.metrics);
     Ok(result)
@@ -1079,11 +1086,9 @@ fn process_partition_chunk(
             .collect::<arrow::error::Result<Vec<_>>>()?;
 
         let part_batch = RecordBatch::try_new(Arc::clone(&schema), taken)?;
-        let part_batch_size = get_record_batch_memory_size(&part_batch);
-        reservation.try_grow(part_batch_size)?;
+        // Memory tracking is handled by spill_batch_auto (buffering) and flush
         let request_msg = format!("grace_partition_{spilling_request_msg}_{i}");
-        partitions[i].spill_batch_auto(&part_batch, &request_msg)?;
-        reservation.try_shrink(part_batch_size)?;
+        partitions[i].spill_batch_auto(&part_batch, &request_msg, reservation)?;
     }
 
     reservation.try_shrink(reserved_bytes)?;
@@ -1094,13 +1099,25 @@ fn process_partition_chunk(
 pub struct PartitionWriter {
     spill_manager: Arc<SpillManager>,
     chunks: Vec<SpillChunk>,
+    buffer: Vec<RecordBatch>,
+    current_buffered_size: usize,
+    schema: SchemaRef,
+    batch_size_threshold: usize,
 }
 
 impl PartitionWriter {
-    pub fn new(spill_manager: Arc<SpillManager>) -> Self {
+    pub fn new(
+        spill_manager: Arc<SpillManager>,
+        schema: SchemaRef,
+        batch_size_threshold: usize,
+    ) -> Self {
         Self {
             spill_manager,
             chunks: vec![],
+            buffer: vec![],
+            current_buffered_size: 0,
+            schema,
+            batch_size_threshold,
         }
     }
 
@@ -1108,9 +1125,40 @@ impl PartitionWriter {
         &mut self,
         batch: &RecordBatch,
         request_msg: &str,
+        reservation: &mut MemoryReservation,
     ) -> Result<()> {
         let size = get_record_batch_memory_size(batch);
-        let loc = self.spill_manager.spill_batch_auto(batch, request_msg)?;
+        reservation.try_grow(size)?;
+        self.buffer.push(batch.clone());
+        self.current_buffered_size += size;
+
+        if self.current_buffered_size >= self.batch_size_threshold {
+            self.flush(reservation, request_msg)?;
+        }
+        Ok(())
+    }
+
+    pub fn flush(
+        &mut self,
+        reservation: &mut MemoryReservation,
+        request_msg: &str,
+    ) -> Result<()> {
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
+
+        let large_batch = concat_batches(&self.schema, &self.buffer)?;
+        // Clear buffer and release memory tracking for the buffered pieces
+        // Note: concat_batches allocates new memory, which is what we are about to spill.
+        // The original buffered batches are dropped here.
+        self.buffer.clear();
+        reservation.shrink(self.current_buffered_size);
+        self.current_buffered_size = 0;
+
+        // Now spill the coalesced batch.
+        // Note: SpillManager might keep it in memory (untracked by us) or spill to disk.
+        let size = get_record_batch_memory_size(&large_batch);
+        let loc = self.spill_manager.spill_batch_auto(&large_batch, request_msg)?;
         self.chunks.push(SpillChunk {
             location: loc,
             size,
@@ -1118,7 +1166,8 @@ impl PartitionWriter {
         Ok(())
     }
 
-    pub fn finish(self) -> Result<PartitionIndex> {
+    pub fn finish(mut self, reservation: &mut MemoryReservation, request_msg: &str) -> Result<PartitionIndex> {
+        self.flush(reservation, request_msg)?;
         let total_bytes = self.chunks.iter().map(|c| c.size).sum();
         Ok(PartitionIndex {
             chunks: self.chunks,
