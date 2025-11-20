@@ -45,6 +45,8 @@ use std::mem::size_of;
 use std::sync::Arc;
 
 use arrow::array::UInt32Array;
+use arrow::array::{Array, StringViewArray, StringViewBuilder};
+use arrow::array::Datum;
 use arrow::compute::{concat_batches, take};
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
@@ -1154,6 +1156,20 @@ impl PartitionWriter {
         self.buffer.clear();
         reservation.shrink(self.current_buffered_size);
         self.current_buffered_size = 0;
+
+        // Compact StringViewArrays to avoid writing huge buffers
+        let new_columns: Vec<Arc<dyn Array>> = large_batch
+            .columns()
+            .iter()
+            .map(|arr| {
+                if let Some(sv) = arr.as_any().downcast_ref::<StringViewArray>() {
+                    Arc::new(sv.gc()) as Arc<dyn Array>
+                } else {
+                    Arc::clone(arr)
+                }
+            })
+            .collect();
+        let large_batch = RecordBatch::try_new(Arc::clone(&self.schema), new_columns)?;
 
         // Now spill the coalesced batch.
         // Note: SpillManager might keep it in memory (untracked by us) or spill to disk.
