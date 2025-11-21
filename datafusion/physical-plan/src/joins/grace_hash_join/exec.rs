@@ -45,8 +45,7 @@ use std::mem::size_of;
 use std::sync::Arc;
 
 use arrow::array::UInt32Array;
-use arrow::array::{Array, StringViewArray, StringViewBuilder};
-use arrow::array::Datum;
+use arrow::array::{Array, StringViewArray};
 use arrow::compute::{concat_batches, take};
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
@@ -972,10 +971,16 @@ async fn partition_and_spill_one_side(
     let schema = input.schema();
     let mut partitions: Vec<PartitionWriter> = (0..partition_count)
         .map(|_| {
+            // Calculate dynamic buffer size threshold to keep total overhead under control.
+            // Target total write buffer memory around 64MB per task.
+            // At least 512KB per partition to ensure some coalescing.
+            let total_target_buffer_mem = 64 * 1024 * 1024; // 64MB
+            let batch_size_threshold = (total_target_buffer_mem / partition_count).max(512 * 1024);
+
             PartitionWriter::new(
                 Arc::clone(&spill_manager),
                 Arc::clone(&schema),
-                10 * 1024 * 1024, // 10MB buffer threshold
+                batch_size_threshold,
             )
         })
         .collect();

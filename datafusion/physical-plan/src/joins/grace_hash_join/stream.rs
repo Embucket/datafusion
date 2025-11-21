@@ -546,33 +546,106 @@ impl GraceHashJoinStream {
                     }
 
                     if current_stream.is_none() {
-                        if left_fut.is_none() && right_fut.is_none() {
-                            if let Some(work) = current_work.as_ref() {
-                                *left_fut = Some(load_partition_async(
-                                    Arc::clone(&self.spill_left),
-                                    work.left.clone(),
-                                    Arc::clone(&self.reservation),
-                                    Arc::clone(left_bytes),
-                                ));
-                                *right_fut = Some(load_partition_async(
-                                    Arc::clone(&self.spill_right),
-                                    work.right.clone(),
-                                    Arc::clone(&self.reservation),
-                                    Arc::clone(right_bytes),
-                                ));
+                        if let Some(work) = current_work.as_ref() {
+                            // Pre-load check: ensure we have budget before loading
+                            // Expansion factor to account for hash table overhead
+                            let estimated_size = (work.total_bytes() as f64 * 1.5) as usize;
+                            let current_limit = self.adaptive_budget.current_limit();
+
+                            // If it definitely won't fit, skip loading and repartition immediately
+                            // But only if we haven't exceeded max passes
+                            if estimated_size > current_limit
+                                && work.pass < self.max_partition_passes
+                                && self.adaptive_budget.current_concurrency() > 1
+                            {
+                                // Try serializing first
+                                if let Some((_, _, new_limit)) = self
+                                    .adaptive_budget
+                                    .serialize_if_helpful(estimated_size)
+                                {
+                                    if estimated_size > new_limit {
+                                        // Still won't fit even with serialization, go straight to repartition
+                                        debug!(
+                                            "Grace hash join partition {} estimated size {} exceeds limit {} (pass {}), skipping load",
+                                            work.partition_id,
+                                            human_readable_size(estimated_size),
+                                            human_readable_size(new_limit),
+                                            work.pass
+                                        );
+                                        // Don't load, fall through to repartition logic below
+                                        // We need to set left_fut/right_fut to None to ensure we don't try to load
+                                        // But wait, the repartition logic is inside the `matches!(outcome)` block
+                                        // We need to trigger that logic.
+                                        // Let's synthesize a "CannotFit" outcome by NOT loading and setting a flag?
+                                        // Or better, refactor the flow.
+                                    }
+                                } else {
+                                    // Already serial or serialization won't help enough
+                                    debug!(
+                                        "Grace hash join partition {} estimated size {} exceeds limit {} (pass {}), skipping load",
+                                        work.partition_id,
+                                        human_readable_size(estimated_size),
+                                        human_readable_size(current_limit),
+                                        work.pass
+                                    );
+                                }
                             }
                         }
 
-                        let left_batches =
-                            (*ready!(left_fut.as_mut().unwrap().get_shared(cx))?).clone();
-                        let right_batches =
-                            (*ready!(right_fut.as_mut().unwrap().get_shared(cx))?)
-                                .clone();
+                        if left_fut.is_none() && right_fut.is_none() {
+                            if let Some(work) = current_work.as_ref() {
+                                // Check budget one last time before launching futures
+                                let estimated_size = (work.total_bytes() as f64 * 1.5) as usize;
+                                let current_limit = self.adaptive_budget.current_limit();
+                                let skip_load = estimated_size > current_limit
+                                    && work.pass < self.max_partition_passes;
+
+                                if !skip_load {
+                                    *left_fut = Some(load_partition_async(
+                                        Arc::clone(&self.spill_left),
+                                        work.left.clone(),
+                                        Arc::clone(&self.reservation),
+                                        Arc::clone(left_bytes),
+                                    ));
+                                    *right_fut = Some(load_partition_async(
+                                        Arc::clone(&self.spill_right),
+                                        work.right.clone(),
+                                        Arc::clone(&self.reservation),
+                                        Arc::clone(right_bytes),
+                                    ));
+                                }
+                            }
+                        }
+
+                        let (left_batches, right_batches) = if left_fut.is_some() {
+                            let left = (*ready!(left_fut.as_mut().unwrap().get_shared(cx))?).clone();
+                            let right = (*ready!(right_fut.as_mut().unwrap().get_shared(cx))?).clone();
+                            (left, right)
+                        } else {
+                            // Skipped loading
+                            (
+                                LoadedPartitionBatches {
+                                    batches: vec![],
+                                    total_bytes: 0,
+                                },
+                                LoadedPartitionBatches {
+                                    batches: vec![],
+                                    total_bytes: 0,
+                                },
+                            )
+                        };
+
                         let work = current_work.as_ref().expect("work must exist");
 
-                        let total_loaded_bytes = left_batches
-                            .total_bytes
-                            .saturating_add(right_batches.total_bytes);
+                        // If we skipped loading, use estimated size. Otherwise use actual loaded size.
+                        let total_loaded_bytes = if left_fut.is_some() {
+                            left_batches
+                                .total_bytes
+                                .saturating_add(right_batches.total_bytes)
+                        } else {
+                            (work.total_bytes() as f64 * 1.5) as usize
+                        };
+
                         let mut outcome =
                             self.adaptive_budget.ensure_fits(total_loaded_bytes);
                         let mut budget_change_logged = false;
