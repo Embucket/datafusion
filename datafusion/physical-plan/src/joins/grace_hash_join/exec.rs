@@ -67,8 +67,10 @@ use crate::spill::get_record_batch_memory_size;
 use crate::spill::spill_manager::SpillLocation;
 use ahash::RandomState;
 use datafusion_common::hash_utils::create_hashes;
+use datafusion_execution::memory_pool::human_readable_size;
 use datafusion_physical_expr_common::physical_expr::fmt_sql;
 use futures::StreamExt;
+use log::debug;
 
 /// Hard-coded seed to ensure hash values from the hash join differ from `RepartitionExec`, avoiding collisions.
 const HASH_JOIN_SEED: RandomState =
@@ -952,6 +954,20 @@ pub async fn partition_and_spill(
         partition_batch_size,
     )
     .await?;
+
+    // Log spill stats per side for visibility
+    let left_files: usize = left_index.iter().map(|p| p.chunk_count()).sum();
+    let right_files: usize = right_index.iter().map(|p| p.chunk_count()).sum();
+    let left_bytes: usize = left_index.iter().map(|p| p.total_bytes()).sum();
+    let right_bytes: usize = right_index.iter().map(|p| p.total_bytes()).sum();
+    debug!(
+        "Grace hash join partitioning: left files={}, right files={}, left bytes={}, right bytes={}",
+        left_files,
+        right_files,
+        human_readable_size(left_bytes),
+        human_readable_size(right_bytes)
+    );
+
     Ok((left_index, right_index))
 }
 
@@ -974,8 +990,10 @@ async fn partition_and_spill_one_side(
             // Calculate dynamic buffer size threshold to keep total overhead under control.
             // Target total write buffer memory around 64MB per task.
             // At least 512KB per partition to ensure some coalescing.
-            let total_target_buffer_mem = 64 * 1024 * 1024; // 64MB
-            let batch_size_threshold = (total_target_buffer_mem / partition_count).max(512 * 1024);
+            // Prefer smaller flush thresholds to keep spill files bounded and reduce stall time.
+            let total_target_buffer_mem = 16 * 1024 * 1024; // 16MB
+            let batch_size_threshold =
+                (total_target_buffer_mem / partition_count).max(512 * 1024);
 
             PartitionWriter::new(
                 Arc::clone(&spill_manager),
@@ -1107,7 +1125,7 @@ pub struct PartitionWriter {
     spill_manager: Arc<SpillManager>,
     chunks: Vec<SpillChunk>,
     buffer: Vec<RecordBatch>,
-    current_buffered_size: usize,
+    buffered_bytes: usize,
     schema: SchemaRef,
     batch_size_threshold: usize,
 }
@@ -1122,7 +1140,7 @@ impl PartitionWriter {
             spill_manager,
             chunks: vec![],
             buffer: vec![],
-            current_buffered_size: 0,
+            buffered_bytes: 0,
             schema,
             batch_size_threshold,
         }
@@ -1137,9 +1155,9 @@ impl PartitionWriter {
         let size = get_record_batch_memory_size(batch);
         reservation.try_grow(size)?;
         self.buffer.push(batch.clone());
-        self.current_buffered_size += size;
+        self.buffered_bytes += size;
 
-        if self.current_buffered_size >= self.batch_size_threshold {
+        if self.buffered_bytes >= self.batch_size_threshold {
             self.flush(reservation, request_msg)?;
         }
         Ok(())
@@ -1154,35 +1172,19 @@ impl PartitionWriter {
             return Ok(());
         }
 
-        let large_batch = concat_batches(&self.schema, &self.buffer)?;
-        // Clear buffer and release memory tracking for the buffered pieces
-        // Note: concat_batches allocates new memory, which is what we are about to spill.
-        // The original buffered batches are dropped here.
+        // Coalesce buffered batches to reduce file count, but only within the configured threshold.
+        let total_accounted = self.buffered_bytes;
+        let coalesced = concat_batches(&self.schema, &self.buffer)?;
         self.buffer.clear();
-        reservation.shrink(self.current_buffered_size);
-        self.current_buffered_size = 0;
+        reservation.shrink(total_accounted);
+        self.buffered_bytes = 0;
 
-        // Compact StringViewArrays to avoid writing huge buffers
-        let new_columns: Vec<Arc<dyn Array>> = large_batch
-            .columns()
-            .iter()
-            .map(|arr| {
-                if let Some(sv) = arr.as_any().downcast_ref::<StringViewArray>() {
-                    Arc::new(sv.gc()) as Arc<dyn Array>
-                } else {
-                    Arc::clone(arr)
-                }
-            })
-            .collect();
-        let large_batch = RecordBatch::try_new(Arc::clone(&self.schema), new_columns)?;
-
-        // Now spill the coalesced batch.
-        // Note: SpillManager might keep it in memory (untracked by us) or spill to disk.
-        let size = get_record_batch_memory_size(&large_batch);
-        let loc = self.spill_manager.spill_batch_auto(&large_batch, request_msg)?;
+        let batch = maybe_compact_string_views(&self.schema, &coalesced)?;
+        let spilled_size = get_record_batch_memory_size(&batch);
+        let loc = self.spill_manager.spill_batch_auto(&batch, request_msg)?;
         self.chunks.push(SpillChunk {
             location: loc,
-            size,
+            size: spilled_size,
         });
         Ok(())
     }
@@ -1217,12 +1219,34 @@ impl PartitionIndex {
     pub fn total_bytes(&self) -> usize {
         self.total_bytes
     }
+
+    pub fn chunk_count(&self) -> usize {
+        self.chunks.len()
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct SpillChunk {
     pub location: SpillLocation,
     pub size: usize,
+}
+
+fn maybe_compact_string_views(
+    schema: &SchemaRef,
+    batch: &RecordBatch,
+) -> Result<RecordBatch> {
+    let new_columns: Vec<Arc<dyn Array>> = batch
+        .columns()
+        .iter()
+        .map(|arr| {
+            if let Some(sv) = arr.as_any().downcast_ref::<StringViewArray>() {
+                Arc::new(sv.gc()) as Arc<dyn Array>
+            } else {
+                Arc::clone(arr)
+            }
+        })
+        .collect();
+    RecordBatch::try_new(Arc::clone(schema), new_columns).map_err(Into::into)
 }
 
 #[cfg(test)]
