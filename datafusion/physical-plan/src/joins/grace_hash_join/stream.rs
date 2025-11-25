@@ -213,12 +213,16 @@ impl AdaptivePartitionBudget {
     }
 
     fn recompute_limit(&mut self) -> usize {
-        let needed = self.base_for_current_concurrency().max(self.observed_max);
-        let mut limit = needed.min(self.preferred_cap);
-        if needed > limit && self.absolute_cap > limit && self.active_partitions <= 1 {
-            limit = needed.min(self.absolute_cap);
+        if self.active_partitions <= 1 {
+            // When processing sequentially (one active partition), allow using the full absolute budget.
+            // This prevents artificial constraints from "preferred" caps or previous observations
+            // when we are in a fallback/recovery mode.
+            self.current_limit = self.absolute_cap.max(1);
+        } else {
+            let needed = self.base_for_current_concurrency().max(self.observed_max);
+            let limit = needed.min(self.preferred_cap);
+            self.current_limit = limit.max(1);
         }
-        self.current_limit = limit.max(1);
         self.current_limit
     }
 
@@ -281,6 +285,7 @@ fn build_repartition_future(
     left_schema: SchemaRef,
     right_schema: SchemaRef,
     partition_batch_size: usize,
+    target_size: usize,
 ) -> OnceFut<Vec<PartitionWorkItem>> {
     OnceFut::new(async move {
         let PartitionWorkItem {
@@ -291,8 +296,13 @@ fn build_repartition_future(
             right,
         } = work;
 
+        let input_size = left.total_bytes() + right.total_bytes();
+        let target_size = target_size.max(1);
+        let fan_out = (input_size + target_size - 1) / target_size;
+        let fan_out = fan_out.max(2);
+
         let new_partition_count =
-            partition_count.saturating_mul(2).max(partition_count + 1);
+            partition_count.saturating_mul(fan_out).max(partition_count + 1);
 
         let left_stream: SendableRecordBatchStream =
             Box::pin(SpilledPartitionStream::new(
@@ -761,6 +771,7 @@ impl GraceHashJoinStream {
                                     Arc::clone(&self.left_input_schema),
                                     Arc::clone(&self.right_input_schema),
                                     self.partition_batch_size,
+                                    self.adaptive_budget.current_limit(),
                                 );
                                 *repartition_fut = Some(future);
                             }
@@ -1033,16 +1044,16 @@ mod tests {
     #[test]
     fn adaptive_budget_borrows_up_to_absolute_cap() {
         let mut budget = AdaptivePartitionBudget::new(512, 1024, 2048, 1);
+        // With aggressive budgeting, a single active partition gets the absolute cap immediately.
+        assert_eq!(budget.current_limit(), 2048);
+
+        // It fits immediately
         match budget.ensure_fits(1500) {
-            AdaptiveBudgetOutcome::Raised {
-                previous,
-                new_limit,
-            } => {
-                assert!(previous >= 1024);
-                assert_eq!(new_limit, 1500);
-            }
+            AdaptiveBudgetOutcome::Fits => {}
             other => panic!("unexpected outcome {other:?}"),
         }
+
+        // Still bounded by absolute cap
         match budget.ensure_fits(3000) {
             AdaptiveBudgetOutcome::CannotFit { limit } => {
                 assert_eq!(limit, 2048);
@@ -1065,9 +1076,10 @@ mod tests {
             Some((previous_concurrency, previous_limit, new_limit)) => {
                 assert_eq!(previous_concurrency, 4);
                 assert_eq!(previous_limit, 512);
-                assert_eq!(new_limit, 800);
+                // Should jump to absolute cap (1024)
+                assert_eq!(new_limit, 1024);
                 assert_eq!(budget.current_concurrency(), 1);
-                assert_eq!(budget.current_limit(), 800);
+                assert_eq!(budget.current_limit(), 1024);
             }
             None => panic!("expected serialization to help"),
         }
