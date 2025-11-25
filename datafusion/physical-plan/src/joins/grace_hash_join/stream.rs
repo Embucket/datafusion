@@ -833,6 +833,24 @@ impl GraceHashJoinStream {
                         }
 
                         if need_repartition {
+                            // If repartitioning would not increase fan-out, skip it to avoid a useless extra pass.
+                            let prospective =
+                                compute_repartition_count(
+                                    work.partition_count,
+                                    work.total_bytes(),
+                                    self.adaptive_budget.current_limit(),
+                                    MAX_REPARTITION_PARTITIONS,
+                                );
+                            if prospective <= work.partition_count {
+                                debug!(
+                                    "Grace hash join partition {} already at fan-out {}, skipping repartition (prospective {})",
+                                    work.partition_id, work.partition_count, prospective
+                                );
+                                need_repartition = false;
+                            }
+                        }
+
+                        if need_repartition {
                             // Free loaded bytes before repartitioning
                             let bytes_to_free = {
                                 let mut l = left_bytes.lock();
@@ -851,6 +869,23 @@ impl GraceHashJoinStream {
 
                             if repartition_fut.is_none() {
                                 let to_split = current_work.take().unwrap();
+                                let planned_fanout = compute_repartition_count(
+                                    to_split.partition_count,
+                                    to_split.total_bytes(),
+                                    self.adaptive_budget.current_limit(),
+                                    MAX_REPARTITION_PARTITIONS,
+                                );
+                                if planned_fanout <= to_split.partition_count {
+                                    debug!(
+                                        "Grace hash join partition {} would not increase fan-out ({} -> {}), skipping repartition",
+                                        to_split.partition_id,
+                                        to_split.partition_count,
+                                        planned_fanout
+                                    );
+                                    *current_work = Some(to_split);
+                                    need_repartition = false;
+                                    continue;
+                                }
                                 let future = build_repartition_future(
                                     to_split,
                                     self.random_state.clone(),
