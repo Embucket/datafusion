@@ -48,6 +48,7 @@ use datafusion_execution::memory_pool::{
 };
 use datafusion_execution::TaskContext;
 use datafusion_physical_expr::PhysicalExprRef;
+use futures::stream::FuturesUnordered;
 use futures::{ready, Stream, StreamExt};
 use log::{debug, info};
 use parking_lot::Mutex;
@@ -55,6 +56,11 @@ use parking_lot::Mutex;
 /// Maximum number of partitions we allow after recursive repartitioning to
 /// prevent explosive fan-out.
 const MAX_REPARTITION_PARTITIONS: usize = 256;
+/// Upper bound on bytes we'll prefetch for the next partition to avoid
+/// runaway memory usage while still hiding IO latency.
+const PREFETCH_MAX_BYTES: usize = 256 * 1024 * 1024;
+/// Upper bound for concurrent spill chunk read-ahead when loading partitions.
+const SPILL_READAHEAD_BYTES: usize = 256 * 1024 * 1024;
 
 enum GraceJoinState {
     /// Waiting for the partitioning phase (Phase 1) to finish
@@ -307,6 +313,7 @@ fn build_repartition_future(
     right_schema: SchemaRef,
     partition_batch_size: usize,
     target_size: usize,
+    partition_write_buffer_bytes: usize,
     max_partition_count: usize,
 ) -> OnceFut<Vec<PartitionWorkItem>> {
     OnceFut::new(async move {
@@ -378,6 +385,7 @@ fn build_repartition_future(
             &mut left_reservation,
             &mut right_reservation,
             partition_batch_size,
+            partition_write_buffer_bytes,
         )
         .await?;
 
@@ -629,9 +637,8 @@ impl GraceHashJoinStream {
                                 previous_concurrency,
                                 previous_limit,
                                 new_limit,
-                            )) = self
-                                .adaptive_budget
-                                .serialize_if_helpful(estimated_size)
+                            )) =
+                                self.adaptive_budget.serialize_if_helpful(estimated_size)
                             {
                                 effective_limit = new_limit;
                                 let msg = format!(
@@ -655,10 +662,7 @@ impl GraceHashJoinStream {
                         let skip_load = estimated_size > effective_limit
                             && work.pass < self.max_partition_passes;
 
-                        if left_fut.is_none()
-                            && right_fut.is_none()
-                            && !skip_load
-                        {
+                        if left_fut.is_none() && right_fut.is_none() && !skip_load {
                             *left_fut = Some(load_partition_async(
                                 Arc::clone(&self.spill_left),
                                 work.left.clone(),
@@ -682,8 +686,12 @@ impl GraceHashJoinStream {
                         }
 
                         let (left_batches, right_batches) = if left_fut.is_some() {
-                            let left = (*ready!(left_fut.as_mut().unwrap().get_shared(cx))?).clone();
-                            let right = (*ready!(right_fut.as_mut().unwrap().get_shared(cx))?).clone();
+                            let left =
+                                (*ready!(left_fut.as_mut().unwrap().get_shared(cx))?)
+                                    .clone();
+                            let right =
+                                (*ready!(right_fut.as_mut().unwrap().get_shared(cx))?)
+                                    .clone();
                             (left, right)
                         } else {
                             // Skipped loading
@@ -826,6 +834,7 @@ impl GraceHashJoinStream {
                                     Arc::clone(&self.right_input_schema),
                                     self.partition_batch_size,
                                     self.adaptive_budget.current_limit(),
+                                    self.adaptive_budget.current_limit(),
                                     MAX_REPARTITION_PARTITIONS,
                                 );
                                 *repartition_fut = Some(future);
@@ -867,9 +876,13 @@ impl GraceHashJoinStream {
                     // Trigger prefetch of the next partition (if any) while joining this one
                     if current_stream.is_some() && prefetch.is_none() {
                         if let Some(next_work) = work_queue.front() {
-                            let estimated_size = (next_work.total_bytes() as f64 * 1.5) as usize;
-                            // Be conservative: prefetch only if it fits under half of current limit
-                            if estimated_size <= self.adaptive_budget.current_limit() / 2 {
+                            let estimated_size =
+                                (next_work.total_bytes() as f64 * 1.1) as usize;
+                            let cap = self
+                                .adaptive_budget
+                                .current_limit()
+                                .min(PREFETCH_MAX_BYTES);
+                            if estimated_size <= cap {
                                 let left_bytes_pf = Arc::new(Mutex::new(0usize));
                                 let right_bytes_pf = Arc::new(Mutex::new(0usize));
                                 let left_fut_pf = load_partition_async(
@@ -884,6 +897,12 @@ impl GraceHashJoinStream {
                                     Arc::clone(&self.reservation),
                                     Arc::clone(&right_bytes_pf),
                                 );
+                                debug!(
+                                    "Prefetching next partition {} (est {} <= cap {})",
+                                    next_work.partition_id,
+                                    human_readable_size(estimated_size),
+                                    human_readable_size(cap)
+                                );
                                 *prefetch = Some(PrefetchState {
                                     work: next_work.clone(),
                                     left_fut: left_fut_pf,
@@ -891,6 +910,13 @@ impl GraceHashJoinStream {
                                     left_bytes: left_bytes_pf,
                                     right_bytes: right_bytes_pf,
                                 });
+                            } else {
+                                debug!(
+                                    "Skipping prefetch for partition {} (est {} > cap {})",
+                                    next_work.partition_id,
+                                    human_readable_size(estimated_size),
+                                    human_readable_size(cap)
+                                );
                             }
                         }
                     }
@@ -941,31 +967,69 @@ fn load_partition_async(
     bytes_counter: Arc<Mutex<usize>>,
 ) -> OnceFut<LoadedPartitionBatches> {
     OnceFut::new(async move {
+        // Load spill chunks with bounded parallelism to overlap IO.
+        let mut tasks = FuturesUnordered::new();
+        let mut in_flight_bytes = 0usize;
         let mut all_batches = Vec::new();
         let mut total_bytes = 0usize;
 
         for chunk in partition.chunks {
-            let mut reader = spill_manager.load_spilled_batch(&chunk.location)?;
-            while let Some(batch_result) = reader.next().await {
-                let batch = batch_result?;
-                // Use de-duplicated record batch memory size to avoid
-                // drastically overestimating memory when arrays share buffers.
-                let batch_size = get_record_batch_memory_size(&batch);
-                {
-                    let mut res = reservation.lock();
-                    res.try_grow(batch_size)?;
-                    let mut b = bytes_counter.lock();
-                    *b += batch_size;
+            let estimated = chunk.size;
+            // backpressure: wait for at least one task to finish if we'd exceed cap
+            while in_flight_bytes + estimated > SPILL_READAHEAD_BYTES {
+                if let Some(res) = tasks.next().await {
+                    let (batches, bytes) = res?;
+                    in_flight_bytes = in_flight_bytes.saturating_sub(bytes);
+                    total_bytes = total_bytes.saturating_add(bytes);
+                    all_batches.extend(batches);
                 }
-                total_bytes = total_bytes.saturating_add(batch_size);
-                all_batches.push(batch);
             }
+
+            let sm = Arc::clone(&spill_manager);
+            let resv = Arc::clone(&reservation);
+            let counter = Arc::clone(&bytes_counter);
+            tasks.push(async move { load_spill_chunk(sm, chunk, resv, counter).await });
+            in_flight_bytes = in_flight_bytes.saturating_add(estimated);
         }
+
+        while let Some(res) = tasks.next().await {
+            let (batches, bytes) = res?;
+            in_flight_bytes = in_flight_bytes.saturating_sub(bytes);
+            total_bytes = total_bytes.saturating_add(bytes);
+            all_batches.extend(batches);
+        }
+
         Ok(LoadedPartitionBatches {
             batches: all_batches,
             total_bytes,
         })
     })
+}
+
+async fn load_spill_chunk(
+    spill_manager: Arc<SpillManager>,
+    chunk: SpillChunk,
+    reservation: Arc<Mutex<MemoryReservation>>,
+    bytes_counter: Arc<Mutex<usize>>,
+) -> Result<(Vec<RecordBatch>, usize)> {
+    let mut reader = spill_manager.load_spilled_batch(&chunk.location)?;
+    let mut batches = Vec::new();
+    let mut total_bytes = 0usize;
+    while let Some(batch_result) = reader.next().await {
+        let batch = batch_result?;
+        // Use de-duplicated record batch memory size to avoid
+        // drastically overestimating memory when arrays share buffers.
+        let batch_size = get_record_batch_memory_size(&batch);
+        {
+            let mut res = reservation.lock();
+            res.try_grow(batch_size)?;
+            let mut b = bytes_counter.lock();
+            *b += batch_size;
+        }
+        total_bytes = total_bytes.saturating_add(batch_size);
+        batches.push(batch);
+    }
+    Ok((batches, total_bytes))
 }
 
 /// Build an in-memory HashJoinExec for one pair of spilled partitions
@@ -1171,23 +1235,14 @@ mod tests {
 
     #[test]
     fn repartition_count_is_capped() {
-        let count = compute_repartition_count(
-            16,
-            1 * 1024 * 1024 * 1024,
-            64 * 1024 * 1024,
-            64,
-        );
+        let count =
+            compute_repartition_count(16, 1 * 1024 * 1024 * 1024, 64 * 1024 * 1024, 64);
         assert_eq!(count, 64);
     }
 
     #[test]
     fn repartition_count_grows_by_fan_out() {
-        let count = compute_repartition_count(
-            8,
-            64 * 1024 * 1024,
-            64 * 1024 * 1024,
-            256,
-        );
+        let count = compute_repartition_count(8, 64 * 1024 * 1024, 64 * 1024 * 1024, 256);
         // fan_out=2 (min), base=8 -> 16
         assert_eq!(count, 16);
     }

@@ -70,7 +70,8 @@ use datafusion_common::hash_utils::create_hashes;
 use datafusion_execution::memory_pool::human_readable_size;
 use datafusion_physical_expr_common::physical_expr::fmt_sql;
 use futures::StreamExt;
-use log::debug;
+use log::{debug, info};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// Hard-coded seed to ensure hash values from the hash join differ from `RepartitionExec`, avoiding collisions.
 const HASH_JOIN_SEED: RandomState =
@@ -667,13 +668,20 @@ impl ExecutionPlan for GraceHashJoinExec {
             None => self.column_indices.clone(),
         };
 
+        let (
+            base_partition_budget_bytes,
+            preferred_partition_budget_bytes,
+            absolute_partition_cap_bytes,
+        ) = Self::partition_memory_budget(&context);
+        let partition_write_buffer_bytes = base_partition_budget_bytes;
+        let partition_batch_size = context.session_config().batch_size();
+
         let random_state = self.random_state.clone();
         let on = self.on.clone();
         let spill_left_clone = Arc::clone(&spill_left);
         let spill_right_clone = Arc::clone(&spill_right);
         let join_metrics_clone = Arc::clone(&join_metrics);
         let context_for_partition = Arc::clone(&context);
-        let partition_batch_size = context_for_partition.session_config().batch_size();
         let spill_fut = OnceFut::new(async move {
             // Track memory used during the partitioning phase for this join
             let mut left_reservation =
@@ -699,6 +707,7 @@ impl ExecutionPlan for GraceHashJoinExec {
                 &mut left_reservation,
                 &mut right_reservation,
                 partition_batch_size,
+                partition_write_buffer_bytes,
             )
             .await?;
             Ok(SpillFut::new(left_partitions, left_idx, right_idx))
@@ -715,12 +724,6 @@ impl ExecutionPlan for GraceHashJoinExec {
                 .with_can_spill(true)
                 .register(context.memory_pool());
 
-        let (
-            base_partition_budget_bytes,
-            preferred_partition_budget_bytes,
-            absolute_partition_cap_bytes,
-        ) = Self::partition_memory_budget(&context);
-        let partition_batch_size = context.session_config().batch_size();
         let max_partition_passes = context
             .session_config()
             .grace_hash_join_max_partition_passes()
@@ -921,6 +924,7 @@ pub async fn partition_and_spill(
     left_reservation: &mut MemoryReservation,
     right_reservation: &mut MemoryReservation,
     partition_batch_size: usize,
+    partition_write_buffer_bytes: usize,
 ) -> Result<(Vec<PartitionIndex>, Vec<PartitionIndex>)> {
     let on_left: Vec<_> = on.iter().map(|(l, _)| Arc::clone(l)).collect();
     let on_right: Vec<_> = on.iter().map(|(_, r)| Arc::clone(r)).collect();
@@ -937,6 +941,7 @@ pub async fn partition_and_spill(
         enable_dynamic_filter_pushdown,
         left_reservation,
         partition_batch_size,
+        partition_write_buffer_bytes,
     )
     .await?;
 
@@ -952,6 +957,7 @@ pub async fn partition_and_spill(
         enable_dynamic_filter_pushdown,
         right_reservation,
         partition_batch_size,
+        partition_write_buffer_bytes,
     )
     .await?;
 
@@ -964,6 +970,41 @@ pub async fn partition_and_spill(
         "Grace hash join partitioning: left files={}, right files={}, left bytes={}, right bytes={}",
         left_files,
         right_files,
+        human_readable_size(left_bytes),
+        human_readable_size(right_bytes)
+    );
+
+    let (left_max, left_avg) = if left_files > 0 {
+        let max = left_index
+            .iter()
+            .flat_map(|p| p.chunks.iter().map(|c| c.size))
+            .max()
+            .unwrap_or(0);
+        let avg = left_bytes / left_files;
+        (max, avg)
+    } else {
+        (0, 0)
+    };
+    let (right_max, right_avg) = if right_files > 0 {
+        let max = right_index
+            .iter()
+            .flat_map(|p| p.chunks.iter().map(|c| c.size))
+            .max()
+            .unwrap_or(0);
+        let avg = right_bytes / right_files;
+        (max, avg)
+    } else {
+        (0, 0)
+    };
+
+    info!(
+        "Grace hash join spill summary: left files={} (avg {}, max {}), right files={} (avg {}, max {}), left bytes={}, right bytes={}",
+        left_files,
+        human_readable_size(left_avg),
+        human_readable_size(left_max),
+        right_files,
+        human_readable_size(right_avg),
+        human_readable_size(right_max),
         human_readable_size(left_bytes),
         human_readable_size(right_bytes)
     );
@@ -983,22 +1024,39 @@ async fn partition_and_spill_one_side(
     _enable_dynamic_filter_pushdown: bool,
     reservation: &mut MemoryReservation,
     partition_batch_size: usize,
+    partition_write_buffer_bytes: usize,
 ) -> Result<Vec<PartitionIndex>> {
     let schema = input.schema();
+    let file_counter = Arc::new(AtomicUsize::new(0));
+    let file_cap_hit = Arc::new(AtomicBool::new(false));
+
     let mut partitions: Vec<PartitionWriter> = (0..partition_count)
         .map(|_| {
             // Calculate dynamic buffer size threshold to keep total overhead under control.
-            // Target total write buffer memory around 64MB per task.
-            // At least 512KB per partition to ensure some coalescing.
-            // Prefer smaller flush thresholds to keep spill files bounded and reduce stall time.
-            let total_target_buffer_mem = 16 * 1024 * 1024; // 16MB
-            let batch_size_threshold =
-                (total_target_buffer_mem / partition_count).max(512 * 1024);
+            // Scale write buffering based on the caller-provided budget but clamp it to
+            // reasonable min/max bounds so we avoid both tiny spill files and runaway memory.
+            const MIN_TOTAL_TARGET_BUFFER_BYTES: usize = 64 * 1024 * 1024;
+            const MAX_TOTAL_TARGET_BUFFER_BYTES: usize = 256 * 1024 * 1024;
+            const MIN_FLUSH_BYTES: usize = 1 * 1024 * 1024;
+            const MAX_FLUSH_BYTES: usize = 32 * 1024 * 1024;
+            const MAX_SPILL_FILES_PER_SIDE: usize = 1024;
+
+            let total_target_buffer = partition_write_buffer_bytes
+                .clamp(MIN_TOTAL_TARGET_BUFFER_BYTES, MAX_TOTAL_TARGET_BUFFER_BYTES);
+            let max_flush_bytes = (total_target_buffer / 4)
+                .clamp(MIN_FLUSH_BYTES, MAX_FLUSH_BYTES);
+            let base_threshold = (total_target_buffer / partition_count)
+                .clamp(MIN_FLUSH_BYTES, max_flush_bytes);
 
             PartitionWriter::new(
                 Arc::clone(&spill_manager),
                 Arc::clone(&schema),
-                batch_size_threshold,
+                base_threshold,
+                MIN_FLUSH_BYTES,
+                MAX_FLUSH_BYTES,
+                MAX_SPILL_FILES_PER_SIDE,
+                Arc::clone(&file_counter),
+                Arc::clone(&file_cap_hit),
             )
         })
         .collect();
@@ -1128,6 +1186,12 @@ pub struct PartitionWriter {
     buffered_bytes: usize,
     schema: SchemaRef,
     batch_size_threshold: usize,
+    min_flush_bytes: usize,
+    max_flush_bytes: usize,
+    max_spill_files: usize,
+    flush_count: usize,
+    file_counter: Arc<AtomicUsize>,
+    file_cap_hit: Arc<AtomicBool>,
 }
 
 impl PartitionWriter {
@@ -1135,6 +1199,11 @@ impl PartitionWriter {
         spill_manager: Arc<SpillManager>,
         schema: SchemaRef,
         batch_size_threshold: usize,
+        min_flush_bytes: usize,
+        max_flush_bytes: usize,
+        max_spill_files: usize,
+        file_counter: Arc<AtomicUsize>,
+        file_cap_hit: Arc<AtomicBool>,
     ) -> Self {
         Self {
             spill_manager,
@@ -1143,6 +1212,12 @@ impl PartitionWriter {
             buffered_bytes: 0,
             schema,
             batch_size_threshold,
+            min_flush_bytes,
+            max_flush_bytes,
+            max_spill_files,
+            flush_count: 0,
+            file_counter,
+            file_cap_hit,
         }
     }
 
@@ -1186,10 +1261,42 @@ impl PartitionWriter {
             location: loc,
             size: spilled_size,
         });
+
+        // Track spill file counts to avoid creating too many tiny files.
+        let global_files = self.file_counter.fetch_add(1, Ordering::SeqCst) + 1;
+        self.flush_count += 1;
+        if global_files > self.max_spill_files
+            && !self.file_cap_hit.swap(true, Ordering::SeqCst)
+        {
+            info!(
+                "Grace hash join exceeded spill file cap ({} > {}); raising flush threshold",
+                global_files, self.max_spill_files
+            );
+        }
+
+        // Adapt threshold: if we are spilling multiple times or have exceeded the cap,
+        // increase the flush threshold to reduce file count. Otherwise gently decay toward min.
+        if global_files > self.max_spill_files || self.flush_count > 1 {
+            self.batch_size_threshold = if global_files > self.max_spill_files {
+                self.max_flush_bytes
+            } else {
+                (self.batch_size_threshold.saturating_mul(2)).min(self.max_flush_bytes)
+            };
+        } else {
+            self.batch_size_threshold =
+                (self.batch_size_threshold + self.min_flush_bytes) / 2;
+            self.batch_size_threshold = self
+                .batch_size_threshold
+                .clamp(self.min_flush_bytes, self.max_flush_bytes);
+        }
         Ok(())
     }
 
-    pub fn finish(mut self, reservation: &mut MemoryReservation, request_msg: &str) -> Result<PartitionIndex> {
+    pub fn finish(
+        mut self,
+        reservation: &mut MemoryReservation,
+        request_msg: &str,
+    ) -> Result<PartitionIndex> {
         self.flush(reservation, request_msg)?;
         let total_bytes = self.chunks.iter().map(|c| c.size).sum();
         Ok(PartitionIndex {
