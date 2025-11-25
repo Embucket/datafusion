@@ -61,6 +61,8 @@ const MAX_REPARTITION_PARTITIONS: usize = 256;
 const PREFETCH_MAX_BYTES: usize = 256 * 1024 * 1024;
 /// Upper bound for concurrent spill chunk read-ahead when loading partitions.
 const SPILL_READAHEAD_BYTES: usize = 256 * 1024 * 1024;
+/// Below this size we avoid further repartitioning to keep file counts under control.
+const MIN_REPARTITION_BYTES: usize = 16 * 1024 * 1024;
 
 enum GraceJoinState {
     /// Waiting for the partitioning phase (Phase 1) to finish
@@ -293,6 +295,12 @@ fn compute_repartition_count(
     max_partition_count: usize,
 ) -> usize {
     let target_size = target_size.max(1);
+    // If the current partition is already within the target, keep the same fan-out
+    // to avoid pointless recursive repartitioning.
+    if input_size <= target_size {
+        return partition_count.min(max_partition_count);
+    }
+
     let fan_out = (input_size + target_size - 1) / target_size;
     let fan_out = fan_out.max(2);
 
@@ -796,6 +804,31 @@ impl GraceHashJoinStream {
                                     )));
                                 }
                                 need_repartition = true;
+                            }
+                        }
+
+                        if need_repartition {
+                            // Do not split already-small partitions; instead keep them as-is.
+                            if work.total_bytes() <= MIN_REPARTITION_BYTES {
+                                debug!(
+                                    "Grace hash join partition {} size {} below minimum repartition threshold {}, joining without further split",
+                                    work.partition_id,
+                                    human_readable_size(work.total_bytes()),
+                                    human_readable_size(MIN_REPARTITION_BYTES)
+                                );
+                                need_repartition = false;
+                            } else {
+                                // If the loaded size now fits the current limit, join directly.
+                                let current_limit = self.adaptive_budget.current_limit();
+                                if total_loaded_bytes <= current_limit {
+                                    debug!(
+                                        "Grace hash join partition {} now fits current limit {} (loaded {}), skipping repartition",
+                                        work.partition_id,
+                                        human_readable_size(current_limit),
+                                        human_readable_size(total_loaded_bytes)
+                                    );
+                                    need_repartition = false;
+                                }
                             }
                         }
 
