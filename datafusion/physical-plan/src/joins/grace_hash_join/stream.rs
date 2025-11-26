@@ -300,6 +300,11 @@ fn compute_repartition_count(
     if input_size <= target_size {
         return partition_count.min(max_partition_count);
     }
+    // Allow some slack: if we're within 2x of the target, keep the fan-out to avoid
+    // a costly extra pass when the current size will still fit in memory.
+    if input_size <= target_size.saturating_mul(2) {
+        return partition_count.min(max_partition_count);
+    }
 
     let fan_out = (input_size + target_size - 1) / target_size;
     let fan_out = fan_out.max(2);
@@ -847,6 +852,18 @@ impl GraceHashJoinStream {
                                     work.partition_id, work.partition_count, prospective
                                 );
                                 need_repartition = false;
+                            } else {
+                                // If we are only mildly above the budget (<= 2x), prefer joining with serialization instead of splitting.
+                                let current_limit = self.adaptive_budget.current_limit();
+                                if total_loaded_bytes <= current_limit.saturating_mul(2) {
+                                    debug!(
+                                        "Grace hash join partition {} within 2x budget (limit {}, loaded {}), skipping repartition",
+                                        work.partition_id,
+                                        human_readable_size(current_limit),
+                                        human_readable_size(total_loaded_bytes)
+                                    );
+                                    need_repartition = false;
+                                }
                             }
                         }
 
@@ -885,6 +902,16 @@ impl GraceHashJoinStream {
                                     *current_work = Some(to_split);
                                     need_repartition = false;
                                     continue;
+                                } else {
+                                    debug!(
+                                        "Grace hash join repartitioning partition {} (pass {}) fan-out {} -> {} (size {}, target {})",
+                                        to_split.partition_id,
+                                        to_split.pass,
+                                        to_split.partition_count,
+                                        planned_fanout,
+                                        human_readable_size(to_split.total_bytes()),
+                                        human_readable_size(self.adaptive_budget.current_limit())
+                                    );
                                 }
                                 let future = build_repartition_future(
                                     to_split,
