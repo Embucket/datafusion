@@ -647,6 +647,9 @@ impl GraceHashJoinStream {
                         let estimated_size = (work.total_bytes() as f64 * 1.5) as usize;
                         let mut effective_limit = self.adaptive_budget.current_limit();
                         let mut preload_budget_change_logged = false;
+                        let force_compute_repartition =
+                            estimated_size > COMPUTE_SOFT_MAX_BYTES
+                                && work.pass < self.max_partition_passes;
 
                         // If it definitely won't fit, try serializing first to raise the limit.
                         if estimated_size > effective_limit
@@ -682,7 +685,11 @@ impl GraceHashJoinStream {
                         let skip_load = estimated_size > effective_limit
                             && work.pass < self.max_partition_passes;
 
-                        if left_fut.is_none() && right_fut.is_none() && !skip_load {
+                        if left_fut.is_none()
+                            && right_fut.is_none()
+                            && !skip_load
+                            && !force_compute_repartition
+                        {
                             *left_fut = Some(load_partition_async(
                                 Arc::clone(&self.spill_left),
                                 work.left.clone(),
@@ -695,12 +702,17 @@ impl GraceHashJoinStream {
                                 Arc::clone(&self.reservation),
                                 Arc::clone(right_bytes),
                             ));
-                        } else if skip_load {
+                        } else if skip_load || force_compute_repartition {
                             debug!(
-                                "Grace hash join partition {} estimated size {} exceeds limit {} (pass {}), repartitioning without loading",
+                                "Grace hash join partition {} estimated size {} exceeds {} (limit {}, pass {}), repartitioning without loading",
                                 work.partition_id,
                                 human_readable_size(estimated_size),
-                                human_readable_size(effective_limit),
+                                if force_compute_repartition {
+                                    human_readable_size(COMPUTE_SOFT_MAX_BYTES)
+                                } else {
+                                    human_readable_size(effective_limit)
+                                },
+                                effective_limit,
                                 work.pass
                             );
                         }
