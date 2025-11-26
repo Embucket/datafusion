@@ -63,6 +63,8 @@ const PREFETCH_MAX_BYTES: usize = 1024 * 1024 * 1024;
 const SPILL_READAHEAD_BYTES: usize = 256 * 1024 * 1024;
 /// Below this size we avoid further repartitioning to keep file counts under control.
 const MIN_REPARTITION_BYTES: usize = 16 * 1024 * 1024;
+/// Soft cap for compute-friendly partition size even when memory budgets are large.
+const COMPUTE_SOFT_MAX_BYTES: usize = 256 * 1024 * 1024;
 
 enum GraceJoinState {
     /// Waiting for the partitioning phase (Phase 1) to finish
@@ -297,18 +299,19 @@ fn compute_repartition_count(
     max_partition_count: usize,
 ) -> usize {
     let target_size = target_size.max(1);
+    let effective_target = target_size.min(COMPUTE_SOFT_MAX_BYTES);
     // If the current partition is already within the target, keep the same fan-out
     // to avoid pointless recursive repartitioning.
-    if input_size <= target_size {
+    if input_size <= effective_target {
         return partition_count.min(max_partition_count);
     }
     // Allow some slack: if we're within 2x of the target, keep the fan-out to avoid
     // a costly extra pass when the current size will still fit in memory.
-    if input_size <= target_size.saturating_mul(2) {
+    if input_size <= effective_target.saturating_mul(2) {
         return partition_count.min(max_partition_count);
     }
 
-    let fan_out = (input_size + target_size - 1) / target_size;
+    let fan_out = (input_size + effective_target - 1) / effective_target;
     let fan_out = fan_out.max(2);
 
     let base = partition_count.min(max_partition_count);
