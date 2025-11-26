@@ -58,7 +58,7 @@ use parking_lot::Mutex;
 const MAX_REPARTITION_PARTITIONS: usize = 256;
 /// Upper bound on bytes we'll prefetch for the next partition to avoid
 /// runaway memory usage while still hiding IO latency.
-const PREFETCH_MAX_BYTES: usize = 256 * 1024 * 1024;
+const PREFETCH_MAX_BYTES: usize = 1024 * 1024 * 1024;
 /// Upper bound for concurrent spill chunk read-ahead when loading partitions.
 const SPILL_READAHEAD_BYTES: usize = 256 * 1024 * 1024;
 /// Below this size we avoid further repartitioning to keep file counts under control.
@@ -85,6 +85,8 @@ enum GraceJoinState {
         repartition_fut: Option<OnceFut<Vec<PartitionWorkItem>>>,
         /// Prefetch for the next partition (at most one in-flight)
         prefetch: Option<PrefetchState>,
+        /// Last partition we logged a prefetch skip for, to avoid log spam
+        last_prefetch_skip: Option<(usize, usize)>,
     },
 
     Done,
@@ -589,6 +591,7 @@ impl GraceHashJoinStream {
                         current_join_start: None,
                         repartition_fut: None,
                         prefetch: None,
+                        last_prefetch_skip: None,
                     };
                     continue;
                 }
@@ -603,6 +606,7 @@ impl GraceHashJoinStream {
                     current_join_start,
                     repartition_fut,
                     prefetch,
+                    last_prefetch_skip,
                 } => {
                     if current_work.is_none() {
                         match work_queue.pop_front() {
@@ -963,6 +967,14 @@ impl GraceHashJoinStream {
                         )?;
 
                         *current_stream = Some(stream);
+                        info!(
+                            "Grace hash join starting partition {} (pass {}, loaded {} left / {} right, limit {})",
+                            work.partition_id,
+                            work.pass,
+                            human_readable_size(left_batches.total_bytes),
+                            human_readable_size(right_batches.total_bytes),
+                            human_readable_size(self.adaptive_budget.current_limit())
+                        );
                         *current_join_start = Some(Instant::now());
                         *left_fut = None;
                         *right_fut = None;
@@ -1006,12 +1018,16 @@ impl GraceHashJoinStream {
                                     right_bytes: right_bytes_pf,
                                 });
                             } else {
-                                debug!(
-                                    "Skipping prefetch for partition {} (est {} > cap {})",
-                                    next_work.partition_id,
-                                    human_readable_size(estimated_size),
-                                    human_readable_size(cap)
-                                );
+                                let key = (next_work.partition_id, next_work.pass);
+                                if last_prefetch_skip.as_ref() != Some(&key) {
+                                    debug!(
+                                        "Skipping prefetch for partition {} (est {} > cap {})",
+                                        next_work.partition_id,
+                                        human_readable_size(estimated_size),
+                                        human_readable_size(cap)
+                                    );
+                                    *last_prefetch_skip = Some(key);
+                                }
                             }
                         }
                     }
@@ -1022,6 +1038,14 @@ impl GraceHashJoinStream {
                             Some(Err(e)) => {
                                 if let Some(start) = current_join_start.take() {
                                     join_time_metric.add_elapsed(start);
+                                    if let Some(work) = current_work.as_ref() {
+                                        info!(
+                                            "Grace hash join failed partition {} (pass {}) after {:?}",
+                                            work.partition_id,
+                                            work.pass,
+                                            start.elapsed()
+                                        );
+                                    }
                                 }
                                 return Poll::Ready(Some(Err(e)));
                             }
@@ -1040,9 +1064,18 @@ impl GraceHashJoinStream {
                                 }
                                 if let Some(start) = current_join_start.take() {
                                     join_time_metric.add_elapsed(start);
+                                    if let Some(work) = current_work.as_ref() {
+                                        info!(
+                                            "Grace hash join finished partition {} (pass {}) in {:?}",
+                                            work.partition_id,
+                                            work.pass,
+                                            start.elapsed()
+                                        );
+                                    }
                                 }
                                 *current_stream = None;
                                 *current_work = None;
+                                *last_prefetch_skip = None;
                                 self.adaptive_budget.update_active_partitions(1);
                                 continue;
                             }
