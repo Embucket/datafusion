@@ -626,11 +626,11 @@ impl GraceHashJoinStream {
                         }
                     }
 
-                    if current_stream.is_none() {
-                        let work = current_work.as_ref().expect("work must exist");
+                        if current_stream.is_none() {
+                            let work = current_work.as_ref().expect("work must exist");
 
-                        // If we prefetched this work item, reuse its futures/bytes
-                        if let Some(pref) = prefetch.take() {
+                            // If we prefetched this work item, reuse its futures/bytes
+                            if let Some(pref) = prefetch.take() {
                             if pref.work.partition_id == work.partition_id
                                 && pref.work.pass == work.pass
                             {
@@ -655,6 +655,7 @@ impl GraceHashJoinStream {
                         if estimated_size > effective_limit
                             && work.pass < self.max_partition_passes
                             && self.adaptive_budget.current_concurrency() > 1
+                            && !force_compute_repartition
                         {
                             if let Some((
                                 previous_concurrency,
@@ -682,8 +683,9 @@ impl GraceHashJoinStream {
                             }
                         }
 
-                        let skip_load = estimated_size > effective_limit
-                            && work.pass < self.max_partition_passes;
+                        let skip_load = (estimated_size > effective_limit
+                            && work.pass < self.max_partition_passes)
+                            || force_compute_repartition;
 
                         if left_fut.is_none()
                             && right_fut.is_none()
@@ -726,7 +728,7 @@ impl GraceHashJoinStream {
                                     .clone();
                             (left, right)
                         } else {
-                            // Skipped loading
+                            // Should only happen when we force repartition without loading.
                             (
                                 LoadedPartitionBatches {
                                     batches: vec![],
@@ -754,8 +756,13 @@ impl GraceHashJoinStream {
                             self.adaptive_budget.ensure_fits(total_loaded_bytes);
                         let mut budget_change_logged = preload_budget_change_logged;
 
+                        if force_compute_repartition {
+                            need_repartition = true;
+                        }
+
                         if matches!(outcome, AdaptiveBudgetOutcome::CannotFit { .. })
                             && self.adaptive_budget.current_concurrency() > 1
+                            && !force_compute_repartition
                         {
                             if let Some((
                                 previous_concurrency,
@@ -857,7 +864,7 @@ impl GraceHashJoinStream {
                                     human_readable_size(MIN_REPARTITION_BYTES)
                                 );
                                 need_repartition = false;
-                            } else {
+                            } else if !force_compute_repartition {
                                 // If the loaded size now fits the current limit, join directly.
                                 let current_limit = self.adaptive_budget.current_limit();
                                 if total_loaded_bytes <= current_limit {
@@ -874,14 +881,17 @@ impl GraceHashJoinStream {
 
                         if need_repartition {
                             // If repartitioning would not increase fan-out, skip it to avoid a useless extra pass.
-                            let prospective =
-                                compute_repartition_count(
-                                    work.partition_count,
-                                    work.total_bytes(),
-                                    self.adaptive_budget.current_limit(),
-                                    MAX_REPARTITION_PARTITIONS,
-                                );
-                            if prospective <= work.partition_count {
+                            let prospective = compute_repartition_count(
+                                work.partition_count,
+                                work.total_bytes(),
+                                if force_compute_repartition {
+                                    COMPUTE_SOFT_MAX_BYTES
+                                } else {
+                                    self.adaptive_budget.current_limit()
+                                },
+                                MAX_REPARTITION_PARTITIONS,
+                            );
+                            if prospective <= work.partition_count && !force_compute_repartition {
                                 debug!(
                                     "Grace hash join partition {} already at fan-out {}, skipping repartition (prospective {})",
                                     work.partition_id, work.partition_count, prospective
@@ -924,7 +934,11 @@ impl GraceHashJoinStream {
                                 let planned_fanout = compute_repartition_count(
                                     to_split.partition_count,
                                     to_split.total_bytes(),
-                                    self.adaptive_budget.current_limit(),
+                                    if force_compute_repartition {
+                                        COMPUTE_SOFT_MAX_BYTES
+                                    } else {
+                                        self.adaptive_budget.current_limit()
+                                    },
                                     MAX_REPARTITION_PARTITIONS,
                                 );
                                 if planned_fanout <= to_split.partition_count {
