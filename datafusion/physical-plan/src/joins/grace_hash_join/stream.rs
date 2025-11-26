@@ -819,6 +819,22 @@ impl GraceHashJoinStream {
                             }
                         }
 
+                        // Even if it fits the memory budget, avoid building extremely large partitions
+                        // by capping compute-friendly size.
+                        if !need_repartition
+                            && work.pass < self.max_partition_passes
+                            && work.partition_count < MAX_REPARTITION_PARTITIONS
+                            && total_loaded_bytes > COMPUTE_SOFT_MAX_BYTES
+                        {
+                            debug!(
+                                "Grace hash join partition {} size {} exceeds compute soft cap {}, repartitioning to reduce per-partition work",
+                                work.partition_id,
+                                human_readable_size(total_loaded_bytes),
+                                human_readable_size(COMPUTE_SOFT_MAX_BYTES)
+                            );
+                            need_repartition = true;
+                        }
+
                         if need_repartition {
                             // Do not split already-small partitions; instead keep them as-is.
                             if work.total_bytes() <= MIN_REPARTITION_BYTES {
