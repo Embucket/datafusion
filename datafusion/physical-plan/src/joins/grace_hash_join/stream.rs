@@ -1025,6 +1025,24 @@ impl GraceHashJoinStream {
                             continue;
                         }
 
+                        // If we decided not to repartition but skipped loading earlier,
+                        // load now and poll again to avoid joining empty batches.
+                        if left_fut.is_none() {
+                            *left_fut = Some(load_partition_async(
+                                Arc::clone(&self.spill_left),
+                                work.left.clone(),
+                                Arc::clone(&self.reservation),
+                                Arc::clone(left_bytes),
+                            ));
+                            *right_fut = Some(load_partition_async(
+                                Arc::clone(&self.spill_right),
+                                work.right.clone(),
+                                Arc::clone(&self.reservation),
+                                Arc::clone(right_bytes),
+                            ));
+                            continue;
+                        }
+
                         let stream = build_in_memory_join_stream(
                             Arc::clone(&self.schema),
                             Arc::clone(&self.left_input_schema),
