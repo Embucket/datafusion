@@ -1084,7 +1084,7 @@ impl GraceHashJoinStream {
                                 .adaptive_budget
                                 .current_limit()
                                 .min(PREFETCH_MAX_BYTES);
-                            if estimated_size <= cap {
+                            if PREFETCH_MAX_BYTES > 0 && estimated_size <= cap {
                                 let left_bytes_pf = Arc::new(Mutex::new(0usize));
                                 let right_bytes_pf = Arc::new(Mutex::new(0usize));
                                 let left_fut_pf = load_partition_async(

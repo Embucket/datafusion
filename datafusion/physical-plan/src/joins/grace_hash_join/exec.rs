@@ -1039,7 +1039,7 @@ async fn partition_and_spill_one_side(
             const MAX_TOTAL_TARGET_BUFFER_BYTES: usize = 256 * 1024 * 1024;
             const MIN_FLUSH_BYTES: usize = 1 * 1024 * 1024;
             const MAX_FLUSH_BYTES: usize = 32 * 1024 * 1024;
-            const MAX_SPILL_FILES_PER_SIDE: usize = 128;
+            const MAX_SPILL_FILES_PER_SIDE: usize = 1024;
 
             let total_target_buffer = partition_write_buffer_bytes
                 .clamp(MIN_TOTAL_TARGET_BUFFER_BYTES, MAX_TOTAL_TARGET_BUFFER_BYTES);
