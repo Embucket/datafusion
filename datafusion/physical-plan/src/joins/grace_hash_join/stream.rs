@@ -56,15 +56,24 @@ use parking_lot::Mutex;
 /// Maximum number of partitions we allow after recursive repartitioning to
 /// prevent explosive fan-out.
 const MAX_REPARTITION_PARTITIONS: usize = 256;
-/// Upper bound on bytes we'll prefetch for the next partition to avoid
-/// runaway memory usage while still hiding IO latency.
-const PREFETCH_MAX_BYTES: usize = 0;
 /// Upper bound for concurrent spill chunk read-ahead when loading partitions.
 const SPILL_READAHEAD_BYTES: usize = 64 * 1024 * 1024;
 /// Below this size we avoid further repartitioning to keep file counts under control.
 const MIN_REPARTITION_BYTES: usize = 16 * 1024 * 1024;
-/// Soft cap for compute-friendly partition size even when memory budgets are large.
-const COMPUTE_SOFT_MAX_BYTES: usize = 512 * 1024 * 1024;
+
+/// Derive a prefetch cap for the next partition to avoid runaway memory use.
+/// We cap at half of the current budget but never exceed 512 MiB, and disable
+/// prefetch entirely for very small budgets to avoid churn.
+fn prefetch_cap_bytes(current_limit: usize) -> usize {
+    const PREFETCH_HARD_CAP: usize = 512 * 1024 * 1024;
+    const PREFETCH_MIN_BYTES: usize = 8 * 1024 * 1024;
+    let cap = (current_limit / 2).min(PREFETCH_HARD_CAP);
+    if cap < PREFETCH_MIN_BYTES {
+        0
+    } else {
+        cap
+    }
+}
 
 enum GraceJoinState {
     /// Waiting for the partitioning phase (Phase 1) to finish
@@ -298,9 +307,10 @@ fn compute_repartition_count(
     target_size: usize,
     max_partition_count: usize,
     allow_slack: bool,
+    compute_soft_cap_bytes: usize,
 ) -> usize {
     let target_size = target_size.max(1);
-    let effective_target = target_size.min(COMPUTE_SOFT_MAX_BYTES);
+    let effective_target = target_size.min(compute_soft_cap_bytes.max(1));
     // If the current partition is already within the target, keep the same fan-out
     // to avoid pointless recursive repartitioning.
     if allow_slack && input_size <= effective_target {
@@ -334,6 +344,7 @@ fn build_repartition_future(
     target_size: usize,
     partition_write_buffer_bytes: usize,
     max_partition_count: usize,
+    compute_soft_cap_bytes: usize,
 ) -> OnceFut<Vec<PartitionWorkItem>> {
     OnceFut::new(async move {
         let PartitionWorkItem {
@@ -352,6 +363,7 @@ fn build_repartition_future(
             target_size,
             max_partition_count,
             true,
+            compute_soft_cap_bytes,
         );
         if new_partition_count == max_partition_count
             && partition_count < max_partition_count
@@ -446,6 +458,7 @@ pub struct GraceHashJoinStream {
     partition_batch_size: usize,
     adaptive_budget: AdaptivePartitionBudget,
     max_partition_passes: usize,
+    compute_soft_cap_bytes: usize,
     partition_stats: PartitionStatsSummary,
     state: GraceJoinState,
 }
@@ -509,6 +522,7 @@ impl GraceHashJoinStream {
         preferred_partition_budget_bytes: usize,
         absolute_partition_cap_bytes: usize,
         max_partition_passes: usize,
+        compute_soft_cap_bytes: usize,
     ) -> Self {
         let adaptive_budget = AdaptivePartitionBudget::new(
             base_partition_budget_bytes,
@@ -536,6 +550,7 @@ impl GraceHashJoinStream {
             partition_batch_size,
             adaptive_budget,
             max_partition_passes,
+            compute_soft_cap_bytes,
             partition_stats: PartitionStatsSummary::default(),
             state: GraceJoinState::WaitPartitioning,
         }
@@ -628,11 +643,11 @@ impl GraceHashJoinStream {
                         }
                     }
 
-                        if current_stream.is_none() {
-                            let work = current_work.as_ref().expect("work must exist");
+                    if current_stream.is_none() {
+                        let work = current_work.as_ref().expect("work must exist");
 
-                            // If we prefetched this work item, reuse its futures/bytes
-                            if let Some(pref) = prefetch.take() {
+                        // If we prefetched this work item, reuse its futures/bytes
+                        if let Some(pref) = prefetch.take() {
                             if pref.work.partition_id == work.partition_id
                                 && pref.work.pass == work.pass
                             {
@@ -649,9 +664,9 @@ impl GraceHashJoinStream {
                         let estimated_size = (work.total_bytes() as f64 * 1.5) as usize;
                         let mut effective_limit = self.adaptive_budget.current_limit();
                         let mut preload_budget_change_logged = false;
-                        let force_compute_repartition =
-                            estimated_size > COMPUTE_SOFT_MAX_BYTES
-                                && work.pass < self.max_partition_passes;
+                        let force_compute_repartition = estimated_size
+                            > self.compute_soft_cap_bytes
+                            && work.pass < self.max_partition_passes;
 
                         // If it definitely won't fit, try serializing first to raise the limit.
                         if estimated_size > effective_limit
@@ -712,7 +727,7 @@ impl GraceHashJoinStream {
                                 work.partition_id,
                                 human_readable_size(estimated_size),
                                 if force_compute_repartition {
-                                    human_readable_size(COMPUTE_SOFT_MAX_BYTES)
+                                    human_readable_size(self.compute_soft_cap_bytes)
                                 } else {
                                     human_readable_size(effective_limit)
                                 },
@@ -848,13 +863,13 @@ impl GraceHashJoinStream {
                         if !need_repartition
                             && work.pass < self.max_partition_passes
                             && work.partition_count < MAX_REPARTITION_PARTITIONS
-                            && total_loaded_bytes > COMPUTE_SOFT_MAX_BYTES
+                            && total_loaded_bytes > self.compute_soft_cap_bytes
                         {
                             debug!(
                                 "Grace hash join partition {} size {} exceeds compute soft cap {}, repartitioning to reduce per-partition work",
                                 work.partition_id,
                                 human_readable_size(total_loaded_bytes),
-                                human_readable_size(COMPUTE_SOFT_MAX_BYTES)
+                                human_readable_size(self.compute_soft_cap_bytes)
                             );
                             need_repartition = true;
                         }
@@ -890,14 +905,17 @@ impl GraceHashJoinStream {
                                 work.partition_count,
                                 work.total_bytes(),
                                 if force_compute_repartition {
-                                    COMPUTE_SOFT_MAX_BYTES
+                                    self.compute_soft_cap_bytes
                                 } else {
                                     self.adaptive_budget.current_limit()
                                 },
                                 MAX_REPARTITION_PARTITIONS,
                                 !force_compute_repartition,
+                                self.compute_soft_cap_bytes,
                             );
-                            if prospective <= work.partition_count && force_compute_repartition {
+                            if prospective <= work.partition_count
+                                && force_compute_repartition
+                            {
                                 debug!(
                                     "Grace hash join partition {} compute-split planned fan-out {} -> {} (no increase), loading and joining instead",
                                     work.partition_id,
@@ -948,12 +966,13 @@ impl GraceHashJoinStream {
                                     to_split.partition_count,
                                     to_split.total_bytes(),
                                     if force_compute_repartition {
-                                        COMPUTE_SOFT_MAX_BYTES
+                                        self.compute_soft_cap_bytes
                                     } else {
                                         self.adaptive_budget.current_limit()
                                     },
                                     MAX_REPARTITION_PARTITIONS,
                                     !force_compute_repartition,
+                                    self.compute_soft_cap_bytes,
                                 );
                                 if planned_fanout <= to_split.partition_count
                                     && force_compute_repartition
@@ -984,7 +1003,7 @@ impl GraceHashJoinStream {
                                         planned_fanout,
                                         human_readable_size(to_split.total_bytes()),
                                         if force_compute_repartition {
-                                            human_readable_size(COMPUTE_SOFT_MAX_BYTES)
+                                            human_readable_size(self.compute_soft_cap_bytes)
                                         } else {
                                             human_readable_size(self.adaptive_budget.current_limit())
                                         }
@@ -1006,12 +1025,13 @@ impl GraceHashJoinStream {
                                     Arc::clone(&self.right_input_schema),
                                     self.partition_batch_size,
                                     if force_compute_repartition {
-                                        COMPUTE_SOFT_MAX_BYTES
+                                        self.compute_soft_cap_bytes
                                     } else {
                                         self.adaptive_budget.current_limit()
                                     },
                                     self.adaptive_budget.current_limit(),
                                     MAX_REPARTITION_PARTITIONS,
+                                    self.compute_soft_cap_bytes,
                                 );
                                 *repartition_fut = Some(future);
                             }
@@ -1080,11 +1100,9 @@ impl GraceHashJoinStream {
                         if let Some(next_work) = work_queue.front() {
                             let estimated_size =
                                 (next_work.total_bytes() as f64 * 1.1) as usize;
-                            let cap = self
-                                .adaptive_budget
-                                .current_limit()
-                                .min(PREFETCH_MAX_BYTES);
-                            if PREFETCH_MAX_BYTES > 0 && estimated_size <= cap {
+                            let cap =
+                                prefetch_cap_bytes(self.adaptive_budget.current_limit());
+                            if cap > 0 && estimated_size <= cap {
                                 let left_bytes_pf = Arc::new(Mutex::new(0usize));
                                 let right_bytes_pf = Arc::new(Mutex::new(0usize));
                                 let left_fut_pf = load_partition_async(
@@ -1458,14 +1476,14 @@ mod tests {
 
     #[test]
     fn repartition_count_is_capped() {
-        let count =
-            compute_repartition_count(
-                16,
-                1 * 1024 * 1024 * 1024,
-                64 * 1024 * 1024,
-                64,
-                true,
-            );
+        let count = compute_repartition_count(
+            16,
+            1 * 1024 * 1024 * 1024,
+            64 * 1024 * 1024,
+            64,
+            true,
+            512 * 1024 * 1024,
+        );
         assert_eq!(count, 64);
     }
 
@@ -1477,6 +1495,7 @@ mod tests {
             64 * 1024 * 1024,
             256,
             true,
+            512 * 1024 * 1024,
         );
         // fan_out=2 (min), base=8 -> 16
         assert_eq!(count, 16);

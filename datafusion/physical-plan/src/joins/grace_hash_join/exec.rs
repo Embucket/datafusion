@@ -673,6 +673,9 @@ impl ExecutionPlan for GraceHashJoinExec {
             preferred_partition_budget_bytes,
             absolute_partition_cap_bytes,
         ) = Self::partition_memory_budget(&context);
+        let compute_soft_cap_bytes = preferred_partition_budget_bytes
+            .min(absolute_partition_cap_bytes)
+            .max(base_partition_budget_bytes);
         let partition_write_buffer_bytes = base_partition_budget_bytes;
         let partition_batch_size = context.session_config().batch_size();
 
@@ -751,6 +754,7 @@ impl ExecutionPlan for GraceHashJoinExec {
             preferred_partition_budget_bytes,
             absolute_partition_cap_bytes,
             max_partition_passes,
+            compute_soft_cap_bytes,
         )))
     }
 
@@ -1035,16 +1039,16 @@ async fn partition_and_spill_one_side(
             // Calculate dynamic buffer size threshold to keep total overhead under control.
             // Scale write buffering based on the caller-provided budget but clamp it to
             // reasonable min/max bounds so we avoid both tiny spill files and runaway memory.
-            const MIN_TOTAL_TARGET_BUFFER_BYTES: usize = 64 * 1024 * 1024;
-            const MAX_TOTAL_TARGET_BUFFER_BYTES: usize = 256 * 1024 * 1024;
-            const MIN_FLUSH_BYTES: usize = 1 * 1024 * 1024;
-            const MAX_FLUSH_BYTES: usize = 32 * 1024 * 1024;
-            const MAX_SPILL_FILES_PER_SIDE: usize = 1024;
+            const MIN_TOTAL_TARGET_BUFFER_BYTES: usize = 128 * 1024 * 1024;
+            const MAX_TOTAL_TARGET_BUFFER_BYTES: usize = 1024 * 1024 * 1024;
+            const MIN_FLUSH_BYTES: usize = 8 * 1024 * 1024;
+            const MAX_FLUSH_BYTES: usize = 128 * 1024 * 1024;
+            const MAX_SPILL_FILES_PER_SIDE: usize = 2048;
 
             let total_target_buffer = partition_write_buffer_bytes
                 .clamp(MIN_TOTAL_TARGET_BUFFER_BYTES, MAX_TOTAL_TARGET_BUFFER_BYTES);
-            let max_flush_bytes = (total_target_buffer / 4)
-                .clamp(MIN_FLUSH_BYTES, MAX_FLUSH_BYTES);
+            let max_flush_bytes =
+                (total_target_buffer / 4).clamp(MIN_FLUSH_BYTES, MAX_FLUSH_BYTES);
             let base_threshold = (total_target_buffer / partition_count)
                 .clamp(MIN_FLUSH_BYTES, max_flush_bytes);
 
