@@ -1163,11 +1163,9 @@ fn process_partition_chunk(
         reservation.try_grow(actual_reserved - reserved_bytes)?;
     } else if reserved_bytes > actual_reserved {
         let delta = reserved_bytes - actual_reserved;
-        let available = reservation.size();
-        if delta > available {
-            reservation.shrink(available);
-        } else {
-            reservation.shrink(delta);
+        if reservation.try_shrink(delta).is_err() {
+            // If accounting drifted, free whatever is left to avoid leaking
+            let _ = reservation.free();
         }
     }
     reserved_bytes = actual_reserved;
@@ -1190,11 +1188,8 @@ fn process_partition_chunk(
         partitions[i].spill_batch_auto(&part_batch, &request_msg, reservation)?;
     }
 
-    let available = reservation.size();
-    if reserved_bytes > available {
-        reservation.shrink(available);
-    } else {
-        reservation.shrink(reserved_bytes);
+    if reservation.try_shrink(reserved_bytes).is_err() {
+        let _ = reservation.free();
     }
     Ok(())
 }
@@ -1272,11 +1267,8 @@ impl PartitionWriter {
         let total_accounted = self.buffered_bytes;
         let coalesced = concat_batches(&self.schema, &self.buffer)?;
         self.buffer.clear();
-        let available = reservation.size();
-        if total_accounted > available {
-            reservation.shrink(available);
-        } else {
-            reservation.shrink(total_accounted);
+        if reservation.try_shrink(total_accounted).is_err() {
+            let _ = reservation.free();
         }
         self.buffered_bytes = 0;
 

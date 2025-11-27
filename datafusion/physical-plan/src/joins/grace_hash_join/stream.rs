@@ -990,20 +990,13 @@ impl GraceHashJoinStream {
                             };
                             if bytes_to_free > 0 {
                                 let mut res = reservation.lock();
-                                let available = res.size();
-                                if bytes_to_free > available {
-                                    // Don't panic on accounting drift; free what we can and log.
-                                    let shrink = available;
-                                    if shrink > 0 {
-                                        res.shrink(shrink);
-                                    }
+                                if res.try_shrink(bytes_to_free).is_err() {
+                                    let freed = res.free();
                                     debug!(
-                                        "Grace hash join reservation underflow: attempted to free {}, but reservation size is {}",
-                                        human_readable_size(bytes_to_free),
-                                        human_readable_size(available)
+                                        "Grace hash join reservation underflow: freed {} after shrink failure (requested {})",
+                                        human_readable_size(freed),
+                                        human_readable_size(bytes_to_free)
                                     );
-                                } else {
-                                    res.shrink(bytes_to_free);
                                 }
                             }
                             *left_fut = None;
@@ -1223,18 +1216,13 @@ impl GraceHashJoinStream {
                                 };
                                 if bytes_to_free > 0 {
                                     let mut res = self.reservation.lock();
-                                    let available = res.size();
-                                    if bytes_to_free > available {
-                                        if available > 0 {
-                                            res.shrink(available);
-                                        }
+                                    if res.try_shrink(bytes_to_free).is_err() {
+                                        let freed = res.free();
                                         debug!(
-                                            "Grace hash join reservation underflow on stream completion: attempted to free {}, but reservation size is {}",
-                                            human_readable_size(bytes_to_free),
-                                            human_readable_size(available)
+                                            "Grace hash join stream completion freed {} after shrink failure (requested {})",
+                                            human_readable_size(freed),
+                                            human_readable_size(bytes_to_free)
                                         );
-                                    } else {
-                                        res.shrink(bytes_to_free);
                                     }
                                 }
                                 if let Some(start) = current_join_start.take() {
