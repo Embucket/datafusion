@@ -953,6 +953,7 @@ impl GraceHashJoinStream {
                                         self.adaptive_budget.current_limit()
                                     },
                                     MAX_REPARTITION_PARTITIONS,
+                                    !force_compute_repartition,
                                 );
                                 if planned_fanout <= to_split.partition_count {
                                     debug!(
