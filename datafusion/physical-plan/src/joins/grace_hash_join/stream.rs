@@ -756,10 +756,6 @@ impl GraceHashJoinStream {
                             self.adaptive_budget.ensure_fits(total_loaded_bytes);
                         let mut budget_change_logged = preload_budget_change_logged;
 
-                        if force_compute_repartition {
-                            need_repartition = true;
-                        }
-
                         if matches!(outcome, AdaptiveBudgetOutcome::CannotFit { .. })
                             && self.adaptive_budget.current_concurrency() > 1
                             && !force_compute_repartition
@@ -798,6 +794,7 @@ impl GraceHashJoinStream {
                             }
                         }
 
+                        // Track whether we must repartition this partition
                         let mut need_repartition = false;
                         match outcome {
                             AdaptiveBudgetOutcome::Fits => {}
@@ -836,6 +833,10 @@ impl GraceHashJoinStream {
                                 }
                                 need_repartition = true;
                             }
+                        }
+
+                        if force_compute_repartition {
+                            need_repartition = true;
                         }
 
                         // Even if it fits the memory budget, avoid building extremely large partitions
