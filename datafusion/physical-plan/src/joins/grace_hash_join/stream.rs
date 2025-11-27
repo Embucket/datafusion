@@ -64,7 +64,7 @@ const SPILL_READAHEAD_BYTES: usize = 256 * 1024 * 1024;
 /// Below this size we avoid further repartitioning to keep file counts under control.
 const MIN_REPARTITION_BYTES: usize = 16 * 1024 * 1024;
 /// Soft cap for compute-friendly partition size even when memory budgets are large.
-const COMPUTE_SOFT_MAX_BYTES: usize = 256 * 1024 * 1024;
+const COMPUTE_SOFT_MAX_BYTES: usize = 1024 * 1024 * 1024;
 
 enum GraceJoinState {
     /// Waiting for the partitioning phase (Phase 1) to finish
@@ -829,6 +829,8 @@ impl GraceHashJoinStream {
                                         human_readable_size(limit),
                                         self.max_partition_passes
                                     );
+                                    use log::error;
+                                    error!("{}", msg);
                                     return Poll::Ready(Some(Err(
                                         datafusion_common::DataFusionError::ResourcesExhausted(msg),
                                     )));
@@ -1457,13 +1459,25 @@ mod tests {
     #[test]
     fn repartition_count_is_capped() {
         let count =
-            compute_repartition_count(16, 1 * 1024 * 1024 * 1024, 64 * 1024 * 1024, 64);
+            compute_repartition_count(
+                16,
+                1 * 1024 * 1024 * 1024,
+                64 * 1024 * 1024,
+                64,
+                true,
+            );
         assert_eq!(count, 64);
     }
 
     #[test]
     fn repartition_count_grows_by_fan_out() {
-        let count = compute_repartition_count(8, 64 * 1024 * 1024, 64 * 1024 * 1024, 256);
+        let count = compute_repartition_count(
+            8,
+            64 * 1024 * 1024,
+            64 * 1024 * 1024,
+            256,
+            true,
+        );
         // fan_out=2 (min), base=8 -> 16
         assert_eq!(count, 16);
     }
