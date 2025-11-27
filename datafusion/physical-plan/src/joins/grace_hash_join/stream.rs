@@ -94,6 +94,8 @@ enum GraceJoinState {
         /// Bytes reserved in the memory pool for the current partition's
         /// loaded right batches
         right_bytes: Arc<Mutex<usize>>,
+        /// Reservation used to track memory for the current partition's loaded batches
+        reservation: Arc<Mutex<MemoryReservation>>,
         current_join_start: Option<Instant>,
         repartition_fut: Option<OnceFut<Vec<PartitionWorkItem>>>,
         /// Prefetch for the next partition (at most one in-flight)
@@ -456,6 +458,8 @@ pub struct GraceHashJoinStream {
     context: Arc<TaskContext>,
     /// Memory reservation tracking in-memory buffers used by the join stream
     reservation: Arc<Mutex<MemoryReservation>>,
+    /// Memory reservation dedicated to prefetching the next partition
+    prefetch_reservation: Arc<Mutex<MemoryReservation>>,
     random_state: RandomState,
     partition_batch_size: usize,
     adaptive_budget: AdaptivePartitionBudget,
@@ -494,6 +498,7 @@ struct PrefetchState {
     right_fut: OnceFut<LoadedPartitionBatches>,
     left_bytes: Arc<Mutex<usize>>,
     right_bytes: Arc<Mutex<usize>>,
+    reservation: Arc<Mutex<MemoryReservation>>,
 }
 
 impl RecordBatchStream for GraceHashJoinStream {
@@ -519,6 +524,7 @@ impl GraceHashJoinStream {
         join_metrics: Arc<BuildProbeJoinMetrics>,
         context: Arc<TaskContext>,
         reservation: MemoryReservation,
+        prefetch_reservation: MemoryReservation,
         random_state: RandomState,
         partition_batch_size: usize,
         base_partition_budget_bytes: usize,
@@ -549,6 +555,7 @@ impl GraceHashJoinStream {
             join_metrics,
             context,
             reservation: Arc::new(Mutex::new(reservation)),
+            prefetch_reservation: Arc::new(Mutex::new(prefetch_reservation)),
             random_state,
             partition_batch_size,
             adaptive_budget,
@@ -623,6 +630,7 @@ impl GraceHashJoinStream {
                         right_fut: None,
                         left_bytes,
                         right_bytes,
+                        reservation: Arc::clone(&self.reservation),
                         current_join_start: None,
                         repartition_fut: None,
                         prefetch: None,
@@ -638,6 +646,7 @@ impl GraceHashJoinStream {
                     right_fut,
                     left_bytes,
                     right_bytes,
+                    reservation,
                     current_join_start,
                     repartition_fut,
                     prefetch,
@@ -649,6 +658,7 @@ impl GraceHashJoinStream {
                                 *current_work = Some(work);
                                 *left_bytes.lock() = 0;
                                 *right_bytes.lock() = 0;
+                                *reservation = Arc::clone(&self.reservation);
                                 self.adaptive_budget.update_active_partitions(1);
                             }
                             None => {
@@ -670,6 +680,7 @@ impl GraceHashJoinStream {
                                 *right_fut = Some(pref.right_fut);
                                 *left_bytes = pref.left_bytes;
                                 *right_bytes = pref.right_bytes;
+                                *reservation = pref.reservation;
                             } else {
                                 // Not the same work, keep prefetch for later
                                 *prefetch = Some(pref);
@@ -727,13 +738,13 @@ impl GraceHashJoinStream {
                             *left_fut = Some(load_partition_async(
                                 Arc::clone(&self.spill_left),
                                 work.left.clone(),
-                                Arc::clone(&self.reservation),
+                                Arc::clone(reservation),
                                 Arc::clone(left_bytes),
                             ));
                             *right_fut = Some(load_partition_async(
                                 Arc::clone(&self.spill_right),
                                 work.right.clone(),
-                                Arc::clone(&self.reservation),
+                                Arc::clone(reservation),
                                 Arc::clone(right_bytes),
                             ));
                         } else if skip_load || force_compute_repartition {
@@ -978,7 +989,7 @@ impl GraceHashJoinStream {
                                 total
                             };
                             if bytes_to_free > 0 {
-                                let mut res = self.reservation.lock();
+                                let mut res = reservation.lock();
                                 res.shrink(bytes_to_free);
                             }
                             *left_fut = None;
@@ -1077,13 +1088,13 @@ impl GraceHashJoinStream {
                             *left_fut = Some(load_partition_async(
                                 Arc::clone(&self.spill_left),
                                 work.left.clone(),
-                                Arc::clone(&self.reservation),
+                                Arc::clone(reservation),
                                 Arc::clone(left_bytes),
                             ));
                             *right_fut = Some(load_partition_async(
                                 Arc::clone(&self.spill_right),
                                 work.right.clone(),
-                                Arc::clone(&self.reservation),
+                                Arc::clone(reservation),
                                 Arc::clone(right_bytes),
                             ));
                             continue;
@@ -1132,13 +1143,13 @@ impl GraceHashJoinStream {
                                 let left_fut_pf = load_partition_async(
                                     Arc::clone(&self.spill_left),
                                     next_work.left.clone(),
-                                    Arc::clone(&self.reservation),
+                                    Arc::clone(&self.prefetch_reservation),
                                     Arc::clone(&left_bytes_pf),
                                 );
                                 let right_fut_pf = load_partition_async(
                                     Arc::clone(&self.spill_right),
                                     next_work.right.clone(),
-                                    Arc::clone(&self.reservation),
+                                    Arc::clone(&self.prefetch_reservation),
                                     Arc::clone(&right_bytes_pf),
                                 );
                                 debug!(
@@ -1153,6 +1164,7 @@ impl GraceHashJoinStream {
                                     right_fut: right_fut_pf,
                                     left_bytes: left_bytes_pf,
                                     right_bytes: right_bytes_pf,
+                                    reservation: Arc::clone(&self.prefetch_reservation),
                                 });
                             } else {
                                 let key = (next_work.partition_id, next_work.pass);
@@ -1213,6 +1225,7 @@ impl GraceHashJoinStream {
                                 *current_stream = None;
                                 *current_work = None;
                                 *last_prefetch_skip = None;
+                                *reservation = Arc::clone(&self.reservation);
                                 self.adaptive_budget.update_active_partitions(1);
                                 continue;
                             }

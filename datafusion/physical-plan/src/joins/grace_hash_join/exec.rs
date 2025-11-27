@@ -726,6 +726,11 @@ impl ExecutionPlan for GraceHashJoinExec {
             MemoryConsumer::new(format!("GraceHashJoinStream[{partition}]"))
                 .with_can_spill(true)
                 .register(context.memory_pool());
+        // Separate reservation for prefetch to avoid blocking the main join reservation.
+        let prefetch_reservation =
+            MemoryConsumer::new(format!("GraceHashJoinPrefetch[{partition}]"))
+                .with_can_spill(true)
+                .register(context.memory_pool());
 
         let max_partition_passes = context
             .session_config()
@@ -748,6 +753,7 @@ impl ExecutionPlan for GraceHashJoinExec {
             join_metrics,
             Arc::clone(&context),
             reservation,
+            prefetch_reservation,
             self.random_state.clone(),
             partition_batch_size,
             base_partition_budget_bytes,
@@ -1039,11 +1045,11 @@ async fn partition_and_spill_one_side(
             // Calculate dynamic buffer size threshold to keep total overhead under control.
             // Scale write buffering based on the caller-provided budget but clamp it to
             // reasonable min/max bounds so we avoid both tiny spill files and runaway memory.
-            const MIN_TOTAL_TARGET_BUFFER_BYTES: usize = 128 * 1024 * 1024;
-            const MAX_TOTAL_TARGET_BUFFER_BYTES: usize = 1024 * 1024 * 1024;
-            const MIN_FLUSH_BYTES: usize = 8 * 1024 * 1024;
-            const MAX_FLUSH_BYTES: usize = 128 * 1024 * 1024;
-            const MAX_SPILL_FILES_PER_SIDE: usize = 2048;
+            const MIN_TOTAL_TARGET_BUFFER_BYTES: usize = 256 * 1024 * 1024;
+            const MAX_TOTAL_TARGET_BUFFER_BYTES: usize = 2 * 1024 * 1024 * 1024;
+            const MIN_FLUSH_BYTES: usize = 16 * 1024 * 1024;
+            const MAX_FLUSH_BYTES: usize = 256 * 1024 * 1024;
+            const MAX_SPILL_FILES_PER_SIDE: usize = 4096;
 
             let total_target_buffer = partition_write_buffer_bytes
                 .clamp(MIN_TOTAL_TARGET_BUFFER_BYTES, MAX_TOTAL_TARGET_BUFFER_BYTES);
