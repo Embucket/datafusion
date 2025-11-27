@@ -1223,7 +1223,19 @@ impl GraceHashJoinStream {
                                 };
                                 if bytes_to_free > 0 {
                                     let mut res = self.reservation.lock();
-                                    res.shrink(bytes_to_free);
+                                    let available = res.size();
+                                    if bytes_to_free > available {
+                                        if available > 0 {
+                                            res.shrink(available);
+                                        }
+                                        debug!(
+                                            "Grace hash join reservation underflow on stream completion: attempted to free {}, but reservation size is {}",
+                                            human_readable_size(bytes_to_free),
+                                            human_readable_size(available)
+                                        );
+                                    } else {
+                                        res.shrink(bytes_to_free);
+                                    }
                                 }
                                 if let Some(start) = current_join_start.take() {
                                     join_time_metric.add_elapsed(start);
