@@ -297,17 +297,18 @@ fn compute_repartition_count(
     input_size: usize,
     target_size: usize,
     max_partition_count: usize,
+    allow_slack: bool,
 ) -> usize {
     let target_size = target_size.max(1);
     let effective_target = target_size.min(COMPUTE_SOFT_MAX_BYTES);
     // If the current partition is already within the target, keep the same fan-out
     // to avoid pointless recursive repartitioning.
-    if input_size <= effective_target {
+    if allow_slack && input_size <= effective_target {
         return partition_count.min(max_partition_count);
     }
     // Allow some slack: if we're within 2x of the target, keep the fan-out to avoid
     // a costly extra pass when the current size will still fit in memory.
-    if input_size <= effective_target.saturating_mul(2) {
+    if allow_slack && input_size <= effective_target.saturating_mul(2) {
         return partition_count.min(max_partition_count);
     }
 
@@ -350,6 +351,7 @@ fn build_repartition_future(
             input_size,
             target_size,
             max_partition_count,
+            true,
         );
         if new_partition_count == max_partition_count
             && partition_count < max_partition_count
@@ -683,7 +685,7 @@ impl GraceHashJoinStream {
                             }
                         }
 
-                        let skip_load = (estimated_size > effective_limit
+                        let mut skip_load = (estimated_size > effective_limit
                             && work.pass < self.max_partition_passes)
                             || force_compute_repartition;
 
@@ -891,8 +893,18 @@ impl GraceHashJoinStream {
                                     self.adaptive_budget.current_limit()
                                 },
                                 MAX_REPARTITION_PARTITIONS,
+                                !force_compute_repartition,
                             );
-                            if prospective <= work.partition_count && !force_compute_repartition {
+                            if prospective <= work.partition_count && force_compute_repartition {
+                                debug!(
+                                    "Grace hash join partition {} compute-split planned fan-out {} -> {} (no increase), loading and joining instead",
+                                    work.partition_id,
+                                    work.partition_count,
+                                    prospective
+                                );
+                                skip_load = false;
+                                need_repartition = false;
+                            } else if prospective <= work.partition_count {
                                 debug!(
                                     "Grace hash join partition {} already at fan-out {}, skipping repartition (prospective {})",
                                     work.partition_id, work.partition_count, prospective
