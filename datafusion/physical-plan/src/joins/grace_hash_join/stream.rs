@@ -685,7 +685,7 @@ impl GraceHashJoinStream {
                             }
                         }
 
-                        let mut skip_load = (estimated_size > effective_limit
+                        let skip_load = (estimated_size > effective_limit
                             && work.pass < self.max_partition_passes)
                             || force_compute_repartition;
 
@@ -902,8 +902,6 @@ impl GraceHashJoinStream {
                                     work.partition_count,
                                     prospective
                                 );
-                                skip_load = false;
-                                need_repartition = false;
                             } else if prospective <= work.partition_count {
                                 debug!(
                                     "Grace hash join partition {} already at fan-out {}, skipping repartition (prospective {})",
@@ -955,7 +953,18 @@ impl GraceHashJoinStream {
                                     MAX_REPARTITION_PARTITIONS,
                                     !force_compute_repartition,
                                 );
-                                if planned_fanout <= to_split.partition_count {
+                                if planned_fanout <= to_split.partition_count
+                                    && force_compute_repartition
+                                {
+                                    debug!(
+                                        "Grace hash join partition {} compute-split planned fan-out {} -> {} (no increase), loading and joining instead",
+                                        to_split.partition_id,
+                                        to_split.partition_count,
+                                        planned_fanout
+                                    );
+                                    *current_work = Some(to_split);
+                                    continue;
+                                } else if planned_fanout <= to_split.partition_count {
                                     debug!(
                                         "Grace hash join partition {} would not increase fan-out ({} -> {}), skipping repartition",
                                         to_split.partition_id,
@@ -963,7 +972,6 @@ impl GraceHashJoinStream {
                                         planned_fanout
                                     );
                                     *current_work = Some(to_split);
-                                    need_repartition = false;
                                     continue;
                                 } else {
                                     debug!(
@@ -973,7 +981,11 @@ impl GraceHashJoinStream {
                                         to_split.partition_count,
                                         planned_fanout,
                                         human_readable_size(to_split.total_bytes()),
-                                        human_readable_size(self.adaptive_budget.current_limit())
+                                        if force_compute_repartition {
+                                            human_readable_size(COMPUTE_SOFT_MAX_BYTES)
+                                        } else {
+                                            human_readable_size(self.adaptive_budget.current_limit())
+                                        }
                                     );
                                 }
                                 let future = build_repartition_future(
@@ -991,7 +1003,11 @@ impl GraceHashJoinStream {
                                     Arc::clone(&self.left_input_schema),
                                     Arc::clone(&self.right_input_schema),
                                     self.partition_batch_size,
-                                    self.adaptive_budget.current_limit(),
+                                    if force_compute_repartition {
+                                        COMPUTE_SOFT_MAX_BYTES
+                                    } else {
+                                        self.adaptive_budget.current_limit()
+                                    },
                                     self.adaptive_budget.current_limit(),
                                     MAX_REPARTITION_PARTITIONS,
                                 );
