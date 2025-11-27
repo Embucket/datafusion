@@ -1239,7 +1239,9 @@ fn load_partition_async(
         for chunk in partition.chunks {
             let estimated = chunk.size;
             // backpressure: wait for at least one task to finish if we'd exceed cap
-            while in_flight_bytes + estimated > SPILL_READAHEAD_BYTES {
+            while in_flight_bytes > 0
+                && in_flight_bytes + estimated > SPILL_READAHEAD_BYTES
+            {
                 if let Some(res) = tasks.next().await {
                     let (batches, bytes) = res?;
                     in_flight_bytes = in_flight_bytes.saturating_sub(bytes);
