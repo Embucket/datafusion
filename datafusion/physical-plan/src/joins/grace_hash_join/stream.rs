@@ -58,13 +58,13 @@ use parking_lot::Mutex;
 const MAX_REPARTITION_PARTITIONS: usize = 256;
 /// Upper bound on bytes we'll prefetch for the next partition to avoid
 /// runaway memory usage while still hiding IO latency.
-const PREFETCH_MAX_BYTES: usize = 1024 * 1024 * 1024;
+const PREFETCH_MAX_BYTES: usize = 0;
 /// Upper bound for concurrent spill chunk read-ahead when loading partitions.
-const SPILL_READAHEAD_BYTES: usize = 256 * 1024 * 1024;
+const SPILL_READAHEAD_BYTES: usize = 64 * 1024 * 1024;
 /// Below this size we avoid further repartitioning to keep file counts under control.
 const MIN_REPARTITION_BYTES: usize = 16 * 1024 * 1024;
 /// Soft cap for compute-friendly partition size even when memory budgets are large.
-const COMPUTE_SOFT_MAX_BYTES: usize = 1024 * 1024 * 1024;
+const COMPUTE_SOFT_MAX_BYTES: usize = 512 * 1024 * 1024;
 
 enum GraceJoinState {
     /// Waiting for the partitioning phase (Phase 1) to finish
