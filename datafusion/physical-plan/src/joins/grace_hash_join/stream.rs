@@ -459,6 +459,7 @@ pub struct GraceHashJoinStream {
     adaptive_budget: AdaptivePartitionBudget,
     max_partition_passes: usize,
     compute_soft_cap_bytes: usize,
+    repartition_enabled: bool,
     partition_stats: PartitionStatsSummary,
     state: GraceJoinState,
 }
@@ -551,6 +552,7 @@ impl GraceHashJoinStream {
             adaptive_budget,
             max_partition_passes,
             compute_soft_cap_bytes,
+            repartition_enabled: true,
             partition_stats: PartitionStatsSummary::default(),
             state: GraceJoinState::WaitPartitioning,
         }
@@ -598,6 +600,17 @@ impl GraceHashJoinStream {
                     self.partition_stats = stats.clone();
                     self.adaptive_budget.prime_with_stats(&stats);
                     self.adaptive_budget.update_active_partitions(1);
+                    // If every partition already fits in the current budget, disable further repartitioning.
+                    if let Some(max_bytes) = stats.max_partition_bytes() {
+                        if max_bytes <= self.adaptive_budget.current_limit() {
+                            self.repartition_enabled = false;
+                            debug!(
+                                "Grace hash join repartition disabled: max partition {} fits current limit {}",
+                                human_readable_size(max_bytes),
+                                human_readable_size(self.adaptive_budget.current_limit())
+                            );
+                        }
+                    }
                     let left_bytes = Arc::new(Mutex::new(0usize));
                     let right_bytes = Arc::new(Mutex::new(0usize));
                     self.state = GraceJoinState::JoinPartition {
@@ -872,6 +885,15 @@ impl GraceHashJoinStream {
                                 human_readable_size(self.compute_soft_cap_bytes)
                             );
                             need_repartition = true;
+                        }
+
+                        if need_repartition && !self.repartition_enabled {
+                            debug!(
+                                "Grace hash join repartition suppressed: current limit {} covers loaded {}",
+                                human_readable_size(self.adaptive_budget.current_limit()),
+                                human_readable_size(total_loaded_bytes)
+                            );
+                            need_repartition = false;
                         }
 
                         if need_repartition {
