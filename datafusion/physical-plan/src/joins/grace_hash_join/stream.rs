@@ -990,7 +990,21 @@ impl GraceHashJoinStream {
                             };
                             if bytes_to_free > 0 {
                                 let mut res = reservation.lock();
-                                res.shrink(bytes_to_free);
+                                let available = res.size();
+                                if bytes_to_free > available {
+                                    // Don't panic on accounting drift; free what we can and log.
+                                    let shrink = available;
+                                    if shrink > 0 {
+                                        res.shrink(shrink);
+                                    }
+                                    debug!(
+                                        "Grace hash join reservation underflow: attempted to free {}, but reservation size is {}",
+                                        human_readable_size(bytes_to_free),
+                                        human_readable_size(available)
+                                    );
+                                } else {
+                                    res.shrink(bytes_to_free);
+                                }
                             }
                             *left_fut = None;
                             *right_fut = None;
