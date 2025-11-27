@@ -897,7 +897,7 @@ impl GraceHashJoinStream {
                                     work.partition_id, work.partition_count, prospective
                                 );
                                 need_repartition = false;
-                            } else {
+                            } else if !force_compute_repartition {
                                 // If we are only mildly above the budget (<= 2x), prefer joining with serialization instead of splitting.
                                 let current_limit = self.adaptive_budget.current_limit();
                                 if total_loaded_bytes <= current_limit.saturating_mul(2) {
