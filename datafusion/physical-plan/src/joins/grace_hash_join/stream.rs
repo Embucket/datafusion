@@ -1236,6 +1236,7 @@ impl GraceHashJoinStream {
                                         );
                                     }
                                 }
+                                *join_permit = None;
                                 return Poll::Ready(Some(Err(e)));
                             }
                             None => {
