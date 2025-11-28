@@ -52,6 +52,8 @@ use futures::stream::FuturesUnordered;
 use futures::{ready, Stream, StreamExt};
 use log::{debug, info};
 use parking_lot::Mutex;
+use tokio::sync::OnceCell;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 /// Maximum number of partitions we allow after recursive repartitioning to
 /// prevent explosive fan-out.
@@ -86,6 +88,9 @@ enum GraceJoinState {
         right_bytes: Arc<Mutex<usize>>,
         /// Reservation used to track memory for the current partition's loaded batches
         reservation: Arc<Mutex<MemoryReservation>>,
+        /// Permit to limit concurrent in-memory joins across tasks
+        join_permit: Option<Arc<OwnedSemaphorePermit>>,
+        join_permit_fut: Option<OnceFut<Arc<OwnedSemaphorePermit>>>,
         current_join_start: Option<Instant>,
         repartition_fut: Option<OnceFut<Vec<PartitionWorkItem>>>,
         /// Prefetch for the next partition (at most one in-flight)
@@ -460,6 +465,11 @@ pub struct GraceHashJoinStream {
     state: GraceJoinState,
 }
 
+fn global_join_semaphore() -> &'static Semaphore {
+    static SEM: OnceCell<Semaphore> = OnceCell::const_new();
+    SEM.get_or_init(|| Semaphore::new(2))
+}
+
 #[derive(Debug, Clone)]
 pub struct SpillFut {
     left: Vec<PartitionIndex>,
@@ -621,6 +631,8 @@ impl GraceHashJoinStream {
                         left_bytes,
                         right_bytes,
                         reservation: Arc::clone(&self.reservation),
+                        join_permit: None,
+                        join_permit_fut: None,
                         current_join_start: None,
                         repartition_fut: None,
                         prefetch: None,
@@ -637,6 +649,8 @@ impl GraceHashJoinStream {
                     left_bytes,
                     right_bytes,
                     reservation,
+                    join_permit,
+                    join_permit_fut,
                     current_join_start,
                     repartition_fut,
                     prefetch,
@@ -649,6 +663,8 @@ impl GraceHashJoinStream {
                                 *left_bytes.lock() = 0;
                                 *right_bytes.lock() = 0;
                                 *reservation = Arc::clone(&self.reservation);
+                                *join_permit = None;
+                                *join_permit_fut = None;
                                 self.adaptive_budget.update_active_partitions(1);
                             }
                             None => {
@@ -656,6 +672,31 @@ impl GraceHashJoinStream {
                                 continue;
                             }
                         }
+                    }
+
+                    // Acquire global join permit before loading/joining to cap concurrent joins.
+                    if join_permit.is_none() {
+                        if join_permit_fut.is_none() {
+                            let sem = global_join_semaphore().clone();
+                            *join_permit_fut = Some(OnceFut::new(async move {
+                                Arc::new(sem.acquire_owned().await.unwrap())
+                            }));
+                        }
+                        if let Some(fut) = join_permit_fut.as_mut() {
+                            match fut.get_shared(cx) {
+                                Poll::Ready(Ok(permit)) => {
+                                    *join_permit = Some(permit.clone());
+                                    *join_permit_fut = None;
+                                }
+                                Poll::Ready(Err(e)) => {
+                                    return Poll::Ready(Some(Err(e)));
+                                }
+                                Poll::Pending => {
+                                    return Poll::Pending;
+                                }
+                            }
+                        }
+                        continue;
                     }
 
                     if current_stream.is_none() {
@@ -989,6 +1030,7 @@ impl GraceHashJoinStream {
                                     );
                                 }
                             }
+                            *join_permit = None;
                             *left_fut = None;
                             *right_fut = None;
 
@@ -1230,6 +1272,7 @@ impl GraceHashJoinStream {
                                 *current_work = None;
                                 *last_prefetch_skip = None;
                                 *reservation = Arc::clone(&self.reservation);
+                                *join_permit = None;
                                 self.adaptive_budget.update_active_partitions(1);
                                 continue;
                             }
