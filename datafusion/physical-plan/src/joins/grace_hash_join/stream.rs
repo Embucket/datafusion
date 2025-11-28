@@ -57,9 +57,8 @@ use parking_lot::Mutex;
 /// prevent explosive fan-out.
 const MAX_REPARTITION_PARTITIONS: usize = 256;
 /// Upper bound for concurrent spill chunk read-ahead when loading partitions.
-/// Use a generous cap to keep IO saturated while staying well below the
-/// per-partition memory budget.
-const SPILL_READAHEAD_BYTES: usize = 512 * 1024 * 1024;
+/// Keep this modest to avoid competing with the main partition budget.
+const SPILL_READAHEAD_BYTES: usize = 256 * 1024 * 1024;
 /// Below this size we avoid further repartitioning to keep file counts under control.
 const MIN_REPARTITION_BYTES: usize = 16 * 1024 * 1024;
 

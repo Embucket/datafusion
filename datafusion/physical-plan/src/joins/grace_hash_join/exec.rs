@@ -1045,10 +1045,11 @@ async fn partition_and_spill_one_side(
             // Calculate dynamic buffer size threshold to keep total overhead under control.
             // Scale write buffering based on the caller-provided budget but clamp it to
             // reasonable min/max bounds so we avoid both tiny spill files and runaway memory.
-            const MIN_TOTAL_TARGET_BUFFER_BYTES: usize = 256 * 1024 * 1024;
-            const MAX_TOTAL_TARGET_BUFFER_BYTES: usize = 2 * 1024 * 1024 * 1024;
-            const MIN_FLUSH_BYTES: usize = 16 * 1024 * 1024;
-            const MAX_FLUSH_BYTES: usize = 256 * 1024 * 1024;
+            // Use conservative buffering to cap peak memory during partitioning.
+            const MIN_TOTAL_TARGET_BUFFER_BYTES: usize = 64 * 1024 * 1024;
+            const MAX_TOTAL_TARGET_BUFFER_BYTES: usize = 256 * 1024 * 1024;
+            const MIN_FLUSH_BYTES: usize = 8 * 1024 * 1024;
+            const MAX_FLUSH_BYTES: usize = 64 * 1024 * 1024;
             const MAX_SPILL_FILES_PER_SIDE: usize = 4096;
 
             let total_target_buffer = partition_write_buffer_bytes
