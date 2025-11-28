@@ -58,22 +58,13 @@ use parking_lot::Mutex;
 const MAX_REPARTITION_PARTITIONS: usize = 256;
 /// Upper bound for concurrent spill chunk read-ahead when loading partitions.
 /// Keep this modest to avoid competing with the main partition budget.
-const SPILL_READAHEAD_BYTES: usize = 256 * 1024 * 1024;
+const SPILL_READAHEAD_BYTES: usize = 64 * 1024 * 1024;
 /// Below this size we avoid further repartitioning to keep file counts under control.
 const MIN_REPARTITION_BYTES: usize = 16 * 1024 * 1024;
 
-/// Derive a prefetch cap for the next partition to avoid runaway memory use.
-/// We cap at half of the current budget but never exceed 512 MiB, and disable
-/// prefetch entirely for very small budgets to avoid churn.
-fn prefetch_cap_bytes(current_limit: usize) -> usize {
-    const PREFETCH_HARD_CAP: usize = 512 * 1024 * 1024;
-    const PREFETCH_MIN_BYTES: usize = 8 * 1024 * 1024;
-    let cap = (current_limit / 2).min(PREFETCH_HARD_CAP);
-    if cap < PREFETCH_MIN_BYTES {
-        0
-    } else {
-        cap
-    }
+/// Prefetch is disabled to avoid overlapping memory use with the active partition.
+fn prefetch_cap_bytes(_current_limit: usize) -> usize {
+    0
 }
 
 enum GraceJoinState {
