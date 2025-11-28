@@ -52,7 +52,7 @@ use futures::stream::FuturesUnordered;
 use futures::{ready, Stream, StreamExt};
 use log::{debug, info};
 use parking_lot::Mutex;
-use tokio::sync::OnceCell;
+use std::sync::OnceLock;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 /// Maximum number of partitions we allow after recursive repartitioning to
@@ -67,6 +67,11 @@ const MIN_REPARTITION_BYTES: usize = 16 * 1024 * 1024;
 /// Prefetch is disabled to avoid overlapping memory use with the active partition.
 fn prefetch_cap_bytes(_current_limit: usize) -> usize {
     0
+}
+
+fn global_join_semaphore() -> &'static Arc<Semaphore> {
+    static SEM: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    SEM.get_or_init(|| Arc::new(Semaphore::new(2)))
 }
 
 enum GraceJoinState {
@@ -90,7 +95,7 @@ enum GraceJoinState {
         reservation: Arc<Mutex<MemoryReservation>>,
         /// Permit to limit concurrent in-memory joins across tasks
         join_permit: Option<Arc<OwnedSemaphorePermit>>,
-        join_permit_fut: Option<OnceFut<Arc<OwnedSemaphorePermit>>>,
+        join_permit_fut: Option<OnceFut<OwnedSemaphorePermit>>,
         current_join_start: Option<Instant>,
         repartition_fut: Option<OnceFut<Vec<PartitionWorkItem>>>,
         /// Prefetch for the next partition (at most one in-flight)
@@ -465,11 +470,6 @@ pub struct GraceHashJoinStream {
     state: GraceJoinState,
 }
 
-fn global_join_semaphore() -> &'static Semaphore {
-    static SEM: OnceCell<Semaphore> = OnceCell::const_new();
-    SEM.get_or_init(|| Semaphore::new(2))
-}
-
 #[derive(Debug, Clone)]
 pub struct SpillFut {
     left: Vec<PartitionIndex>,
@@ -677,15 +677,16 @@ impl GraceHashJoinStream {
                     // Acquire global join permit before loading/joining to cap concurrent joins.
                     if join_permit.is_none() {
                         if join_permit_fut.is_none() {
-                            let sem = global_join_semaphore().clone();
+                            let sem = Arc::clone(global_join_semaphore());
                             *join_permit_fut = Some(OnceFut::new(async move {
-                                Arc::new(sem.acquire_owned().await.unwrap())
+                                let permit = sem.acquire_owned().await.unwrap();
+                                Ok(permit)
                             }));
                         }
                         if let Some(fut) = join_permit_fut.as_mut() {
                             match fut.get_shared(cx) {
                                 Poll::Ready(Ok(permit)) => {
-                                    *join_permit = Some(permit.clone());
+                                    *join_permit = Some(permit);
                                     *join_permit_fut = None;
                                 }
                                 Poll::Ready(Err(e)) => {
