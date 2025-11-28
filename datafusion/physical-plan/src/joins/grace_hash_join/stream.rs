@@ -1214,12 +1214,12 @@ impl GraceHashJoinStream {
                                     total
                                 };
                                 if bytes_to_free > 0 {
-                                    let mut res = self.reservation.lock();
+                                    let mut res = reservation.lock();
                                     if res.try_shrink(bytes_to_free).is_err() {
                                         let freed = res.free();
                                         debug!(
-                                            "Grace hash join stream completion freed {} after shrink failure (requested {})",
-                                            human_readable_size(freed),
+                                        "Grace hash join stream completion freed {} after shrink failure (requested {})",
+                                        human_readable_size(freed),
                                             human_readable_size(bytes_to_free)
                                         );
                                     }
