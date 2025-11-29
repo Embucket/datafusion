@@ -71,7 +71,7 @@ fn prefetch_cap_bytes(_current_limit: usize) -> usize {
 
 fn global_join_semaphore() -> &'static Arc<Semaphore> {
     static SEM: OnceLock<Arc<Semaphore>> = OnceLock::new();
-    SEM.get_or_init(|| Arc::new(Semaphore::new(2)))
+    SEM.get_or_init(|| Arc::new(Semaphore::new(1)))
 }
 
 enum GraceJoinState {
