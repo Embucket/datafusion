@@ -42,7 +42,6 @@ use crate::test::TestMemoryExec;
 use ahash::RandomState;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
-use cfg_if::cfg_if;
 use datafusion_common::{JoinType, NullEquality, Result};
 use datafusion_execution::memory_pool::{
     human_readable_size, MemoryConsumer, MemoryReservation,
@@ -51,6 +50,8 @@ use datafusion_execution::TaskContext;
 use datafusion_physical_expr::PhysicalExprRef;
 use futures::stream::FuturesUnordered;
 use futures::{ready, Stream, StreamExt};
+#[cfg(target_os = "linux")]
+use libc;
 use log::{debug, info};
 use parking_lot::Mutex;
 use std::sync::OnceLock;
@@ -65,35 +66,32 @@ const SPILL_READAHEAD_BYTES: usize = 64 * 1024 * 1024;
 /// Below this size we avoid further repartitioning to keep file counts under control.
 const MIN_REPARTITION_BYTES: usize = 16 * 1024 * 1024;
 
+fn global_join_semaphore() -> &'static Arc<Semaphore> {
+    static SEM: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    SEM.get_or_init(|| Arc::new(Semaphore::new(1)))
+}
+
 /// Prefetch is disabled to avoid overlapping memory use with the active partition.
 fn prefetch_cap_bytes(_current_limit: usize) -> usize {
     0
 }
 
-cfg_if! {
-    if #[cfg(target_os = "linux")] {
-        fn current_rss_bytes() -> Option<u64> {
-            let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
-            let mut parts = statm.split_whitespace();
-            // statm: size resident shared text lib data dt
-            let _size_pages = parts.next()?;
-            let resident_pages = parts.next()?.parse::<u64>().ok()?;
-            let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-            if page_size <= 0 {
-                return None;
-            }
-            Some(resident_pages.saturating_mul(page_size as u64))
-        }
-    } else {
-        fn current_rss_bytes() -> Option<u64> {
-            None
-        }
+#[cfg(target_os = "linux")]
+fn current_rss_bytes() -> Option<u64> {
+    let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
+    let mut parts = statm.split_whitespace();
+    let _size_pages = parts.next()?;
+    let resident_pages = parts.next()?.parse::<u64>().ok()?;
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if page_size <= 0 {
+        return None;
     }
+    Some(resident_pages.saturating_mul(page_size as u64))
 }
 
-fn global_join_semaphore() -> &'static Arc<Semaphore> {
-    static SEM: OnceLock<Arc<Semaphore>> = OnceLock::new();
-    SEM.get_or_init(|| Arc::new(Semaphore::new(1)))
+#[cfg(not(target_os = "linux"))]
+fn current_rss_bytes() -> Option<u64> {
+    None
 }
 
 enum GraceJoinState {
