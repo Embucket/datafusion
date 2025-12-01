@@ -42,7 +42,7 @@ use std::any::Any;
 use std::fmt;
 use std::fmt::Formatter;
 use std::mem::size_of;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use arrow::array::UInt32Array;
 use arrow::array::{Array, StringViewArray};
@@ -72,10 +72,16 @@ use datafusion_physical_expr_common::physical_expr::fmt_sql;
 use futures::StreamExt;
 use log::{debug, info};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use tokio::sync::Semaphore;
 
 /// Hard-coded seed to ensure hash values from the hash join differ from `RepartitionExec`, avoiding collisions.
 const HASH_JOIN_SEED: RandomState =
     RandomState::with_seeds('J' as u64, 'O' as u64, 'I' as u64, 'N' as u64);
+
+fn global_partition_semaphore() -> &'static Arc<Semaphore> {
+    static SEM: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    SEM.get_or_init(|| Arc::new(Semaphore::new(1)))
+}
 
 pub struct GraceHashJoinExec {
     /// left (build) side which gets hashed
@@ -686,6 +692,8 @@ impl ExecutionPlan for GraceHashJoinExec {
         let join_metrics_clone = Arc::clone(&join_metrics);
         let context_for_partition = Arc::clone(&context);
         let spill_fut = OnceFut::new(async move {
+            let sem = Arc::clone(global_partition_semaphore());
+            let _partition_permit = sem.acquire_owned().await.unwrap();
             // Track memory used during the partitioning phase for this join
             let mut left_reservation =
                 MemoryConsumer::new(format!("GraceHashJoinPartitionLeft[{partition}]"))

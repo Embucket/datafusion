@@ -50,10 +50,10 @@ use datafusion_execution::TaskContext;
 use datafusion_physical_expr::PhysicalExprRef;
 use futures::stream::FuturesUnordered;
 use futures::{ready, Stream, StreamExt};
-#[cfg(target_os = "linux")]
-use std::mem;
 use log::{debug, info};
 use parking_lot::Mutex;
+#[cfg(target_os = "linux")]
+use std::mem;
 use std::sync::OnceLock;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
