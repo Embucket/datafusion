@@ -51,7 +51,7 @@ use datafusion_physical_expr::PhysicalExprRef;
 use futures::stream::FuturesUnordered;
 use futures::{ready, Stream, StreamExt};
 #[cfg(target_os = "linux")]
-use libc;
+use std::mem;
 use log::{debug, info};
 use parking_lot::Mutex;
 use std::sync::OnceLock;
@@ -82,7 +82,7 @@ fn current_rss_bytes() -> Option<u64> {
     let mut parts = statm.split_whitespace();
     let _size_pages = parts.next()?;
     let resident_pages = parts.next()?.parse::<u64>().ok()?;
-    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    let page_size = unsafe { libc_sysconf_page_size() };
     if page_size <= 0 {
         return None;
     }
@@ -92,6 +92,16 @@ fn current_rss_bytes() -> Option<u64> {
 #[cfg(not(target_os = "linux"))]
 fn current_rss_bytes() -> Option<u64> {
     None
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn libc_sysconf_page_size() -> i64 {
+    #[link(name = "c")]
+    extern "C" {
+        fn sysconf(name: i32) -> i64;
+    }
+    const _SC_PAGESIZE: i32 = 30; // POSIX _SC_PAGESIZE
+    sysconf(_SC_PAGESIZE)
 }
 
 enum GraceJoinState {
