@@ -42,6 +42,7 @@ use crate::test::TestMemoryExec;
 use ahash::RandomState;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
+use cfg_if::cfg_if;
 use datafusion_common::{JoinType, NullEquality, Result};
 use datafusion_execution::memory_pool::{
     human_readable_size, MemoryConsumer, MemoryReservation,
@@ -67,6 +68,27 @@ const MIN_REPARTITION_BYTES: usize = 16 * 1024 * 1024;
 /// Prefetch is disabled to avoid overlapping memory use with the active partition.
 fn prefetch_cap_bytes(_current_limit: usize) -> usize {
     0
+}
+
+cfg_if! {
+    if #[cfg(target_os = "linux")] {
+        fn current_rss_bytes() -> Option<u64> {
+            let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
+            let mut parts = statm.split_whitespace();
+            // statm: size resident shared text lib data dt
+            let _size_pages = parts.next()?;
+            let resident_pages = parts.next()?.parse::<u64>().ok()?;
+            let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+            if page_size <= 0 {
+                return None;
+            }
+            Some(resident_pages.saturating_mul(page_size as u64))
+        }
+    } else {
+        fn current_rss_bytes() -> Option<u64> {
+            None
+        }
+    }
 }
 
 fn global_join_semaphore() -> &'static Arc<Semaphore> {
@@ -687,6 +709,14 @@ impl GraceHashJoinStream {
                             match fut.get_shared(cx) {
                                 Poll::Ready(Ok(permit)) => {
                                     *join_permit = Some(permit);
+                                    if let Some(rss) = current_rss_bytes() {
+                                        info!(
+                                                "Grace hash join acquired join permit for partition {} (pass {}), rss={}",
+                                                current_work.as_ref().map(|w| w.partition_id).unwrap_or(usize::MAX),
+                                                current_work.as_ref().map(|w| w.pass).unwrap_or(usize::MAX),
+                                                human_readable_size(rss as usize)
+                                            );
+                                    }
                                     *join_permit_fut = None;
                                 }
                                 Poll::Ready(Err(e)) => {
@@ -1254,7 +1284,7 @@ impl GraceHashJoinStream {
                                         let freed = res.free();
                                         debug!(
                                         "Grace hash join stream completion freed {} after shrink failure (requested {})",
-                                        human_readable_size(freed),
+                                            human_readable_size(freed),
                                             human_readable_size(bytes_to_free)
                                         );
                                     }
