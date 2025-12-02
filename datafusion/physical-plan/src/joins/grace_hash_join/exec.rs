@@ -704,11 +704,11 @@ impl ExecutionPlan for GraceHashJoinExec {
             // Track memory used during the partitioning phase for this join
             let mut left_reservation =
                 MemoryConsumer::new(format!("GraceHashJoinPartitionLeft[{partition}]"))
-                    .with_can_spill(true)
+                    .with_can_spill(false)
                     .register(context_for_partition.memory_pool());
             let mut right_reservation =
                 MemoryConsumer::new(format!("GraceHashJoinPartitionRight[{partition}]"))
-                    .with_can_spill(true)
+                    .with_can_spill(false)
                     .register(context_for_partition.memory_pool());
 
             let (left_idx, right_idx) = partition_and_spill(
@@ -734,19 +734,6 @@ impl ExecutionPlan for GraceHashJoinExec {
         let left_input_schema = self.left.schema();
         let right_input_schema = self.right.schema();
 
-        // Register a memory consumer to account for in-memory buffers used by the
-        // grace hash join stream (loaded partitions and local join state). Mark it
-        // as spillable so it participates fairly in the FairSpillPool.
-        let reservation =
-            MemoryConsumer::new(format!("GraceHashJoinStream[{partition}]"))
-                .with_can_spill(true)
-                .register(context.memory_pool());
-        // Separate reservation for prefetch to avoid blocking the main join reservation.
-        let prefetch_reservation =
-            MemoryConsumer::new(format!("GraceHashJoinPrefetch[{partition}]"))
-                .with_can_spill(true)
-                .register(context.memory_pool());
-
         let max_partition_passes = context
             .session_config()
             .grace_hash_join_max_partition_passes()
@@ -757,6 +744,7 @@ impl ExecutionPlan for GraceHashJoinExec {
             left_input_schema,
             right_input_schema,
             spill_fut,
+            partition,
             spill_left,
             spill_right,
             on_left,
@@ -767,8 +755,6 @@ impl ExecutionPlan for GraceHashJoinExec {
             column_indices_after_projection,
             join_metrics,
             Arc::clone(&context),
-            reservation,
-            prefetch_reservation,
             self.random_state.clone(),
             partition_batch_size,
             base_partition_budget_bytes,

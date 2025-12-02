@@ -53,7 +53,6 @@ use futures::{ready, Stream, StreamExt};
 use log::{debug, info};
 use parking_lot::Mutex;
 #[cfg(target_os = "linux")]
-use std::mem;
 use std::sync::OnceLock;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
@@ -115,6 +114,8 @@ enum GraceJoinState {
         current_stream: Option<SendableRecordBatchStream>,
         left_fut: Option<OnceFut<LoadedPartitionBatches>>,
         right_fut: Option<OnceFut<LoadedPartitionBatches>>,
+        base_reservation: Arc<Mutex<MemoryReservation>>,
+        prefetch_reservation: Arc<Mutex<MemoryReservation>>,
         /// Bytes reserved in the memory pool for the current partition's
         /// loaded left batches
         left_bytes: Arc<Mutex<usize>>,
@@ -476,6 +477,7 @@ pub struct GraceHashJoinStream {
     left_input_schema: SchemaRef,
     right_input_schema: SchemaRef,
     spill_fut: OnceFut<SpillFut>,
+    partition: usize,
     spill_left: Arc<SpillManager>,
     spill_right: Arc<SpillManager>,
     on_left: Vec<PhysicalExprRef>,
@@ -486,10 +488,10 @@ pub struct GraceHashJoinStream {
     column_indices: Vec<ColumnIndex>,
     join_metrics: Arc<BuildProbeJoinMetrics>,
     context: Arc<TaskContext>,
-    /// Memory reservation tracking in-memory buffers used by the join stream
-    reservation: Arc<Mutex<MemoryReservation>>,
-    /// Memory reservation dedicated to prefetching the next partition
-    prefetch_reservation: Arc<Mutex<MemoryReservation>>,
+    /// Lazily registered reservation tracking in-memory buffers used by the join stream
+    reservation: OnceLock<Arc<Mutex<MemoryReservation>>>,
+    /// Lazily registered reservation dedicated to prefetching the next partition
+    prefetch_reservation: OnceLock<Arc<Mutex<MemoryReservation>>>,
     random_state: RandomState,
     partition_batch_size: usize,
     adaptive_budget: AdaptivePartitionBudget,
@@ -538,11 +540,34 @@ impl RecordBatchStream for GraceHashJoinStream {
 }
 
 impl GraceHashJoinStream {
+    /// Ensure the main join reservation is registered only when the join phase starts.
+    fn main_reservation(&self) -> Arc<Mutex<MemoryReservation>> {
+        Arc::clone(self.reservation.get_or_init(|| {
+            let reservation =
+                MemoryConsumer::new(format!("GraceHashJoinStream[{}]", self.partition))
+                    .with_can_spill(true)
+                    .register(self.context.memory_pool());
+            Arc::new(Mutex::new(reservation))
+        }))
+    }
+
+    /// Lazily register a reservation for prefetching; avoids bloating spillable consumer count while partitioning.
+    fn ensure_prefetch_reservation(&self) -> Arc<Mutex<MemoryReservation>> {
+        Arc::clone(self.prefetch_reservation.get_or_init(|| {
+            let reservation =
+                MemoryConsumer::new(format!("GraceHashJoinPrefetch[{}]", self.partition))
+                    .with_can_spill(true)
+                    .register(self.context.memory_pool());
+            Arc::new(Mutex::new(reservation))
+        }))
+    }
+
     pub fn new(
         schema: SchemaRef,
         left_input_schema: SchemaRef,
         right_input_schema: SchemaRef,
         spill_fut: OnceFut<SpillFut>,
+        partition: usize,
         spill_left: Arc<SpillManager>,
         spill_right: Arc<SpillManager>,
         on_left: Vec<PhysicalExprRef>,
@@ -553,8 +578,6 @@ impl GraceHashJoinStream {
         column_indices: Vec<ColumnIndex>,
         join_metrics: Arc<BuildProbeJoinMetrics>,
         context: Arc<TaskContext>,
-        reservation: MemoryReservation,
-        prefetch_reservation: MemoryReservation,
         random_state: RandomState,
         partition_batch_size: usize,
         base_partition_budget_bytes: usize,
@@ -574,6 +597,7 @@ impl GraceHashJoinStream {
             left_input_schema,
             right_input_schema,
             spill_fut,
+            partition,
             spill_left,
             spill_right,
             on_left,
@@ -584,8 +608,8 @@ impl GraceHashJoinStream {
             column_indices,
             join_metrics,
             context,
-            reservation: Arc::new(Mutex::new(reservation)),
-            prefetch_reservation: Arc::new(Mutex::new(prefetch_reservation)),
+            reservation: OnceLock::new(),
+            prefetch_reservation: OnceLock::new(),
             random_state,
             partition_batch_size,
             adaptive_budget,
@@ -652,15 +676,19 @@ impl GraceHashJoinStream {
                     }
                     let left_bytes = Arc::new(Mutex::new(0usize));
                     let right_bytes = Arc::new(Mutex::new(0usize));
+                    let base_reservation = self.main_reservation();
+                    let prefetch_reservation = self.ensure_prefetch_reservation();
                     self.state = GraceJoinState::JoinPartition {
                         work_queue,
                         current_work: None,
                         current_stream: None,
                         left_fut: None,
                         right_fut: None,
+                        base_reservation: Arc::clone(&base_reservation),
+                        prefetch_reservation: Arc::clone(&prefetch_reservation),
                         left_bytes,
                         right_bytes,
-                        reservation: Arc::clone(&self.reservation),
+                        reservation: base_reservation,
                         join_permit: None,
                         join_permit_fut: None,
                         current_join_start: None,
@@ -676,6 +704,8 @@ impl GraceHashJoinStream {
                     current_stream,
                     left_fut,
                     right_fut,
+                    base_reservation,
+                    prefetch_reservation,
                     left_bytes,
                     right_bytes,
                     reservation,
@@ -692,7 +722,7 @@ impl GraceHashJoinStream {
                                 *current_work = Some(work);
                                 *left_bytes.lock() = 0;
                                 *right_bytes.lock() = 0;
-                                *reservation = Arc::clone(&self.reservation);
+                                *reservation = Arc::clone(base_reservation);
                                 *join_permit = None;
                                 *join_permit_fut = None;
                                 self.adaptive_budget.update_active_partitions(1);
@@ -1221,13 +1251,13 @@ impl GraceHashJoinStream {
                                 let left_fut_pf = load_partition_async(
                                     Arc::clone(&self.spill_left),
                                     next_work.left.clone(),
-                                    Arc::clone(&self.prefetch_reservation),
+                                    Arc::clone(prefetch_reservation),
                                     Arc::clone(&left_bytes_pf),
                                 );
                                 let right_fut_pf = load_partition_async(
                                     Arc::clone(&self.spill_right),
                                     next_work.right.clone(),
-                                    Arc::clone(&self.prefetch_reservation),
+                                    Arc::clone(prefetch_reservation),
                                     Arc::clone(&right_bytes_pf),
                                 );
                                 debug!(
@@ -1242,7 +1272,7 @@ impl GraceHashJoinStream {
                                     right_fut: right_fut_pf,
                                     left_bytes: left_bytes_pf,
                                     right_bytes: right_bytes_pf,
-                                    reservation: Arc::clone(&self.prefetch_reservation),
+                                    reservation: Arc::clone(prefetch_reservation),
                                 });
                             } else {
                                 let key = (next_work.partition_id, next_work.pass);
@@ -1311,7 +1341,7 @@ impl GraceHashJoinStream {
                                 *current_stream = None;
                                 *current_work = None;
                                 *last_prefetch_skip = None;
-                                *reservation = Arc::clone(&self.reservation);
+                                *reservation = Arc::clone(base_reservation);
                                 *join_permit = None;
                                 self.adaptive_budget.update_active_partitions(1);
                                 continue;
