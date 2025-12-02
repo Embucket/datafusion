@@ -42,7 +42,7 @@ use std::any::Any;
 use std::fmt;
 use std::fmt::Formatter;
 use std::mem::size_of;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use arrow::array::UInt32Array;
 use arrow::array::{Array, StringViewArray};
@@ -631,6 +631,21 @@ impl ExecutionPlan for GraceHashJoinExec {
         let enable_dynamic_filter_pushdown = self.dynamic_filter_enabled;
 
         let join_metrics = Arc::new(BuildProbeJoinMetrics::new(partition, &self.metrics));
+
+        // Debug: log pool usage at start of GHJ execute to diagnose out-of-memory conditions.
+        let pool = context.memory_pool();
+        let reserved_now = pool.reserved();
+        let limit_msg = match pool.memory_limit() {
+            MemoryLimit::Finite(l) => human_readable_size(l),
+            MemoryLimit::Infinite => "inf".to_string(),
+            MemoryLimit::Unknown => "unknown".to_string(),
+        };
+        debug!(
+            "Grace hash join execute partition {} pool reserved={}, limit={}",
+            partition,
+            human_readable_size(reserved_now),
+            limit_msg
+        );
 
         let left = self.left.execute(partition, Arc::clone(&context))?;
         let left_schema = Arc::clone(&self.left.schema());
