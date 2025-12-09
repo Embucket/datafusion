@@ -38,6 +38,7 @@ pub mod limited_distinct_aggregation;
 pub mod optimizer;
 pub mod output_requirements;
 pub mod projection_pushdown;
+pub mod rank_topn;
 pub use datafusion_pruning as pruning;
 mod limit_pushdown_past_window;
 pub mod sanity_checker;
