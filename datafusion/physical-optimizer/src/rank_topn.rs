@@ -21,7 +21,7 @@ use datafusion_common::tree_node::{Transformed, TreeNode};
 use datafusion_common::{Result, ScalarValue};
 use datafusion_expr::Operator;
 use datafusion_physical_expr::expressions::{BinaryExpr, Column, Literal};
-use datafusion_physical_expr::PhysicalExpr;
+use datafusion_physical_expr::{PhysicalExpr, ScalarFunctionExpr};
 use datafusion_physical_plan::filter::FilterExec;
 use datafusion_physical_plan::projection::{ProjectionExec, ProjectionExpr};
 use datafusion_physical_plan::rank::RankExec;
@@ -207,12 +207,29 @@ fn is_row_number(expr: &Arc<dyn WindowExpr>) -> bool {
 }
 
 fn as_column(expr: &dyn PhysicalExpr) -> Option<&Column> {
-    expr.as_any().downcast_ref::<Column>().or_else(|| {
-        // Look through a top-level CAST.
-        expr.as_any()
-            .downcast_ref::<datafusion_physical_expr::expressions::CastExpr>()
-            .and_then(|cast| cast.expr().as_any().downcast_ref::<Column>())
-    })
+    expr.as_any()
+        .downcast_ref::<Column>()
+        .or_else(|| {
+            // Look through a top-level CAST.
+            expr.as_any()
+                .downcast_ref::<datafusion_physical_expr::expressions::CastExpr>()
+                .and_then(|cast| cast.expr().as_any().downcast_ref::<Column>())
+        })
+        .or_else(|| {
+            // Look through `to_decimal(col, ...)` wrappers produced by type coercion.
+            expr.as_any()
+                .downcast_ref::<ScalarFunctionExpr>()
+                .and_then(|scalar| {
+                    if scalar.name().eq_ignore_ascii_case("to_decimal") {
+                        scalar
+                            .args()
+                            .first()
+                            .and_then(|arg| as_column(arg.as_ref()))
+                    } else {
+                        None
+                    }
+                })
+        })
 }
 
 fn scalar_to_usize(value: &ScalarValue) -> Option<usize> {
