@@ -82,12 +82,6 @@ impl OptimizerRule for DecorrelatePredicateSubquery {
                     .into_iter()
                     .partition(has_subquery);
 
-            if with_subqueries.is_empty() {
-                return internal_err!(
-                    "can not find expected subqueries in DecorrelatePredicateSubquery"
-                );
-            }
-
         assert_or_internal_err!(
             !with_subqueries.is_empty(),
             "can not find expected subqueries in DecorrelatePredicateSubquery"
@@ -145,6 +139,7 @@ impl OptimizerRule for DecorrelatePredicateSubquery {
                         join.join_type,
                         join.join_constraint,
                         join.null_equality,
+                        join.null_aware,
                     )?;
                     return Ok(Transformed::yes(LogicalPlan::Join(new_join)));
                 }
@@ -546,8 +541,12 @@ fn build_join(
 
         right_cols_idx_and_col.sort_by_key(|(idx, _)| *idx);
 
+        // Deduplicate by schema index to avoid duplicate projection expressions
+        // when the same column is referenced both qualified and unqualified
+        let mut seen_indices = std::collections::HashSet::new();
         let right_proj_exprs: Vec<Expr> = right_cols_idx_and_col
             .into_iter()
+            .filter(|(idx, _)| seen_indices.insert(*idx))
             .map(|(_, c)| Expr::Column(c))
             .collect();
 
@@ -839,9 +838,10 @@ mod tests {
           LeftMark Join:  Filter: a = __correlated_sq_1.ua [a:Int32;N, mark:Boolean]
             Projection: column1 AS a [a:Int32;N]
               Values: (Int32(1)), (Int32(2)) [column1:Int32;N]
-            SubqueryAlias: __correlated_sq_1 [ua:Int32;N]
-              Projection: column1 AS ua [ua:Int32;N]
-                Values: (Int32(2)) [column1:Int32;N]
+            Projection: __correlated_sq_1.ua [ua:Int32;N]
+              SubqueryAlias: __correlated_sq_1 [ua:Int32;N]
+                Projection: column1 AS ua [ua:Int32;N]
+                  Values: (Int32(2)) [column1:Int32;N]
         "
         )
     }

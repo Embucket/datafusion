@@ -174,7 +174,6 @@ impl ScalarUDFImpl for ToDateFunc {
             }
             Float16
             | Float32
-            | Float64
             | Decimal32(_, _)
             | Decimal64(_, _)
             | Decimal128(_, _)

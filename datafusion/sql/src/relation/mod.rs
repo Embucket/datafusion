@@ -338,7 +338,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     return plan_err!("PIVOT value column is required");
                 }
 
-                let column_name = value_column.last().unwrap().value.clone();
+                let column_name = value_column.last().unwrap().to_string();
                 let pivot_column = Column::new(None::<&str>, column_name);
 
                 let default_on_null_expr = default_on_null
@@ -454,7 +454,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 let base_plan = self.create_relation(*table, planner_context)?;
                 let base_schema = base_plan.schema();
 
-                let value_column = value.value.clone();
+                let value_column = value.to_string();
                 let name_column = name.value.clone();
 
                 let mut unpivot_column_indices = Vec::new();
@@ -463,7 +463,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 let mut common_type = None;
 
                 for column_ident in &columns {
-                    let column_name = column_ident.value.clone();
+                    let column_name = column_ident.expr.to_string();
 
                     let idx = if let Some(i) =
                         base_schema.index_of_column_by_name(None, &column_name)

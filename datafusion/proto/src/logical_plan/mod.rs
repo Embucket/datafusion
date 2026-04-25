@@ -981,6 +981,7 @@ impl AsLogicalPlan for LogicalPlanNode {
                     dml_node.dml_type().into(),
                     Arc::new(into_logical_plan!(dml_node.input, ctx, extension_codec)?),
                 )))
+            }
             LogicalPlanType::Pivot(pivot) => {
                 let aggregate_expr = pivot
                     .aggregate_expr
@@ -988,14 +989,14 @@ impl AsLogicalPlan for LogicalPlanNode {
                     .map(|expr| from_proto::parse_expr(expr, ctx, extension_codec))
                     .transpose()?
                     .ok_or_else(|| {
-                        DataFusionError::Internal("aggregate_expr required".to_string())
+                        internal_datafusion_err!("aggregate_expr required")
                     })?;
                 let pivot_column = pivot
                     .pivot_column
                     .as_ref()
                     .map(|col| col.clone().into())
                     .ok_or_else(|| {
-                        DataFusionError::Internal("pivot_column required".to_string())
+                        internal_datafusion_err!("pivot_column required")
                     })?;
                 let pivot_values = pivot
                     .pivot_values

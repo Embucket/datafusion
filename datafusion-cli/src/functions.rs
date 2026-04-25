@@ -639,7 +639,7 @@ impl StatisticsCacheFunc {
 }
 
 impl TableFunctionImpl for StatisticsCacheFunc {
-    fn call(&self, exprs: &[Expr]) -> Result<Arc<dyn TableProvider>> {
+    fn call(&self, exprs: &[(Expr, Option<String>)]) -> Result<Arc<dyn TableProvider>> {
         if !exprs.is_empty() {
             return plan_err!("statistics_cache should have no arguments");
         }
@@ -774,7 +774,7 @@ impl ListFilesCacheFunc {
 }
 
 impl TableFunctionImpl for ListFilesCacheFunc {
-    fn call(&self, exprs: &[Expr]) -> Result<Arc<dyn TableProvider>> {
+    fn call(&self, exprs: &[(Expr, Option<String>)]) -> Result<Arc<dyn TableProvider>> {
         if !exprs.is_empty() {
             return plan_err!("list_files_cache should have no arguments");
         }

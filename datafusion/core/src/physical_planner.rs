@@ -87,7 +87,7 @@ use datafusion_expr::logical_plan::builder::wrap_projection_for_join_if_necessar
 use datafusion_expr::utils::{expr_to_columns, split_conjunction};
 use datafusion_expr::{
     Analyze, BinaryExpr, Cast, DescribeTable, DmlStatement, Explain, ExplainFormat,
-    Extension, FetchType, Filter, JoinType, LogicalPlanBuilder, Operator, RecursiveQuery,
+    Extension, FetchType, Filter, JoinType, LogicalPlanBuilder, RecursiveQuery,
     SkipType, StringifiedPlan, WindowFrame, WindowFrameBound, WriteOp,
 };
 use datafusion_physical_expr::aggregate::{AggregateExprBuilder, AggregateFunctionExpr};
@@ -2212,7 +2212,8 @@ fn extract_dml_filters(
             | LogicalPlan::Repartition(_)
             | LogicalPlan::Aggregate(_)
             | LogicalPlan::Window(_)
-            | LogicalPlan::Subquery(_) => {
+            | LogicalPlan::Subquery(_)
+            | LogicalPlan::Pivot(_) => {
                 // Filter information may appear in child nodes; continue traversal
                 // to extract filters from Filter/TableScan nodes deeper in the plan
             }
@@ -2567,26 +2568,26 @@ pub fn create_aggregate_expr_and_maybe_filter(
 pub fn transform_pivot_to_aggregate(
     input: Arc<LogicalPlan>,
     aggregate_expr: &Expr,
-    pivot_column: &datafusion_common::Column,
+    pivot_column: &Column,
     pivot_values: Vec<ScalarValue>,
     default_on_null_expr: Option<&Expr>,
 ) -> Result<LogicalPlan> {
     let df_schema = input.schema();
 
-    let all_columns: Vec<datafusion_common::Column> = df_schema.columns();
+    let all_columns: Vec<Column> = df_schema.columns();
 
     // Filter to include only columns we want for GROUP BY
     // (exclude pivot column and aggregate expression columns)
     let group_by_columns: Vec<Expr> = all_columns
         .into_iter()
-        .filter(|col: &datafusion_common::Column| {
+        .filter(|col: &Column| {
             col.name != pivot_column.name
                 && !aggregate_expr
                     .column_refs()
                     .iter()
                     .any(|agg_col| agg_col.name == col.name)
         })
-        .map(|col: datafusion_common::Column| Expr::Column(col))
+        .map(|col: Column| Expr::Column(col))
         .collect();
 
     let builder = LogicalPlanBuilder::from(Arc::unwrap_or_clone(Arc::clone(&input)));
@@ -2660,7 +2661,7 @@ pub fn transform_pivot_to_aggregate(
                 .any(|v| field.name() == v.to_string().trim_matches('\''))
             {
                 projection_exprs.push(Expr::Column(
-                    datafusion_common::Column::from_name(field.name()),
+                    Column::from_name(field.name()),
                 ));
             }
         }
@@ -2669,7 +2670,7 @@ pub fn transform_pivot_to_aggregate(
         for value in &pivot_values {
             let field_name = value.to_string().trim_matches('\'').to_string();
             let aggregate_col =
-                Expr::Column(datafusion_common::Column::from_name(&field_name));
+                Expr::Column(Column::from_name(&field_name));
 
             // Create COALESCE expression using CASE: CASE WHEN col IS NULL THEN default_value ELSE col END
             let coalesce_expr = Expr::Case(datafusion_expr::expr::Case {
@@ -3103,7 +3104,7 @@ impl DefaultPhysicalPlanner {
                     {
                         if !physical_exprs.iter().any(|(_, name)| name == field.name()) {
                             all_exprs.push((
-                                Arc::new(Column::new(field.name(), i))
+                                Arc::new(datafusion_physical_expr::expressions::Column::new(field.name(), i))
                                     as Arc<dyn PhysicalExpr>,
                                 field.name().clone(),
                             ));
