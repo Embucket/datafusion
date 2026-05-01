@@ -232,7 +232,7 @@ async fn test_udtf_type_coercion() -> Result<()> {
     struct NoOpTableFunc;
 
     impl TableFunctionImpl for NoOpTableFunc {
-        fn call(&self, _: &[Expr]) -> Result<Arc<dyn TableProvider>> {
+        fn call(&self, _: &[(Expr, Option<String>)]) -> Result<Arc<dyn TableProvider>> {
             let schema = Arc::new(arrow::datatypes::Schema::empty());
             Ok(Arc::new(MemTable::try_new(schema, vec![vec![]])?))
         }
