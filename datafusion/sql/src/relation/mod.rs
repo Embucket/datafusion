@@ -480,9 +480,9 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     if let Some(current_type) = &common_type {
                         if comparison_coercion(current_type, field_type).is_none() {
                             return plan_err!(
-                                    "The type of column '{}' conflicts with the type of other columns in the UNPIVOT list.",
-                                    column_name.to_uppercase()
-                                );
+                                "The type of column '{}' conflicts with the type of other columns in the UNPIVOT list.",
+                                column_name.to_uppercase()
+                            );
                         }
                     } else {
                         common_type = Some(field_type.clone());

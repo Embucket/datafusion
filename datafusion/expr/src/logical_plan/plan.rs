@@ -2188,7 +2188,11 @@ impl LogicalPlan {
                             "Pivot: {} FOR {} IN ({})",
                             aggregate_expr,
                             pivot_column,
-                            pivot_values.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(", ")
+                            pivot_values
+                                .iter()
+                                .map(|v| v.to_string())
+                                .collect::<Vec<_>>()
+                                .join(", ")
                         )
                     }
                 }

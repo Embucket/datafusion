@@ -988,16 +988,12 @@ impl AsLogicalPlan for LogicalPlanNode {
                     .as_ref()
                     .map(|expr| from_proto::parse_expr(expr, ctx, extension_codec))
                     .transpose()?
-                    .ok_or_else(|| {
-                        internal_datafusion_err!("aggregate_expr required")
-                    })?;
+                    .ok_or_else(|| internal_datafusion_err!("aggregate_expr required"))?;
                 let pivot_column = pivot
                     .pivot_column
                     .as_ref()
                     .map(|col| col.clone().into())
-                    .ok_or_else(|| {
-                        internal_datafusion_err!("pivot_column required")
-                    })?;
+                    .ok_or_else(|| internal_datafusion_err!("pivot_column required"))?;
                 let pivot_values = pivot
                     .pivot_values
                     .iter()

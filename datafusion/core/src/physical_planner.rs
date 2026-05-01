@@ -87,8 +87,8 @@ use datafusion_expr::logical_plan::builder::wrap_projection_for_join_if_necessar
 use datafusion_expr::utils::{expr_to_columns, split_conjunction};
 use datafusion_expr::{
     Analyze, BinaryExpr, Cast, DescribeTable, DmlStatement, Explain, ExplainFormat,
-    Extension, FetchType, Filter, JoinType, LogicalPlanBuilder, RecursiveQuery,
-    SkipType, StringifiedPlan, WindowFrame, WindowFrameBound, WriteOp,
+    Extension, FetchType, Filter, JoinType, LogicalPlanBuilder, RecursiveQuery, SkipType,
+    StringifiedPlan, WindowFrame, WindowFrameBound, WriteOp,
 };
 use datafusion_physical_expr::aggregate::{AggregateExprBuilder, AggregateFunctionExpr};
 use datafusion_physical_expr::expressions::Literal;
@@ -1310,7 +1310,7 @@ impl DefaultPhysicalPlanner {
                     self.create_physical_plan(&agg_plan, session_state).await
                 } else {
                     plan_err!("PIVOT operation requires at least one value to pivot on")
-                }
+                };
             }
             // 2 Children
             LogicalPlan::Join(Join {
@@ -2602,7 +2602,7 @@ pub fn transform_pivot_to_aggregate(
             return plan_err!(
                 "Pivot column '{}' does not exist in input schema",
                 pivot_column
-            )
+            );
         }
     };
     let pivot_col_type = input_schema.field(pivot_col_idx).data_type();
@@ -2660,17 +2660,14 @@ pub fn transform_pivot_to_aggregate(
                 .iter()
                 .any(|v| field.name() == v.to_string().trim_matches('\''))
             {
-                projection_exprs.push(Expr::Column(
-                    Column::from_name(field.name()),
-                ));
+                projection_exprs.push(Expr::Column(Column::from_name(field.name())));
             }
         }
 
         // Apply COALESCE to aggregate columns
         for value in &pivot_values {
             let field_name = value.to_string().trim_matches('\'').to_string();
-            let aggregate_col =
-                Expr::Column(Column::from_name(&field_name));
+            let aggregate_col = Expr::Column(Column::from_name(&field_name));
 
             // Create COALESCE expression using CASE: CASE WHEN col IS NULL THEN default_value ELSE col END
             let coalesce_expr = Expr::Case(datafusion_expr::expr::Case {
@@ -3084,8 +3081,8 @@ impl DefaultPhysicalPlanner {
 
         let num_input_columns = input_exec.schema().fields().len();
         // When we detect a PIVOT-derived plan with a value_subquery, ensure all generated columns are preserved
-        if let LogicalPlan::Pivot(pivot) = input.as_ref() {
-            if pivot.value_subquery.is_some()
+        if let LogicalPlan::Pivot(pivot) = input.as_ref()
+            && pivot.value_subquery.is_some()
                 && input_exec
                     .as_any()
                     .downcast_ref::<AggregateExec>()
@@ -3104,7 +3101,12 @@ impl DefaultPhysicalPlanner {
                     {
                         if !physical_exprs.iter().any(|(_, name)| name == field.name()) {
                             all_exprs.push((
-                                Arc::new(datafusion_physical_expr::expressions::Column::new(field.name(), i))
+                                Arc::new(
+                                    datafusion_physical_expr::expressions::Column::new(
+                                        field.name(),
+                                        i,
+                                    ),
+                                )
                                     as Arc<dyn PhysicalExpr>,
                                 field.name().clone(),
                             ));
@@ -3114,7 +3116,6 @@ impl DefaultPhysicalPlanner {
                     return Ok(Arc::new(ProjectionExec::try_new(all_exprs, input_exec)?));
                 }
             }
-        }
 
         match self.try_plan_async_exprs(
             num_input_columns,

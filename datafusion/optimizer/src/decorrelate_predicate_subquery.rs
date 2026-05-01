@@ -82,10 +82,10 @@ impl OptimizerRule for DecorrelatePredicateSubquery {
                     .into_iter()
                     .partition(has_subquery);
 
-        assert_or_internal_err!(
-            !with_subqueries.is_empty(),
-            "can not find expected subqueries in DecorrelatePredicateSubquery"
-        );
+            assert_or_internal_err!(
+                !with_subqueries.is_empty(),
+                "can not find expected subqueries in DecorrelatePredicateSubquery"
+            );
 
             // iterate through all exists clauses in predicate, turning each into a join
             let mut cur_input = Arc::unwrap_or_clone(filter.input);
@@ -123,8 +123,8 @@ impl OptimizerRule for DecorrelatePredicateSubquery {
 
         // Additionally handle subqueries embedded in Join.filter expressions
         if let LogicalPlan::Join(join) = plan {
-            if let Some(predicate) = &join.filter {
-                if has_subquery(predicate) {
+            if let Some(predicate) = &join.filter
+                && has_subquery(predicate) {
                     let (new_left, new_predicate) = rewrite_inner_subqueries(
                         Arc::unwrap_or_clone(join.left),
                         predicate.clone(),
@@ -143,7 +143,6 @@ impl OptimizerRule for DecorrelatePredicateSubquery {
                     )?;
                     return Ok(Transformed::yes(LogicalPlan::Join(new_join)));
                 }
-            }
             return Ok(Transformed::no(LogicalPlan::Join(join)));
         }
 

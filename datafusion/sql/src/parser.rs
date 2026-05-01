@@ -554,11 +554,9 @@ impl<'a> DFParser<'a> {
                         for offset in [2, 4] {
                             if let Token::Word(w) =
                                 self.parser.peek_nth_token(offset).token
-                            {
-                                if w.keyword == Keyword::VOLUME {
+                                && w.keyword == Keyword::VOLUME {
                                     return self.parse_and_handle_statement();
                                 }
-                            }
                         }
                         self.parser.next_token(); // CREATE
                         self.parse_create()
@@ -1890,7 +1888,9 @@ mod tests {
             "Expected to parse exactly one statement"
         );
         if let Statement::CreateExternalTable(_) = &statements[0] {
-            panic!("Expected non CREATE EXTERNAL TABLE statement, but was successful: {statements:?}");
+            panic!(
+                "Expected non CREATE EXTERNAL TABLE statement, but was successful: {statements:?}"
+            );
         }
         Ok(())
     }

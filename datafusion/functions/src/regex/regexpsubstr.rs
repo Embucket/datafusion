@@ -21,10 +21,10 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Int64Type};
 use arrow::error::ArrowError;
-use datafusion_common::plan_err;
 use datafusion_common::ScalarValue;
+use datafusion_common::plan_err;
 use datafusion_common::{
-    cast::as_generic_string_array, internal_err, DataFusionError, Result,
+    DataFusionError, Result, cast::as_generic_string_array, internal_err,
 };
 use datafusion_expr::scalar_doc_sections::DOC_SECTION_REGEX;
 use datafusion_expr::{ColumnarValue, Documentation, ScalarFunctionArgs, TypeSignature};
@@ -223,7 +223,7 @@ fn regexp_substr_inner<T: OffsetSizeTrait>(
 ) -> Result<ArrayRef> {
     let regex = match regex {
         None | Some("") => {
-            return Ok(Arc::new(GenericStringArray::<T>::new_null(values.len())))
+            return Ok(Arc::new(GenericStringArray::<T>::new_null(values.len())));
         }
         Some(regex) => regex,
     };
@@ -332,7 +332,7 @@ fn compile_regex(regex: &str, flags: Option<&str>) -> Result<Regex, ArrowError> 
 
 #[cfg(test)]
 mod tests {
-    use crate::regex::regexpsubstr::{regexp_substr, RegexpSubstrFunc};
+    use crate::regex::regexpsubstr::{RegexpSubstrFunc, regexp_substr};
     use arrow::array::{Array, ArrayRef, Int64Array, LargeStringArray, StringArray};
     use arrow::datatypes::{DataType, Field};
     use datafusion_common::ScalarValue;
@@ -608,6 +608,9 @@ mod tests {
         ])
         .expect_err("unsupported flag should have failed");
 
-        assert_eq!(re_err.strip_backtrace(), "Error during planning: regexp_substr() does not support the \"global\" option");
+        assert_eq!(
+            re_err.strip_backtrace(),
+            "Error during planning: regexp_substr() does not support the \"global\" option"
+        );
     }
 }

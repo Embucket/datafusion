@@ -23,8 +23,8 @@ use std::fmt;
 use crate::{
     Aggregate, DescribeTable, Distinct, DistinctOn, DmlStatement, Expr, Filter, Join,
     Limit, LogicalPlan, Partitioning, Pivot, Projection, RecursiveQuery, Repartition,
-    Sort, Subquery, SubqueryAlias, TableProviderFilterPushDown, TableScan, Unnest, Values,
-    Window, expr_vec_fmt,
+    Sort, Subquery, SubqueryAlias, TableProviderFilterPushDown, TableScan, Unnest,
+    Values, Window, expr_vec_fmt,
 };
 
 use crate::dml::CopyTo;
