@@ -17,4 +17,6 @@
 
 //! Optimizer rule for reordering joins to minimize query execution cost
 
+pub mod cost;
 pub mod join_graph;
+pub mod left_deep_join_plan;
