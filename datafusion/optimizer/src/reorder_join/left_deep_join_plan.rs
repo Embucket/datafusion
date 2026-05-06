@@ -75,12 +75,8 @@ pub fn optimal_left_deep_join_plan(
     plan: LogicalPlan,
     cost_estimator: &dyn JoinCostEstimator,
 ) -> Result<LogicalPlan> {
-    // Extract the join subtree and wrappers above the topmost join
-    let (join_subtree, wrappers) =
-        crate::reorder_join::query_graph::extract_join_subtree(plan)?;
-
     // Convert join subtree to query graph
-    let query_graph = QueryGraph::try_from(join_subtree)?;
+    let (query_graph, wrappers) = QueryGraph::try_from_logical_plan(plan)?;
 
     // Optimize the joins
     let mut optimized_joins =
