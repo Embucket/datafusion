@@ -224,6 +224,21 @@ pub trait MemoryPool: Send + Sync + std::fmt::Debug + Display {
         Box::pin(async move { self.try_grow(reservation, additional) })
     }
 
+    /// Walk reclaimers registered with this pool's consumers and ask
+    /// them to free up to `target_bytes`. Returns the total bytes
+    /// actually released. `exclude_consumer_id`, when set, skips a
+    /// consumer (typically the caller, to avoid self-reclaim).
+    ///
+    /// The default implementation does nothing and returns `Ok(0)`.
+    /// Reclaim-aware pools (e.g. [`TrackConsumersPool`]) override.
+    fn reclaim(
+        &self,
+        _target_bytes: usize,
+        _exclude_consumer_id: Option<usize>,
+    ) -> Pin<Box<dyn Future<Output = Result<usize>> + Send + '_>> {
+        Box::pin(async { Ok(0) })
+    }
+
     /// Return the total amount of memory reserved
     fn reserved(&self) -> usize;
 
@@ -408,6 +423,14 @@ impl MemoryReservation {
     /// Returns [MemoryConsumer] for this [MemoryReservation]
     pub fn consumer(&self) -> &MemoryConsumer {
         &self.registration.consumer
+    }
+
+    /// Returns the [`MemoryPool`] this reservation is registered with.
+    /// Cheap `Arc` access for callers that need to spawn a `'static`
+    /// future (e.g. a pending [`MemoryPool::reclaim`] poll inside a
+    /// `Stream`).
+    pub fn pool(&self) -> &Arc<dyn MemoryPool> {
+        &self.registration.pool
     }
 
     /// Frees all bytes from this reservation back to the underlying

@@ -51,8 +51,9 @@ pub struct BatchBuilder {
     reservation: MemoryReservation,
 
     /// Tracks the actual memory used by buffered batches (not including
-    /// pre-reserved bytes). This allows [`Self::push_batch`] to skip pool
-    /// allocation requests when the pre-reserved bytes cover the batch.
+    /// pre-reserved bytes). This allows [`Self::reserve_for_batch`] to
+    /// skip pool allocation requests when the pre-reserved bytes cover
+    /// the batch.
     batches_mem_used: usize,
 
     /// The initial reservation size at construction time. When the reservation
@@ -89,21 +90,43 @@ impl BatchBuilder {
         }
     }
 
-    /// Append a new batch in `stream_idx`
-    pub fn push_batch(&mut self, stream_idx: usize, batch: RecordBatch) -> Result<()> {
-        let size = get_record_batch_memory_size(&batch);
-        self.batches_mem_used += size;
+    /// Reserve pool memory needed to push `batch`. Does **not** mutate
+    /// any internal accounting; on `Err` the caller can retry (e.g.
+    /// after reclaiming via [`MemoryPool::reclaim`]).
+    ///
+    /// On `Ok`, callers MUST follow up with [`Self::commit_batch`] for
+    /// the same `batch` to keep the reservation and `batches_mem_used`
+    /// in agreement.
+    ///
+    /// [`MemoryPool::reclaim`]: datafusion_execution::memory_pool::MemoryPool::reclaim
+    pub fn reserve_for_batch(&mut self, batch: &RecordBatch) -> Result<()> {
+        let size = get_record_batch_memory_size(batch);
+        let target = self.batches_mem_used + size;
         // Only request additional memory from the pool when actual batch
         // usage exceeds the current reservation (which may include
         // pre-reserved bytes from sort_spill_reservation_bytes).
-        try_grow_reservation_to_at_least(&mut self.reservation, self.batches_mem_used)?;
+        try_grow_reservation_to_at_least(&mut self.reservation, target)
+    }
+
+    /// Append `batch` to `stream_idx`. Must be called only after a
+    /// successful [`Self::reserve_for_batch`] for the same `batch`;
+    /// infallible.
+    pub fn commit_batch(&mut self, stream_idx: usize, batch: RecordBatch) {
+        let size = get_record_batch_memory_size(&batch);
+        self.batches_mem_used += size;
         let batch_idx = self.batches.len();
         self.batches.push((stream_idx, batch));
         self.cursors[stream_idx] = BatchCursor {
             batch_idx,
             row_idx: 0,
         };
-        Ok(())
+    }
+
+    /// Returns the underlying [`MemoryReservation`] so callers can read
+    /// pool / consumer metadata (e.g. to spawn a `'static` reclaim
+    /// future).
+    pub fn reservation(&self) -> &MemoryReservation {
+        &self.reservation
     }
 
     /// Append the next row from `stream_idx`
@@ -234,6 +257,21 @@ pub(crate) fn try_grow_reservation_to_at_least(
     Ok(())
 }
 
+/// Async variant of [`try_grow_reservation_to_at_least`]. Routes
+/// through [`MemoryReservation::try_grow_async`] so the pool can ask
+/// sibling reclaimers to spill before surfacing OOM.
+pub(crate) async fn try_grow_reservation_to_at_least_async(
+    reservation: &mut MemoryReservation,
+    needed: usize,
+) -> Result<()> {
+    if needed > reservation.size() {
+        reservation
+            .try_grow_async(needed - reservation.size())
+            .await?;
+    }
+    Ok(())
+}
+
 /// Returns true if the error is an Arrow offset overflow.
 fn is_offset_overflow(e: &DataFusionError) -> bool {
     matches!(
@@ -348,7 +386,8 @@ mod tests {
         let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
         let reservation = MemoryConsumer::new("test").register(&pool);
         let mut builder = BatchBuilder::new(schema, 1, 2, reservation);
-        builder.push_batch(0, batch).unwrap();
+        builder.reserve_for_batch(&batch).unwrap();
+        builder.commit_batch(0, batch);
 
         let error = builder
             .try_interleave_columns(&[(0, 0), (0, 0)])

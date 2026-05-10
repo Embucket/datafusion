@@ -27,6 +27,7 @@ use crate::metrics::BaselineMetrics;
 use crate::sorts::builder::BatchBuilder;
 use crate::sorts::cursor::{Cursor, CursorValues};
 use crate::sorts::stream::PartitionedStream;
+use crate::spill::get_record_batch_memory_size;
 
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
@@ -34,12 +35,12 @@ use datafusion_common::Result;
 use datafusion_execution::memory_pool::MemoryReservation;
 
 use futures::Stream;
+use futures::future::BoxFuture;
 
 /// A fallible [`PartitionedStream`] of [`Cursor`] and [`RecordBatch`]
 type CursorStream<C> = Box<dyn PartitionedStream<Output = Result<(C, RecordBatch)>>>;
 
 /// Merges a stream of sorted cursors and record batches into a single sorted stream
-#[derive(Debug)]
 pub(crate) struct SortPreservingMergeStream<C: CursorValues> {
     in_progress: BatchBuilder,
 
@@ -153,6 +154,44 @@ pub(crate) struct SortPreservingMergeStream<C: CursorValues> {
 
     /// This vector contains the indices of the partitions that have not started emitting yet.
     uninitiated_partitions: Vec<usize>,
+
+    /// Stashed `(stream_idx, cursor_values, batch)` that the inner state
+    /// machine pulled from a partition stream but could not commit because
+    /// `BatchBuilder::reserve_for_batch` failed. Drained at the top of
+    /// [`Self::poll_next_inner`] after a reclaim future resolves.
+    pending_push: Option<(usize, C, RecordBatch)>,
+
+    /// Bytes that the inner state machine asked to reclaim. Set by
+    /// [`Self::maybe_poll_stream`] when [`BatchBuilder::reserve_for_batch`]
+    /// fails; consumed by the outer [`Stream::poll_next`] which builds
+    /// `pending_grow` from it.
+    pending_grow_bytes: Option<usize>,
+
+    /// In-flight [`MemoryPool::reclaim`] future spawned by the outer
+    /// poll loop. Mirrors the futures-rs `Then` adapter pattern: once
+    /// it resolves, the inner state machine retries the stashed push.
+    ///
+    /// [`MemoryPool::reclaim`]: datafusion_execution::memory_pool::MemoryPool::reclaim
+    pending_grow: Option<BoxFuture<'static, Result<usize>>>,
+}
+
+impl<C: CursorValues> std::fmt::Debug for SortPreservingMergeStream<C> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SortPreservingMergeStream")
+            .field("in_progress", &self.in_progress)
+            .field("done", &self.done)
+            .field("loser_tree_adjusted", &self.loser_tree_adjusted)
+            .field("batch_size", &self.batch_size)
+            .field("fetch", &self.fetch)
+            .field("produced", &self.produced)
+            .field("pending_grow_bytes", &self.pending_grow_bytes)
+            .field("pending_grow_in_flight", &self.pending_grow.is_some())
+            .field(
+                "pending_push_idx",
+                &self.pending_push.as_ref().map(|(idx, _, _)| idx),
+            )
+            .finish()
+    }
 }
 
 impl<C: CursorValues> SortPreservingMergeStream<C> {
@@ -186,12 +225,34 @@ impl<C: CursorValues> SortPreservingMergeStream<C> {
             produced: 0,
             uninitiated_partitions: (0..stream_count).collect(),
             enable_round_robin_tie_breaker,
+            pending_push: None,
+            pending_grow_bytes: None,
+            pending_grow: None,
         }
     }
 
     /// If the stream at the given index is not exhausted, and the last cursor for the
     /// stream is finished, poll the stream for the next RecordBatch and create a new
-    /// cursor for the stream from the returned result
+    /// cursor for the stream from the returned result.
+    ///
+    /// On `BatchBuilder::reserve_for_batch` failure the cursor + batch
+    /// are stashed in [`Self::pending_push`] and
+    /// [`Self::pending_grow_bytes`] is set so the outer poll loop can
+    /// fire a [`MemoryPool::reclaim`] before retrying. The cursor is
+    /// **not** installed in `self.cursors[idx]` until the batch
+    /// successfully commits, so the loser tree never points at a batch
+    /// that isn't in the builder.
+    ///
+    /// Also propagates a "needs grow" signal raised by the underlying
+    /// [`PartitionedStream`]: if the cursor stream OOMs in its own
+    /// `try_grow` (e.g. growing per-batch row buffers in
+    /// `RowCursorStream`), it stashes the batch internally and surfaces
+    /// the deficit via [`PartitionedStream::take_pending_grow`]. We
+    /// mirror the deficit into [`Self::pending_grow_bytes`] so the
+    /// outer loop reclaims and the cursor stream's own retry path
+    /// resumes on the next poll.
+    ///
+    /// [`MemoryPool::reclaim`]: datafusion_execution::memory_pool::MemoryPool::reclaim
     fn maybe_poll_stream(
         &mut self,
         cx: &mut Context<'_>,
@@ -202,12 +263,30 @@ impl<C: CursorValues> SortPreservingMergeStream<C> {
             return Poll::Ready(Ok(()));
         }
 
-        match futures::ready!(self.streams.poll_next(cx, idx)) {
+        let poll = self.streams.poll_next(cx, idx);
+        if let Some(needed) = self.streams.take_pending_grow() {
+            // Cursor stream stashed its batch internally; nothing to install
+            // here. Surface the deficit so the outer Then-loop reclaims.
+            self.pending_grow_bytes = Some(needed);
+            return Poll::Pending;
+        }
+
+        match futures::ready!(poll) {
             None => Poll::Ready(Ok(())),
             Some(Err(e)) => Poll::Ready(Err(e)),
             Some(Ok((cursor, batch))) => {
+                if self.in_progress.reserve_for_batch(&batch).is_err() {
+                    // Stash the unconsumed batch + cursor and ask the
+                    // outer poll loop to reclaim from sibling consumers.
+                    // The retry happens at the top of `poll_next_inner`.
+                    let needed = get_record_batch_memory_size(&batch);
+                    self.pending_push = Some((idx, cursor, batch));
+                    self.pending_grow_bytes = Some(needed);
+                    return Poll::Pending;
+                }
                 self.cursors[idx] = Some(Cursor::new(cursor));
-                Poll::Ready(self.in_progress.push_batch(idx, batch))
+                self.in_progress.commit_batch(idx, batch);
+                Poll::Ready(Ok(()))
             }
         }
     }
@@ -223,6 +302,18 @@ impl<C: CursorValues> SortPreservingMergeStream<C> {
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<RecordBatch>>> {
+        // Drain a stashed push (set when a previous reserve_for_batch
+        // failed and the outer poll loop ran a reclaim). If the retry
+        // still can't grow, surface OOM via the normal error path.
+        if let Some((idx, cursor, batch)) = self.pending_push.take() {
+            if let Err(e) = self.in_progress.reserve_for_batch(&batch) {
+                self.done = true;
+                return Poll::Ready(Some(Err(e)));
+            }
+            self.cursors[idx] = Some(Cursor::new(cursor));
+            self.in_progress.commit_batch(idx, batch);
+        }
+
         if self.done {
             // When `build_record_batch()` hits an i32 offset overflow (e.g.
             // combined string offsets exceed 2 GB), it emits a partial batch
@@ -553,12 +644,49 @@ impl<C: CursorValues> SortPreservingMergeStream<C> {
 impl<C: CursorValues + Unpin> Stream for SortPreservingMergeStream<C> {
     type Item = Result<RecordBatch>;
 
+    /// Then-style poll loop (mirrors `futures-util::stream::Then`):
+    ///   1. drive any in-flight reclaim future to completion;
+    ///   2. run the sync state machine (`poll_next_inner`);
+    ///   3. if the inner asked to grow, build a `pool.reclaim` future
+    ///      from a cloned `Arc<dyn MemoryPool>` (so the future is
+    ///      `'static`) and loop back to drive it.
+    ///
+    /// The loser-tree hot loop inside `poll_next_inner` stays fully
+    /// synchronous; the only `await` lives here.
     fn poll_next(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Self::Item>> {
-        let poll = self.poll_next_inner(cx);
-        self.metrics.record_poll(poll)
+        loop {
+            // 1. Drive any in-flight reclaim future. Ignore the bytes
+            //    reclaimed: if reclaim freed nothing, the next inner
+            //    step's retry will fail and surface OOM normally.
+            if let Some(fut) = self.pending_grow.as_mut() {
+                match fut.as_mut().poll(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(_) => {
+                        self.pending_grow = None;
+                    }
+                }
+            }
+
+            // 2. Run the existing sync state machine.
+            let poll = self.poll_next_inner(cx);
+
+            // 3. Did the inner step request a grow?
+            if let Some(needed) = self.pending_grow_bytes.take() {
+                let pool = Arc::clone(self.in_progress.reservation().pool());
+                let cid = self.in_progress.reservation().consumer().id();
+                self.pending_grow =
+                    Some(Box::pin(
+                        async move { pool.reclaim(needed, Some(cid)).await },
+                    ));
+                // Loop back to drive the new future immediately.
+                continue;
+            }
+
+            return self.metrics.record_poll(poll);
+        }
     }
 }
 
@@ -641,7 +769,8 @@ mod tests {
         let batch =
             RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![1]))])
                 .unwrap();
-        stream.in_progress.push_batch(0, batch).unwrap();
+        stream.in_progress.reserve_for_batch(&batch).unwrap();
+        stream.in_progress.commit_batch(0, batch);
         stream.in_progress.push_row(0);
         stream.done = true;
         stream.drain_in_progress_on_done = true;

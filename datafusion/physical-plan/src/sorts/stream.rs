@@ -52,6 +52,19 @@ pub trait PartitionedStream: std::fmt::Debug + Send {
         cx: &mut Context<'_>,
         stream_idx: usize,
     ) -> Poll<Option<Self::Output>>;
+
+    /// If [`Self::poll_next`] returned `Poll::Pending` because a sync
+    /// `try_grow` failed, returns the bytes the caller should reclaim
+    /// before re-polling. Cleared on retrieval.
+    ///
+    /// Allows the caller (typically `SortPreservingMergeStream`) to
+    /// route the signal through its `Then`-style outer loop and call
+    /// [`MemoryPool::reclaim`] on behalf of this stream.
+    ///
+    /// [`MemoryPool::reclaim`]: datafusion_execution::memory_pool::MemoryPool::reclaim
+    fn take_pending_grow(&mut self) -> Option<usize> {
+        None
+    }
 }
 
 /// A new type wrapper around a set of fused [`SendableRecordBatchStream`]
@@ -128,6 +141,18 @@ pub struct RowCursorStream {
     /// Allocated rows for each partition, we keep two to allow for buffering one
     /// in the consumer of the stream
     rows: ReusableRows,
+    /// Per-partition stash of `(batch, rows)` saved when sync
+    /// `try_grow` / `try_resize` fails inside the reservation step.
+    /// Drained at the top of [`Self::poll_next`] after the caller has
+    /// reclaimed via [`MemoryPool::reclaim`]; lets us retry the
+    /// reservation step without re-running the non-idempotent
+    /// `RowConverter::append`.
+    ///
+    /// [`MemoryPool::reclaim`]: datafusion_execution::memory_pool::MemoryPool::reclaim
+    pending_batch: Vec<Option<(RecordBatch, Arc<Rows>)>>,
+    /// Latest "needs N bytes" signal raised by an OOM path. Read by
+    /// the caller via [`PartitionedStream::take_pending_grow`].
+    pending_grow_bytes: Option<usize>,
 }
 
 impl RowCursorStream {
@@ -146,8 +171,9 @@ impl RowCursorStream {
             .collect::<Result<Vec<_>>>()?;
 
         let streams: Vec<_> = streams.into_iter().map(|s| s.fuse()).collect();
+        let stream_count = streams.len();
         let converter = RowConverter::new(sort_fields)?;
-        let mut rows = Vec::with_capacity(streams.len());
+        let mut rows = Vec::with_capacity(stream_count);
         for _ in &streams {
             // Initialize each stream with an empty Rows
             rows.push([
@@ -161,31 +187,58 @@ impl RowCursorStream {
             column_expressions: expressions.iter().map(|x| Arc::clone(&x.expr)).collect(),
             streams: FusedStreams(streams),
             rows: ReusableRows { inner: rows },
+            pending_batch: (0..stream_count).map(|_| None).collect(),
+            pending_grow_bytes: None,
         })
     }
 
-    fn convert_batch(
+    /// Prepare `batch` for the cursor: evaluate the sort expressions,
+    /// take a writable [`Rows`] from the slot, append the encoded keys.
+    /// Returns the `Arc<Rows>` ready for the reservation step.
+    ///
+    /// `RowConverter::append` mutates internal converter state, so this
+    /// stage is **not** idempotent — the caller must keep the returned
+    /// rows around if a later step fails and the caller intends to retry.
+    fn prepare_rows(
         &mut self,
         batch: &RecordBatch,
         stream_idx: usize,
-    ) -> Result<RowValues> {
+    ) -> Result<Arc<Rows>> {
         let cols = evaluate_expressions_to_arrays(&self.column_expressions, batch)?;
-
-        // At this point, ownership should of this Rows should be unique
         let mut rows = self.rows.take_next(stream_idx)?;
-
         rows.clear();
-
         self.converter.append(&mut rows, &cols)?;
-        self.reservation.try_resize(self.converter.size())?;
+        Ok(Arc::new(rows))
+    }
 
-        let rows = Arc::new(rows);
-
-        self.rows.save(stream_idx, &rows);
-
-        // track the memory in the newly created Rows.
+    /// Reservation step. Idempotent: callers may retry with the same
+    /// `(batch, rows)` after a [`MemoryPool::reclaim`] without
+    /// re-running [`Self::prepare_rows`].
+    ///
+    /// On OOM, returns `Err((rows, needed))`: the caller should stash
+    /// the rows + the failing batch in [`Self::pending_batch`] and
+    /// surface `needed` via `pending_grow_bytes`.
+    ///
+    /// [`MemoryPool::reclaim`]: datafusion_execution::memory_pool::MemoryPool::reclaim
+    fn try_reserve(
+        &mut self,
+        stream_idx: usize,
+        rows: Arc<Rows>,
+    ) -> std::result::Result<RowValues, (Arc<Rows>, usize)> {
+        // (a) grow the converter reservation to its accumulated size.
+        if self.reservation.try_resize(self.converter.size()).is_err() {
+            // Worst-case ask: the bytes this batch's row payload will need.
+            let needed = rows.size();
+            return Err((rows, needed));
+        }
+        // (b) grow a per-batch reservation for the new row buffer.
         let rows_reservation = self.reservation.new_empty();
-        rows_reservation.try_grow(rows.size())?;
+        if rows_reservation.try_grow(rows.size()).is_err() {
+            let needed = rows.size();
+            return Err((rows, needed));
+        }
+        // Both steps succeeded; commit the rows to the slot.
+        self.rows.save(stream_idx, &rows);
         Ok(RowValues::new(rows, rows_reservation))
     }
 }
@@ -202,12 +255,43 @@ impl PartitionedStream for RowCursorStream {
         cx: &mut Context<'_>,
         stream_idx: usize,
     ) -> Poll<Option<Self::Output>> {
-        Poll::Ready(ready!(self.streams.poll_next(cx, stream_idx)).map(|r| {
-            r.and_then(|batch| {
-                let cursor = self.convert_batch(&batch, stream_idx)?;
-                Ok((cursor, batch))
-            })
-        }))
+        // Retry path: if a previous poll stashed (batch, rows) for this
+        // partition because reservation failed, retry the reservation
+        // step before pulling a fresh batch from upstream.
+        if let Some((batch, rows)) = self.pending_batch[stream_idx].take() {
+            return match self.try_reserve(stream_idx, rows) {
+                Ok(rv) => Poll::Ready(Some(Ok((rv, batch)))),
+                Err((rows, needed)) => {
+                    self.pending_batch[stream_idx] = Some((batch, rows));
+                    self.pending_grow_bytes = Some(needed);
+                    Poll::Pending
+                }
+            };
+        }
+
+        // Normal path.
+        match ready!(self.streams.poll_next(cx, stream_idx)) {
+            None => Poll::Ready(None),
+            Some(Err(e)) => Poll::Ready(Some(Err(e))),
+            Some(Ok(batch)) => {
+                let rows = match self.prepare_rows(&batch, stream_idx) {
+                    Ok(r) => r,
+                    Err(e) => return Poll::Ready(Some(Err(e))),
+                };
+                match self.try_reserve(stream_idx, rows) {
+                    Ok(rv) => Poll::Ready(Some(Ok((rv, batch)))),
+                    Err((rows, needed)) => {
+                        self.pending_batch[stream_idx] = Some((batch, rows));
+                        self.pending_grow_bytes = Some(needed);
+                        Poll::Pending
+                    }
+                }
+            }
+        }
+    }
+
+    fn take_pending_grow(&mut self) -> Option<usize> {
+        self.pending_grow_bytes.take()
     }
 }
 
@@ -219,6 +303,13 @@ pub struct FieldCursorStream<T: CursorArray> {
     streams: FusedStreams,
     /// Create new reservations for each array
     reservation: MemoryReservation,
+    /// Per-partition stash of the [`RecordBatch`] saved when a sync
+    /// `try_grow` failed. Drained at the top of [`Self::poll_next`]
+    /// after the caller has reclaimed.
+    pending_batch: Vec<Option<RecordBatch>>,
+    /// Bytes the caller should reclaim before retrying. Read via
+    /// [`PartitionedStream::take_pending_grow`].
+    pending_grow_bytes: Option<usize>,
     phantom: PhantomData<fn(T) -> T>,
 }
 
@@ -236,22 +327,40 @@ impl<T: CursorArray> FieldCursorStream<T> {
         streams: Vec<SendableRecordBatchStream>,
         reservation: MemoryReservation,
     ) -> Self {
+        let stream_count = streams.len();
         let streams = streams.into_iter().map(|s| s.fuse()).collect();
         Self {
             sort,
             streams: FusedStreams(streams),
             reservation,
+            pending_batch: (0..stream_count).map(|_| None).collect(),
+            pending_grow_bytes: None,
             phantom: Default::default(),
         }
     }
 
-    fn convert_batch(&mut self, batch: &RecordBatch) -> Result<ArrayValues<T::Values>> {
-        let value = self.sort.expr.evaluate(batch)?;
-        let array = value.into_array(batch.num_rows())?;
+    /// Returns `Err(needed)` (without partial mutation) if the
+    /// per-array reservation cannot grow. Re-evaluating the expression
+    /// on retry is idempotent, so the caller only needs to stash the
+    /// original batch.
+    fn try_convert_batch(
+        &mut self,
+        batch: &RecordBatch,
+    ) -> std::result::Result<ArrayValues<T::Values>, Result<usize>> {
+        let value = match self.sort.expr.evaluate(batch) {
+            Ok(v) => v,
+            Err(e) => return Err(Err(e)),
+        };
+        let array = match value.into_array(batch.num_rows()) {
+            Ok(a) => a,
+            Err(e) => return Err(Err(e)),
+        };
         let size_in_mem = array.get_buffer_memory_size();
         let array = array.as_any().downcast_ref::<T>().expect("field values");
         let array_reservation = self.reservation.new_empty();
-        array_reservation.try_grow(size_in_mem)?;
+        if array_reservation.try_grow(size_in_mem).is_err() {
+            return Err(Ok(size_in_mem));
+        }
         Ok(ArrayValues::new(
             self.sort.options,
             array,
@@ -272,12 +381,28 @@ impl<T: CursorArray> PartitionedStream for FieldCursorStream<T> {
         cx: &mut Context<'_>,
         stream_idx: usize,
     ) -> Poll<Option<Self::Output>> {
-        Poll::Ready(ready!(self.streams.poll_next(cx, stream_idx)).map(|r| {
-            r.and_then(|batch| {
-                let cursor = self.convert_batch(&batch)?;
-                Ok((cursor, batch))
-            })
-        }))
+        let batch = if let Some(b) = self.pending_batch[stream_idx].take() {
+            b
+        } else {
+            match ready!(self.streams.poll_next(cx, stream_idx)) {
+                None => return Poll::Ready(None),
+                Some(Err(e)) => return Poll::Ready(Some(Err(e))),
+                Some(Ok(b)) => b,
+            }
+        };
+        match self.try_convert_batch(&batch) {
+            Ok(cursor) => Poll::Ready(Some(Ok((cursor, batch)))),
+            Err(Ok(needed)) => {
+                self.pending_batch[stream_idx] = Some(batch);
+                self.pending_grow_bytes = Some(needed);
+                Poll::Pending
+            }
+            Err(Err(e)) => Poll::Ready(Some(Err(e))),
+        }
+    }
+
+    fn take_pending_grow(&mut self) -> Option<usize> {
+        self.pending_grow_bytes.take()
     }
 }
 

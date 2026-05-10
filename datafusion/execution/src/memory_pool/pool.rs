@@ -710,6 +710,80 @@ impl<I: MemoryPool> MemoryPool for TrackConsumersPool<I> {
         Ok(())
     }
 
+    fn reclaim(
+        &self,
+        target_bytes: usize,
+        exclude_consumer_id: Option<usize>,
+    ) -> Pin<Box<dyn Future<Output = Result<usize>> + Send + '_>> {
+        Box::pin(async move {
+            if target_bytes == 0 {
+                return Ok(0);
+            }
+
+            // Snapshot reclaimers. Skip the excluded consumer (self-
+            // reclaim risks deadlock) and zero-byte consumers. Filter
+            // out anyone whose `reclaimer_state` flag is not
+            // `AVAILABLE` (in-flight or sticky-disabled) so we don't
+            // serialize behind another reclaim or chase a victim that
+            // can no longer free memory. Drop the read guard before
+            // awaiting any reclaim.
+            let mut candidates: Vec<(usize, Arc<dyn MemoryReclaimer>, Arc<AtomicU8>)> = {
+                let guard = self.tracked_consumers.read();
+                guard
+                    .iter()
+                    .filter_map(|(cid, tc)| {
+                        let reclaimer = tc.reclaimer.as_ref()?;
+                        if Some(*cid) == exclude_consumer_id || tc.reserved() == 0 {
+                            return None;
+                        }
+                        if tc.reclaimer_state.load(Ordering::Acquire)
+                            != reclaimer_state::AVAILABLE
+                        {
+                            return None;
+                        }
+                        Some((
+                            tc.reserved(),
+                            Arc::clone(reclaimer),
+                            Arc::clone(&tc.reclaimer_state),
+                        ))
+                    })
+                    .collect()
+            };
+            // Order: priority desc, then reservation size desc.
+            candidates.sort_by(|(lr, l, _), (rr, r, _)| {
+                r.priority().cmp(&l.priority()).then_with(|| rr.cmp(lr))
+            });
+            // Cap reclaim work — only consider the top-ranked candidates.
+            candidates.truncate(self.reclaim_candidate_limit.get());
+
+            // Iterate reclaimers; ask each for whatever is still
+            // outstanding. Each reclaimer is responsible for its own
+            // self-bounded wait (e.g. a `tokio::time::timeout`) so a
+            // victim that is itself blocked doesn't stall this walk
+            // forever.
+            let mut total_reclaimed: usize = 0;
+            for (_, reclaimer, flag) in candidates {
+                if total_reclaimed >= target_bytes {
+                    break;
+                }
+                let _g = match ReclaimerStateGuard::try_acquire(&flag) {
+                    Some(g) => g,
+                    None => continue,
+                };
+                let remaining = target_bytes - total_reclaimed;
+                match reclaimer.reclaim(remaining).await {
+                    Ok(freed) => {
+                        total_reclaimed = total_reclaimed.saturating_add(freed);
+                    }
+                    Err(e) => {
+                        debug!("memory reclaimer returned error: {e}");
+                    }
+                }
+            }
+            Ok(total_reclaimed)
+        })
+    }
+
     fn try_grow_async<'a>(
         &'a self,
         reservation: &'a MemoryReservation,

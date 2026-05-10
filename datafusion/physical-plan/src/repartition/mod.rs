@@ -1479,7 +1479,7 @@ impl RepartitionExec {
                 // if there is still a receiver, send to it
                 if let Some(channel) = output_channels.get_mut(&partition) {
                     let (batch_to_send, is_memory_batch) =
-                        match channel.reservation.try_grow(size) {
+                        match channel.reservation.try_grow_async(size).await {
                             Ok(_) => {
                                 // Memory available - send in-memory batch
                                 (RepartitionBatch::Memory(batch), true)
