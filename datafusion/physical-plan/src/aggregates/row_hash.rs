@@ -53,6 +53,7 @@ use datafusion_physical_expr_common::sort_expr::LexOrdering;
 use crate::sorts::IncrementalSortIterator;
 use datafusion_common::instant::Instant;
 use datafusion_common::utils::memory::get_record_batch_memory_size;
+use futures::future::BoxFuture;
 use futures::ready;
 use futures::stream::{Stream, StreamExt};
 use log::debug;
@@ -69,6 +70,14 @@ pub(crate) enum ExecutionState {
     ///
     /// See "partial aggregation" discussion on [`GroupedHashAggregateStream`]
     SkippingAggregation,
+    /// Hit OOM while resizing the reservation; the outer Then-style
+    /// poll loop is driving a [`MemoryPool::reclaim`] future. When the
+    /// future resolves, the state transitions back to
+    /// [`Self::ReadingInput`] which retries
+    /// [`GroupedHashAggregateStream::try_update_memory_reservation`].
+    ///
+    /// [`MemoryPool::reclaim`]: datafusion_execution::memory_pool::MemoryPool::reclaim
+    AwaitingReclaim,
     /// All input has been consumed and all groups have been emitted
     Done,
 }
@@ -455,6 +464,27 @@ pub(crate) struct GroupedHashAggregateStream {
 
     /// Reduction factor metric, calculated as `output_rows/input_rows` (only for partial aggregation)
     reduction_factor: Option<metrics::RatioMetrics>,
+
+    /// Bytes the outer Then-style poll loop should request via
+    /// [`MemoryPool::reclaim`] before retrying. Set by
+    /// [`Self::try_update_memory_reservation`] when `try_resize`
+    /// fails; consumed by [`Stream::poll_next`].
+    ///
+    /// [`MemoryPool::reclaim`]: datafusion_execution::memory_pool::MemoryPool::reclaim
+    pending_grow_bytes: Option<usize>,
+
+    /// In-flight [`MemoryPool::reclaim`] future spawned by the outer
+    /// poll loop. Mirrors the futures-rs `Then` adapter pattern: once
+    /// it resolves, the state machine retries.
+    ///
+    /// [`MemoryPool::reclaim`]: datafusion_execution::memory_pool::MemoryPool::reclaim
+    pending_grow: Option<BoxFuture<'static, Result<usize>>>,
+
+    /// True between setting [`Self::pending_grow_bytes`] and the
+    /// subsequent retry of [`Self::update_memory_reservation`]. Ensures
+    /// we ask siblings to reclaim **once** per OOM event before falling
+    /// through to local OOM handling (spill / emit-early / report).
+    reclaim_attempted: bool,
 }
 
 impl GroupedHashAggregateStream {
@@ -681,6 +711,9 @@ impl GroupedHashAggregateStream {
             group_values_soft_limit: agg.limit_options().map(|config| config.limit()),
             skip_aggregation_probe,
             reduction_factor,
+            pending_grow_bytes: None,
+            pending_grow: None,
+            reclaim_attempted: false,
         })
     }
 }
@@ -708,10 +741,76 @@ pub(crate) fn create_group_accumulator(
 impl Stream for GroupedHashAggregateStream {
     type Item = Result<RecordBatch>;
 
+    /// Then-style poll loop (mirrors `futures-util::stream::Then`):
+    ///   1. drive any in-flight reclaim future to completion;
+    ///   2. run the sync state machine (`poll_next_inner`);
+    ///   3. if the inner asked for reclaim, build a `pool.reclaim`
+    ///      future from a cloned `Arc<dyn MemoryPool>` (so the future
+    ///      is `'static`) and loop back to drive it.
+    ///
+    /// The aggregation hot path inside `poll_next_inner` stays fully
+    /// synchronous; the only `await` lives here.
     fn poll_next(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Self::Item>> {
+        loop {
+            // 1. Drive any in-flight reclaim future. Ignore the bytes
+            //    reclaimed: if reclaim freed nothing, the retry of
+            //    `try_update_memory_reservation` below will fall
+            //    through to local OOM handling normally.
+            if let Some(fut) = self.pending_grow.as_mut() {
+                match fut.as_mut().poll(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(_) => {
+                        self.pending_grow = None;
+                        // Resume by retrying the reservation that
+                        // triggered the reclaim. Going straight to
+                        // `ReadingInput` would pull a fresh upstream
+                        // batch and skip the spill/emit path the
+                        // previous batch demanded.
+                        if matches!(self.exec_state, ExecutionState::AwaitingReclaim) {
+                            match self.try_update_memory_reservation() {
+                                Ok(None) => {
+                                    self.exec_state = ExecutionState::ReadingInput;
+                                }
+                                Ok(Some(new_state)) => {
+                                    self.exec_state = new_state;
+                                }
+                                Err(e) => {
+                                    return Poll::Ready(Some(Err(e)));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 2. Run the existing sync state machine.
+            let poll = self.poll_next_inner(cx);
+
+            // 3. Did the inner step request a reclaim?
+            if let Some(needed) = self.pending_grow_bytes.take() {
+                let pool = Arc::clone(self.reservation.pool());
+                let cid = self.reservation.consumer().id();
+                self.pending_grow =
+                    Some(Box::pin(
+                        async move { pool.reclaim(needed, Some(cid)).await },
+                    ));
+                // Loop back to drive the new future immediately.
+                continue;
+            }
+
+            return poll;
+        }
+    }
+}
+
+impl GroupedHashAggregateStream {
+    fn poll_next_inner(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<RecordBatch>>> {
         let elapsed_compute = self.baseline_metrics.elapsed_compute().clone();
 
         loop {
@@ -880,6 +979,14 @@ impl Stream for GroupedHashAggregateStream {
                     )));
                 }
 
+                ExecutionState::AwaitingReclaim => {
+                    // Outer `Stream::poll_next` drives the in-flight
+                    // reclaim future and transitions us back to
+                    // `ReadingInput` once it resolves; nothing to do
+                    // here.
+                    return Poll::Pending;
+                }
+
                 ExecutionState::Done => {
                     // Sanity check: all groups should have been emitted by now
                     if !self.group_values.is_empty() {
@@ -1020,8 +1127,25 @@ impl GroupedHashAggregateStream {
         let oom = match self.update_memory_reservation() {
             Err(e @ DataFusionError::ResourcesExhausted(_)) => e,
             Err(e) => return Err(e),
-            Ok(_) => return Ok(None),
+            Ok(_) => {
+                // Successful grow resets the per-OOM-event reclaim flag
+                // so the next OOM gets its own one-shot sibling reclaim.
+                self.reclaim_attempted = false;
+                return Ok(None);
+            }
         };
+
+        // First OOM hit for this batch: ask siblings to reclaim before
+        // falling through to local OOM handling. The outer Then-style
+        // poll loop spawns a `MemoryPool::reclaim` future and re-enters
+        // here once it resolves; on re-entry `reclaim_attempted` is
+        // true and we proceed with the existing OOM mode logic.
+        if !self.reclaim_attempted {
+            self.pending_grow_bytes = Some(self.reservation_deficit());
+            self.reclaim_attempted = true;
+            return Ok(Some(ExecutionState::AwaitingReclaim));
+        }
+        self.reclaim_attempted = false;
 
         match self.oom_mode {
             OutOfMemoryMode::Spill if !self.group_values.is_empty() => {
@@ -1050,6 +1174,28 @@ impl GroupedHashAggregateStream {
             | OutOfMemoryMode::Spill
             | OutOfMemoryMode::ReportError => Err(oom),
         }
+    }
+
+    /// Returns the byte deficit between the current reservation and the
+    /// target size [`Self::update_memory_reservation`] would compute.
+    /// Used as the argument to [`MemoryPool::reclaim`] on first OOM so
+    /// siblings know how much to free.
+    ///
+    /// [`MemoryPool::reclaim`]: datafusion_execution::memory_pool::MemoryPool::reclaim
+    fn reservation_deficit(&self) -> usize {
+        let acc = self.accumulators.iter().map(|x| x.size()).sum::<usize>();
+        let groups_and_acc_size = acc
+            + self.group_values.size()
+            + self.group_ordering.size()
+            + self.current_group_indices.allocated_size();
+        let sort_headroom =
+            if self.oom_mode == OutOfMemoryMode::Spill && !self.group_values.is_empty() {
+                acc + self.group_values.size()
+            } else {
+                0
+            };
+        let new_size = groups_and_acc_size + sort_headroom;
+        new_size.saturating_sub(self.reservation.size())
     }
 
     fn update_memory_reservation(&mut self) -> Result<()> {
