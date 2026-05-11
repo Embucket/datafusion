@@ -66,7 +66,7 @@ use datafusion_common::{
 };
 use datafusion_execution::TaskContext;
 use datafusion_execution::memory_pool::{
-    MemoryConsumer, MemoryReclaimer, MemoryReservation, reclaimer_state,
+    MemoryConsumer, MemoryLimit, MemoryReclaimer, MemoryReservation, reclaimer_state,
 };
 use datafusion_execution::runtime_env::RuntimeEnv;
 use datafusion_physical_expr::LexOrdering;
@@ -75,6 +75,13 @@ use datafusion_physical_expr::expressions::{DynamicFilterPhysicalExpr, lit};
 
 use futures::{StreamExt, TryStreamExt};
 use log::{debug, trace};
+
+/// Pool-usage fraction above which a sorter proactively spills its
+/// in-memory batches at merge entry, before flipping its reclaimer
+/// to `DISABLED`. Prevents a fat unspilled sorter from becoming a
+/// permanently-held monument that starves sibling consumers in the
+/// merge phase.
+const PRE_MERGE_SPILL_POOL_THRESHOLD: f64 = 0.66;
 
 /// Reclaimer for an [`ExternalSorter`] partition. Hands a oneshot off to
 /// the partition's stream loop (the sorter's sole owner), which spills and
@@ -1439,6 +1446,24 @@ impl ExecutionPlan for SortExec {
                                     }
                                     sorter.in_mem_batches.push(batch);
                                 }
+                            }
+                        }
+                        // Proactive spill before entering the
+                        // non-reclaimable merge phase. If the pool is
+                        // under pressure and we still hold in-memory
+                        // batches, spill them so siblings can use the
+                        // freed bytes. After this, `sort()` takes the
+                        // multi-level-merge path with a tiny resident
+                        // footprint.
+                        if !sorter.in_mem_batches.is_empty()
+                            && let MemoryLimit::Finite(limit) =
+                                sorter.runtime.memory_pool.memory_limit()
+                        {
+                            let threshold =
+                                (limit as f64 * PRE_MERGE_SPILL_POOL_THRESHOLD) as usize;
+                            let reserved = sorter.runtime.memory_pool.reserved();
+                            if reserved > threshold {
+                                sorter.sort_and_spill_in_mem_batches().await?;
                             }
                         }
                         // Sticky-disable so concurrent `try_grow_async`
