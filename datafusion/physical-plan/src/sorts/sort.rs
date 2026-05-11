@@ -81,7 +81,7 @@ use log::{debug, trace};
 /// to `DISABLED`. Prevents a fat unspilled sorter from becoming a
 /// permanently-held monument that starves sibling consumers in the
 /// merge phase.
-const PRE_MERGE_SPILL_POOL_THRESHOLD: f64 = 0.66;
+const PRE_MERGE_SPILL_POOL_THRESHOLD: f64 = 0.33;
 
 /// Reclaimer for an [`ExternalSorter`] partition. Hands a oneshot off to
 /// the partition's stream loop (the sorter's sole owner), which spills and
@@ -1449,22 +1449,51 @@ impl ExecutionPlan for SortExec {
                             }
                         }
                         // Proactive spill before entering the
-                        // non-reclaimable merge phase. If the pool is
-                        // under pressure and we still hold in-memory
-                        // batches, spill them so siblings can use the
-                        // freed bytes. After this, `sort()` takes the
-                        // multi-level-merge path with a tiny resident
-                        // footprint.
+                        // non-reclaimable merge phase. Two signals,
+                        // either fires:
+                        //
+                        // - Self-relative: this partition alone holds
+                        //   more than its fair per-worker share
+                        //   (`limit / num_workers`). Catches early
+                        //   finishers whose own footprint is the
+                        //   problem even when `pool.reserved()`
+                        //   hasn't yet risen.
+                        //
+                        // - Pool-relative: total pool usage is past
+                        //   the threshold. Catches the "I'm small but
+                        //   the pool is hot" case.
                         if !sorter.in_mem_batches.is_empty()
                             && let MemoryLimit::Finite(limit) =
                                 sorter.runtime.memory_pool.memory_limit()
                         {
-                            let threshold =
+                            let num_workers = tokio::runtime::Handle::current()
+                                .metrics()
+                                .num_workers()
+                                .max(1);
+                            let self_share = limit / num_workers;
+                            let pool_threshold =
                                 (limit as f64 * PRE_MERGE_SPILL_POOL_THRESHOLD) as usize;
-                            let reserved = sorter.runtime.memory_pool.reserved();
-                            if reserved > threshold {
+                            let pool_used = sorter.runtime.memory_pool.reserved();
+                            if sorter.used() > self_share || pool_used > pool_threshold {
                                 sorter.sort_and_spill_in_mem_batches().await?;
                             }
+                        }
+                        // Drain any reclaim requests already queued
+                        // before we commit to a sort path. A sibling
+                        // may have asked while we were finishing the
+                        // input loop; once `sort()` consumes
+                        // `in_mem_batches` we can no longer service
+                        // them. Non-blocking — if nothing is pending
+                        // we proceed to commit.
+                        while let Ok(resp_tx) = reclaim_rx.try_recv() {
+                            if sorter.in_mem_batches.is_empty() {
+                                let _ = resp_tx.send(0);
+                                continue;
+                            }
+                            let before = sorter.used();
+                            sorter.sort_and_spill_in_mem_batches().await?;
+                            let after = sorter.used();
+                            let _ = resp_tx.send(before.saturating_sub(after));
                         }
                         // Sticky-disable so concurrent `try_grow_async`
                         // callers stop targeting this consumer once we
