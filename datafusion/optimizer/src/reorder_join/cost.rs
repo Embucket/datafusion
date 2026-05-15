@@ -18,7 +18,7 @@
 use datafusion_common::{Result, plan_err};
 use datafusion_expr::{JoinType, LogicalPlan};
 
-use super::query_graph::Edge;
+use super::join_graph::Edge;
 
 pub trait JoinCostEstimator: std::fmt::Debug {
     fn cardinality(&self, plan: &LogicalPlan) -> Option<f64> {

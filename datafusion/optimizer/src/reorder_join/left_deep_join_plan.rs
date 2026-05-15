@@ -22,7 +22,7 @@ use datafusion_expr::{Expr, Filter, JoinConstraint, LogicalPlan};
 
 use crate::reorder_join::{
     cost::JoinCostEstimator,
-    query_graph::{NodeId, QueryGraph},
+    join_graph::{JoinGraph, NodeId},
 };
 
 /// Generates an optimized left-deep join plan from a logical plan using the Ibaraki-Kameda algorithm.
@@ -76,7 +76,7 @@ pub fn optimal_left_deep_join_plan(
     cost_estimator: &dyn JoinCostEstimator,
 ) -> Result<LogicalPlan> {
     // Convert join subtree to query graph
-    let (query_graph, wrappers) = QueryGraph::try_from_logical_plan(plan)?;
+    let (query_graph, wrappers) = JoinGraph::try_from_logical_plan(plan)?;
 
     // Optimize the joins
     let mut optimized_joins =
@@ -91,7 +91,7 @@ pub fn optimal_left_deep_join_plan(
     }
 
     // Reconstruct the full plan with wrappers
-    crate::reorder_join::query_graph::reconstruct_plan(optimized_joins, wrappers)
+    crate::reorder_join::join_graph::reconstruct_plan(optimized_joins, wrappers)
 }
 
 /// Generates an optimized linear join plan from a query graph using the Ibaraki-Kameda algorithm.
@@ -112,7 +112,7 @@ pub fn optimal_left_deep_join_plan(
 /// 3. **Denormalization**: Split merged operations back into individual nodes while maintaining chain structure
 /// 4. **Cost Comparison**: Compare the resulting plan's cost against the current best
 pub fn query_graph_to_optimal_left_deep_join_plan(
-    query_graph: &QueryGraph,
+    query_graph: &JoinGraph,
     cost_estimator: &dyn JoinCostEstimator,
 ) -> Result<LogicalPlan> {
     let mut best_graph: Option<PrecedenceTreeNode> = None;
@@ -164,7 +164,7 @@ impl QueryNode {
 struct PrecedenceTreeNode<'graph> {
     query_nodes: Vec<QueryNode>,
     children: Vec<PrecedenceTreeNode<'graph>>,
-    query_graph: &'graph QueryGraph,
+    query_graph: &'graph JoinGraph,
 }
 
 impl Debug for PrecedenceTreeNode<'_> {
@@ -179,7 +179,7 @@ impl Debug for PrecedenceTreeNode<'_> {
 impl<'graph> PrecedenceTreeNode<'graph> {
     /// Creates a precedence tree from a query graph.
     pub(crate) fn from_query_graph(
-        graph: &'graph QueryGraph,
+        graph: &'graph JoinGraph,
         root_id: NodeId,
         cost_estimator: &dyn JoinCostEstimator,
     ) -> Result<Self> {
@@ -199,7 +199,7 @@ impl<'graph> PrecedenceTreeNode<'graph> {
     fn from_query_node(
         node_id: NodeId,
         selectivity: f64,
-        query_graph: &'graph QueryGraph,
+        query_graph: &'graph JoinGraph,
         remaining: &mut HashSet<NodeId>,
         cost_estimator: &dyn JoinCostEstimator,
         is_root: bool,
@@ -364,7 +364,7 @@ impl<'graph> PrecedenceTreeNode<'graph> {
     /// Converts the precedence tree chain into a DataFusion `LogicalPlan`.
     pub(crate) fn into_logical_plan(
         self,
-        query_graph: &QueryGraph,
+        query_graph: &JoinGraph,
     ) -> Result<LogicalPlan> {
         let current_node_id = self.query_nodes[0].node_id;
         let mut current_plan = query_graph
