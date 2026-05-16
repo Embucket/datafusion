@@ -20,6 +20,11 @@ use datafusion_expr::{Expr, JoinType, LogicalPlan};
 
 use super::join_graph::Edge;
 
+/// Fraction of preserved-side rows estimated to survive a semi/anti join
+/// when column NDV statistics are unavailable. Mirrors DuckDB's
+/// `CardinalityEstimator::DEFAULT_SEMI_ANTI_SELECTIVITY = 1/5`.
+const DEFAULT_SEMI_ANTI_SELECTIVITY: f64 = 0.2;
+
 pub trait JoinCostEstimator: std::fmt::Debug {
     /// Cardinality of `plan`.
     ///
@@ -32,14 +37,27 @@ pub trait JoinCostEstimator: std::fmt::Debug {
 
     /// Estimated selectivity of joining `left` with `right` via `edge`.
     ///
-    /// Default: `1 / max(NDV(left.key), NDV(right.key))` for inner equi-joins
-    /// when both NDVs are available; otherwise a per-join-type constant.
+    /// Default: `1 / max(NDV(left.key), NDV(right.key))` for equi-joins
+    /// (inner and semi/anti) when both NDVs are available; otherwise a
+    /// per-join-type constant.
     fn selectivity(&self, edge: &Edge, left: &LogicalPlan, right: &LogicalPlan) -> f64 {
         let fallback = match edge.join_type {
             JoinType::Inner => 0.1,
+            JoinType::LeftSemi
+            | JoinType::LeftAnti
+            | JoinType::RightSemi
+            | JoinType::RightAnti => DEFAULT_SEMI_ANTI_SELECTIVITY,
             _ => 1.0,
         };
-        if edge.join_type != JoinType::Inner || edge.on.is_empty() {
+        let is_eq_join = matches!(
+            edge.join_type,
+            JoinType::Inner
+                | JoinType::LeftSemi
+                | JoinType::LeftAnti
+                | JoinType::RightSemi
+                | JoinType::RightAnti
+        );
+        if !is_eq_join || edge.on.is_empty() {
             return fallback;
         }
         // Use only the first equi-pair. Compounding pairwise selectivities
@@ -51,8 +69,26 @@ pub trait JoinCostEstimator: std::fmt::Debug {
         };
         let ndv_a = ndv_for(self, col_a, left, right);
         let ndv_b = ndv_for(self, col_b, left, right);
-        match (ndv_a, ndv_b) {
-            (Some(a), Some(b)) if a.max(b) > 0.0 => 1.0 / a.max(b),
+        match edge.join_type {
+            JoinType::Inner => match (ndv_a, ndv_b) {
+                (Some(a), Some(b)) if a.max(b) > 0.0 => 1.0 / a.max(b),
+                _ => fallback,
+            },
+            // Semi/anti containment estimator: surviving fraction of the
+            // preserved side ≈ `min(NDV_preserved, NDV_filtering) / NDV_preserved`.
+            // Edges normalized by `flatten_joins_recursive` always have
+            // `on = (preserved_key, filtering_key)`, so the preserved
+            // NDV is `ndv_a` for Left{Semi,Anti}. RightSemi/RightAnti
+            // shouldn't appear in graph edges (they get normalized) but
+            // are handled defensively.
+            JoinType::LeftSemi | JoinType::LeftAnti => match (ndv_a, ndv_b) {
+                (Some(a), Some(b)) if a > 0.0 => (a.min(b) / a).min(1.0),
+                _ => fallback,
+            },
+            JoinType::RightSemi | JoinType::RightAnti => match (ndv_a, ndv_b) {
+                (Some(a), Some(b)) if b > 0.0 => (a.min(b) / b).min(1.0),
+                _ => fallback,
+            },
             _ => fallback,
         }
     }
@@ -170,6 +206,31 @@ fn estimate_cardinality(plan: &LogicalPlan, column: Option<&Column>) -> Result<f
                         ),
                     }
                 }
+            }
+        }
+        // Semi/anti joins do not grow rows: the output cardinality is
+        // bounded by the preserved side. We size them via the
+        // `DEFAULT_SEMI_ANTI_SELECTIVITY` heuristic. NDV queries on the
+        // output route to whichever side is preserved.
+        LogicalPlan::Join(j)
+            if matches!(
+                j.join_type,
+                JoinType::LeftSemi
+                    | JoinType::LeftAnti
+                    | JoinType::RightSemi
+                    | JoinType::RightAnti
+            ) =>
+        {
+            let preserved = match j.join_type {
+                JoinType::LeftSemi | JoinType::LeftAnti => &j.left,
+                _ => &j.right,
+            };
+            match column {
+                None => {
+                    let rows = estimate_cardinality(preserved, None)?;
+                    Ok(rows * DEFAULT_SEMI_ANTI_SELECTIVITY)
+                }
+                Some(c) => estimate_cardinality(preserved, Some(c)),
             }
         }
         x => {

@@ -17,7 +17,9 @@
 
 use std::sync::Arc;
 
-use datafusion_common::{DataFusionError, NullEquality, Result, plan_err};
+use datafusion_common::{
+    DataFusionError, NullEquality, Result, plan_datafusion_err, plan_err,
+};
 use datafusion_expr::{
     Expr, JoinType, LogicalPlan,
     utils::{check_all_columns_from_schema, split_conjunction_owned},
@@ -58,6 +60,21 @@ impl Node {
 
 pub type EdgeId = usize;
 
+/// An edge connecting two nodes in the join graph.
+///
+/// For symmetric edges (`join_type == JoinType::Inner`), the order of
+/// `nodes` carries no semantic meaning; either side may end up on the
+/// physical left or right after reordering.
+///
+/// For asymmetric edges (`LeftSemi` / `LeftAnti`, established by
+/// `flatten_joins_recursive`), the order is load-bearing: `nodes[0]` is
+/// always the preserved (LHS) relation that contributes rows to the
+/// output, and `nodes[1]` is always the RHS blob that acts as a filter.
+/// `RightSemi` / `RightAnti` joins are normalized to the `Left` variants
+/// at extraction time so the optimizer interior only ever sees this
+/// orientation. The reconstruction code in
+/// `left_deep_join_plan::into_logical_plan` relies on this invariant to
+/// orient the rebuilt `Join` correctly.
 pub struct Edge {
     pub nodes: [NodeId; 2],
     pub on: Vec<(Expr, Expr)>,
@@ -381,7 +398,127 @@ fn flatten_joins_recursive(plan: LogicalPlan, join_graph: &mut JoinGraph) -> Res
 
             Ok(())
         }
-        // Non-inner joins (Left/Right/Full/Semi/Anti/Mark) are not freely
+        // Semi/anti joins (Left and Right variants) decompose
+        // asymmetrically: the preserved side participates in reordering
+        // normally, while the filtering side becomes one opaque blob.
+        // The semi/anti edge then connects the LHS node that owns the
+        // join key(s) to the blob. This mirrors DuckDB's relation_manager
+        // logic at relation_manager.cpp:334-346.
+        //
+        // Right{Semi,Anti} are normalized to Left{Semi,Anti} here by
+        // flipping the join's children and on-keys.
+        //
+        // If the LHS key(s) span more than one already-extracted sub-
+        // relation (multi-LHS semi), the resulting join graph would be
+        // cyclic and IK84 cannot handle it. We fall back to opaque in
+        // that case.
+        LogicalPlan::Join(join)
+            if matches!(
+                join.join_type,
+                JoinType::LeftSemi
+                    | JoinType::LeftAnti
+                    | JoinType::RightSemi
+                    | JoinType::RightAnti
+            ) =>
+        {
+            // Pre-flight multi-LHS guard. We inspect the qualifiers on
+            // the LHS key columns *before* recursing into the LHS
+            // subtree, because we cannot cleanly undo a recursive flatten.
+            // If the LHS key columns reference more than one distinct
+            // table qualifier, we treat the whole join as opaque.
+            let (lhs_child, rhs_child, semi_join_type, on) = match join.join_type {
+                JoinType::RightSemi | JoinType::RightAnti => (
+                    Arc::clone(&join.right),
+                    Arc::clone(&join.left),
+                    join.join_type.swap(),
+                    join.on
+                        .iter()
+                        .map(|(l, r)| (r.clone(), l.clone()))
+                        .collect::<Vec<_>>(),
+                ),
+                _ => (
+                    Arc::clone(&join.left),
+                    Arc::clone(&join.right),
+                    join.join_type,
+                    join.on.clone(),
+                ),
+            };
+
+            // Collect the table qualifiers of every LHS key column. We
+            // require exactly one distinct qualifier: zero means at
+            // least one column is unqualified (can't safely identify the
+            // owner pre-flight), more than one means multi-LHS. Either
+            // case falls back to opaque.
+            let lhs_qualifiers: std::collections::HashSet<_> = on
+                .iter()
+                .flat_map(|(lhs_key, _)| lhs_key.column_refs())
+                .map(|c| c.relation.clone())
+                .collect();
+            if lhs_qualifiers.len() != 1 || lhs_qualifiers.contains(&None) {
+                join_graph.add_node(Arc::new(LogicalPlan::Join(join)));
+                return Ok(());
+            }
+
+            // Recurse into the LHS subtree, then attach the blob.
+            flatten_joins_recursive(Arc::unwrap_or_clone(lhs_child), join_graph)?;
+            let blob_id = join_graph.add_node(rhs_child);
+
+            // Find the single LHS-side node that owns the join key(s).
+            // With the single-qualifier guard above this should be a
+            // unique owner per key, with all keys agreeing. Any deviation
+            // is an internal-invariant error.
+            let mut lhs_owner: Option<NodeId> = None;
+            for (lhs_key, _) in &on {
+                let lhs_cols = lhs_key.column_refs();
+                let owners: Vec<NodeId> = join_graph
+                    .nodes()
+                    .filter(|(id, _)| *id != blob_id)
+                    .filter_map(|(id, node)| {
+                        check_all_columns_from_schema(
+                            &lhs_cols,
+                            node.plan.schema().as_ref(),
+                        )
+                        .unwrap_or(false)
+                        .then_some(id)
+                    })
+                    .collect();
+                if owners.len() != 1 {
+                    return plan_err!(
+                        "Semi/anti join LHS key {} has {} candidate owner(s) \
+                         among extracted left-side nodes; expected exactly 1",
+                        lhs_key,
+                        owners.len()
+                    );
+                }
+                let owner = owners[0];
+                match lhs_owner {
+                    None => lhs_owner = Some(owner),
+                    Some(prev) if prev != owner => {
+                        return plan_err!(
+                            "Semi/anti join LHS keys span multiple sub-relations after \
+                             extraction; this should have been caught by the multi-LHS guard"
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            let lhs_owner = lhs_owner.ok_or_else(|| {
+                plan_datafusion_err!(
+                    "Semi/anti join has no equi-keys; cannot determine LHS owner"
+                )
+            })?;
+
+            // Convention: nodes[0] = LHS owner, nodes[1] = blob.
+            join_graph.add_edge(
+                lhs_owner,
+                blob_id,
+                on,
+                semi_join_type,
+                join.null_equality,
+            );
+            Ok(())
+        }
+        // Other non-inner joins (Left/Right/Full/Mark) are not freely
         // reorderable, so the entire join subtree becomes one opaque leaf.
         LogicalPlan::Join(join) => {
             join_graph.add_node(Arc::new(LogicalPlan::Join(join)));
@@ -675,8 +812,8 @@ mod tests {
         Ok(())
     }
 
-    /// If the root of the plan is a non-inner join, the whole plan collapses
-    /// into a single opaque leaf.
+    /// If the root of the plan is a non-inner join (and not a semi/anti),
+    /// the whole plan collapses into a single opaque leaf.
     #[test]
     fn test_root_non_inner_join_is_single_node() -> Result<(), DataFusionError> {
         let customer = scan_tpch_table("customer");
@@ -703,6 +840,206 @@ mod tests {
         assert!(matches!(
             only_node.plan.as_ref(),
             LogicalPlan::Join(j) if j.join_type == JoinType::Left
+        ));
+
+        Ok(())
+    }
+
+    /// LeftSemi joins decompose asymmetrically: the LHS subtree (an
+    /// inner-join chain) is flattened normally, the RHS becomes one
+    /// opaque blob, and a `LeftSemi` edge connects the LHS node that
+    /// owns the join key to the blob.
+    #[test]
+    fn test_leftsemi_decomposes_asymmetrically() -> Result<(), DataFusionError> {
+        let customer = scan_tpch_table("customer");
+        let orders = scan_tpch_table("orders");
+        let lineitem = scan_tpch_table("lineitem");
+
+        // Subquery returning l_orderkey only.
+        let subquery = LogicalPlanBuilder::from(lineitem)
+            .aggregate(vec![col("l_orderkey")], vec![sum(col("l_quantity"))])
+            .unwrap()
+            .project(vec![col("l_orderkey")])
+            .unwrap()
+            .build()
+            .unwrap();
+
+        // LeftSemi(Inner(customer, orders), subquery) on o_orderkey.
+        let plan = LogicalPlanBuilder::from(customer)
+            .join(
+                orders,
+                JoinType::Inner,
+                (vec!["c_custkey"], vec!["o_custkey"]),
+                None,
+            )
+            .unwrap()
+            .join(
+                subquery,
+                JoinType::LeftSemi,
+                (vec!["o_orderkey"], vec!["l_orderkey"]),
+                None,
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let join_graph = JoinGraph::try_from_logical_plan(plan)?.0;
+
+        // 3 nodes (customer, orders, blob); 2 edges (inner + semi).
+        assert_eq!(join_graph.nodes().count(), 3);
+        assert_eq!(join_graph.edges.iter().count(), 2);
+
+        // Locate the semi edge and check orientation: nodes[0] should be
+        // the node owning o_orderkey (orders); nodes[1] should be the blob.
+        let semi_edges: Vec<&Edge> = join_graph
+            .edges
+            .iter()
+            .map(|(_, e)| e)
+            .filter(|e| e.join_type == JoinType::LeftSemi)
+            .collect();
+        assert_eq!(semi_edges.len(), 1);
+
+        let lhs_node = join_graph.get_node(semi_edges[0].nodes[0]).unwrap();
+        let blob_node = join_graph.get_node(semi_edges[0].nodes[1]).unwrap();
+        let lhs_field_names: Vec<&str> = lhs_node
+            .plan
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        assert!(
+            lhs_field_names.contains(&"o_orderkey"),
+            "semi edge nodes[0] should own o_orderkey, got fields: {lhs_field_names:?}"
+        );
+        let blob_field_names: Vec<&str> = blob_node
+            .plan
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        assert_eq!(blob_field_names, vec!["l_orderkey"]);
+
+        Ok(())
+    }
+
+    /// RightSemi joins are normalized to LeftSemi by flipping the join's
+    /// children at extraction time, so the optimizer interior only ever
+    /// sees Left{Semi,Anti}.
+    #[test]
+    fn test_rightsemi_normalized_to_leftsemi() -> Result<(), DataFusionError> {
+        let customer = scan_tpch_table("customer");
+        let lineitem = scan_tpch_table("lineitem");
+        let orders = scan_tpch_table("orders");
+
+        let subquery = LogicalPlanBuilder::from(lineitem)
+            .aggregate(vec![col("l_orderkey")], vec![sum(col("l_quantity"))])
+            .unwrap()
+            .project(vec![col("l_orderkey")])
+            .unwrap()
+            .build()
+            .unwrap();
+
+        // RightSemi: the subquery is the LHS (filtering side), the
+        // inner-join chain is the RHS (preserved side).
+        let plan = LogicalPlanBuilder::from(subquery)
+            .join(
+                LogicalPlanBuilder::from(customer)
+                    .join(
+                        orders,
+                        JoinType::Inner,
+                        (vec!["c_custkey"], vec!["o_custkey"]),
+                        None,
+                    )
+                    .unwrap()
+                    .build()
+                    .unwrap(),
+                JoinType::RightSemi,
+                (vec!["l_orderkey"], vec!["o_orderkey"]),
+                None,
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let join_graph = JoinGraph::try_from_logical_plan(plan)?.0;
+
+        assert_eq!(join_graph.nodes().count(), 3);
+        assert_eq!(join_graph.edges.iter().count(), 2);
+
+        let semi_edges: Vec<&Edge> = join_graph
+            .edges
+            .iter()
+            .map(|(_, e)| e)
+            .filter(|e| matches!(e.join_type, JoinType::LeftSemi | JoinType::RightSemi))
+            .collect();
+        assert_eq!(semi_edges.len(), 1);
+        assert_eq!(
+            semi_edges[0].join_type,
+            JoinType::LeftSemi,
+            "RightSemi should have been normalized to LeftSemi"
+        );
+
+        Ok(())
+    }
+
+    /// A LeftSemi whose LHS keys span more than one already-extracted
+    /// sub-relation cannot be represented as a tree-edge in the join
+    /// graph (IK84 requires a tree). The multi-LHS guard falls back to
+    /// treating the entire join as one opaque leaf.
+    #[test]
+    fn test_multi_lhs_leftsemi_falls_back_to_opaque() -> Result<(), DataFusionError> {
+        let customer = scan_tpch_table("customer");
+        let orders = scan_tpch_table("orders");
+
+        // Subquery that exposes two columns (one matching customer,
+        // one matching orders).
+        let subquery = LogicalPlanBuilder::from(scan_tpch_table("orders"))
+            .project(vec![col("o_custkey"), col("o_orderkey")])
+            .unwrap()
+            .build()
+            .unwrap();
+
+        // LeftSemi where LHS key spans BOTH customer AND orders:
+        //   (Inner(customer, orders))  LEFTSEMI  subquery
+        //     ON customer.c_custkey = subquery.o_custkey
+        //    AND orders.o_orderkey  = subquery.o_orderkey
+        let plan = LogicalPlanBuilder::from(customer)
+            .join(
+                orders,
+                JoinType::Inner,
+                (vec!["c_custkey"], vec!["o_custkey"]),
+                None,
+            )
+            .unwrap()
+            .join(
+                subquery,
+                JoinType::LeftSemi,
+                (
+                    vec!["c_custkey", "o_orderkey"],
+                    vec!["o_custkey", "o_orderkey"],
+                ),
+                None,
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let join_graph = JoinGraph::try_from_logical_plan(plan)?.0;
+
+        // Multi-LHS guard: the entire join becomes one opaque node.
+        assert_eq!(
+            join_graph.nodes().count(),
+            1,
+            "multi-LHS LeftSemi should collapse to one opaque node"
+        );
+        assert_eq!(join_graph.edges.iter().count(), 0);
+
+        let only_node = join_graph.nodes().next().unwrap().1;
+        assert!(matches!(
+            only_node.plan.as_ref(),
+            LogicalPlan::Join(j) if j.join_type == JoinType::LeftSemi
         ));
 
         Ok(())

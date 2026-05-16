@@ -18,7 +18,7 @@
 use std::{collections::HashSet, fmt::Debug, sync::Arc};
 
 use datafusion_common::{Result, plan_datafusion_err, plan_err};
-use datafusion_expr::{Expr, Filter, JoinConstraint, LogicalPlan};
+use datafusion_expr::{Expr, Filter, JoinConstraint, JoinType, LogicalPlan};
 
 use crate::reorder_join::{
     cost::JoinCostEstimator,
@@ -187,28 +187,30 @@ impl<'graph> PrecedenceTreeNode<'graph> {
         remaining.remove(&root_id);
         PrecedenceTreeNode::from_query_node(
             root_id,
-            1.0,
+            None,
             graph,
             &mut remaining,
             cost_estimator,
-            true,
         )
     }
 
     /// Recursively constructs a precedence tree node from a query graph node.
+    ///
+    /// `incoming` carries the IK84 T- and C-values contributed by the edge
+    /// that brought us to this node; `None` marks the root (`T = |root|`,
+    /// `C = 0`). For non-root nodes the parent's `filter_map` computes
+    /// these before recursing, since only the parent has the `Edge` in
+    /// scope.
     fn from_query_node(
         node_id: NodeId,
-        selectivity: f64,
+        incoming: Option<(f64, f64)>,
         query_graph: &'graph JoinGraph,
         remaining: &mut HashSet<NodeId>,
         cost_estimator: &dyn JoinCostEstimator,
-        is_root: bool,
     ) -> Result<Self> {
         let node = query_graph
             .get_node(node_id)
             .ok_or_else(|| plan_datafusion_err!("Root node not found"))?;
-        let input_cardinality =
-            cost_estimator.cardinality(&node.plan, None).unwrap_or(1.0);
 
         let children = node
             .connections()
@@ -222,28 +224,53 @@ impl<'graph> PrecedenceTreeNode<'graph> {
 
                 remaining.remove(&other);
                 let other_plan = &query_graph.get_node(other)?.plan;
-                let child_selectivity =
-                    cost_estimator.selectivity(edge, &node.plan, other_plan);
+                let sel = cost_estimator.selectivity(edge, &node.plan, other_plan);
+                // IK84 per-step T (cardinality multiplier) and C (cost).
+                //   inner:    T = sel × |other|,  C = cost(sel, |other|)
+                //   semi/anti: T = sel,           C = |blob|  (hash-table
+                //     build cost — independent of traversal direction; the
+                //     blob is `edge.nodes[1]` by convention, see the `Edge`
+                //     doc in `join_graph.rs`)
+                let (child_t, child_c) = match edge.join_type {
+                    JoinType::LeftSemi
+                    | JoinType::LeftAnti
+                    | JoinType::RightSemi
+                    | JoinType::RightAnti => {
+                        let blob_plan = &query_graph.get_node(edge.nodes[1])?.plan;
+                        let blob_card =
+                            cost_estimator.cardinality(blob_plan, None).unwrap_or(1.0);
+                        (sel, blob_card)
+                    }
+                    _ => {
+                        let other_card =
+                            cost_estimator.cardinality(other_plan, None).unwrap_or(1.0);
+                        (sel * other_card, cost_estimator.cost(sel, other_card))
+                    }
+                };
                 Some(PrecedenceTreeNode::from_query_node(
                     other,
-                    child_selectivity,
+                    Some((child_t, child_c)),
                     query_graph,
                     remaining,
                     cost_estimator,
-                    false,
                 ))
             })
             .collect::<Result<Vec<_>>>()?;
 
+        let (t_value, c_value) = match incoming {
+            Some(tc) => tc,
+            None => {
+                let root_card =
+                    cost_estimator.cardinality(&node.plan, None).unwrap_or(1.0);
+                (root_card, 0.0)
+            }
+        };
+
         Ok(PrecedenceTreeNode {
             query_nodes: vec![QueryNode {
                 node_id,
-                selectivity: (selectivity * input_cardinality),
-                cost: if is_root {
-                    0.0
-                } else {
-                    cost_estimator.cost(selectivity, input_cardinality)
-                },
+                selectivity: t_value,
+                cost: c_value,
             }],
             children,
             query_graph,
@@ -411,12 +438,30 @@ impl<'graph> PrecedenceTreeNode<'graph> {
                 })?;
 
             // Determine if the join order was swapped compared to the original edge.
-            // We check whether qualified columns from the equi-join expressions
-            // belong to the current (left) or next (right) schema.
+            //
+            // For semi/anti edges the answer is dictated by the
+            // `nodes[0] = LHS, nodes[1] = blob` invariant set up by
+            // `flatten_joins_recursive` (see `Edge` doc): the preserved
+            // side must always be the physical LEFT of the rebuilt
+            // join. If the node we're about to add is the LHS owner
+            // (`nodes[0]`), then the chain-so-far must be the blob and
+            // we need to swap.
+            //
+            // For symmetric (inner) edges we fall back to schema-column
+            // membership, since neither side has a canonical "preserved"
+            // role.
             let current_schema = current_plan.schema();
             let next_schema = next_plan.schema();
 
-            let join_order_swapped = if !edge.on.is_empty() {
+            let join_order_swapped = if matches!(
+                edge.join_type,
+                JoinType::LeftSemi
+                    | JoinType::LeftAnti
+                    | JoinType::RightSemi
+                    | JoinType::RightAnti
+            ) {
+                next_node_id == edge.nodes[0]
+            } else if !edge.on.is_empty() {
                 let (left_expr, right_expr) = &edge.on[0];
                 let left_columns = left_expr.column_refs();
                 let right_columns = right_expr.column_refs();
@@ -595,6 +640,123 @@ mod tests {
             optimal_left_deep_join_plan(plan, &TestCostEstimator).unwrap();
 
         assert!(matches!(optimized_plan, LogicalPlan::Limit(_)));
+
+        Ok(())
+    }
+
+    /// Cost estimator with hardcoded TPC-H SF=1 row counts so the IK84
+    /// algorithm has something to discriminate on. `scan_tpch_table`
+    /// builds `TableScan`s without `TableSource::statistics()`, so we
+    /// shortcut by recognizing the table names directly.
+    #[derive(Debug)]
+    struct MockStatsEstimator;
+
+    impl JoinCostEstimator for MockStatsEstimator {
+        fn cardinality(
+            &self,
+            plan: &LogicalPlan,
+            column: Option<&datafusion_common::Column>,
+        ) -> Option<f64> {
+            // NDV queries: fall back to selectivity heuristic.
+            if column.is_some() {
+                return None;
+            }
+            match plan {
+                LogicalPlan::TableScan(s) => match s.table_name.table() {
+                    "customer" => Some(150_000.0),
+                    "orders" => Some(1_500_000.0),
+                    "lineitem" => Some(6_001_215.0),
+                    _ => None,
+                },
+                LogicalPlan::Filter(_) => {
+                    let inputs = plan.inputs();
+                    self.cardinality(inputs[0], None).map(|c| c * 0.1)
+                }
+                LogicalPlan::Aggregate(_) => {
+                    let inputs = plan.inputs();
+                    self.cardinality(inputs[0], None).map(|c| c * 0.1)
+                }
+                other => {
+                    let inputs = other.inputs();
+                    if inputs.len() == 1 {
+                        self.cardinality(inputs[0], None)
+                    } else {
+                        None
+                    }
+                }
+            }
+        }
+    }
+
+    /// Q18-shape plan: `LeftSemi(Inner(Inner(customer, orders), lineitem),
+    /// aggregated_lineitem_subquery)`. With SF=1 statistics the
+    /// `aggregated_lineitem` blob is several orders of magnitude smaller
+    /// than `orders` and `lineitem`, so the semi join must be placed
+    /// first in the optimized chain (filtering `orders` early). After
+    /// reorder, the deepest (left-most, first-executed) join in the
+    /// left-deep tree must be the LeftSemi / RightSemi.
+    #[test]
+    fn test_q18_shape_leftsemi_reorders_first() -> Result<()> {
+        use datafusion_expr::test::function_stub::sum;
+        use datafusion_expr::{col, lit};
+
+        let customer = scan_tpch_table("customer");
+        let orders = scan_tpch_table("orders");
+        let lineitem = scan_tpch_table("lineitem");
+
+        // Aggregated subquery blob.
+        let subquery = LogicalPlanBuilder::from(scan_tpch_table("lineitem"))
+            .aggregate(vec![col("l_orderkey")], vec![sum(col("l_quantity"))])?
+            .filter(sum(col("l_quantity")).gt(lit(300)))?
+            .project(vec![col("l_orderkey")])?
+            .build()?;
+
+        // Build the post-decorrelation Q18 join shape directly so we don't
+        // depend on the optimizer chain run by the test above.
+        let plan = LogicalPlanBuilder::from(customer)
+            .join(
+                orders,
+                JoinType::Inner,
+                (vec!["c_custkey"], vec!["o_custkey"]),
+                None,
+            )?
+            .join(
+                lineitem,
+                JoinType::Inner,
+                (vec!["o_orderkey"], vec!["l_orderkey"]),
+                None,
+            )?
+            .join(
+                subquery,
+                JoinType::LeftSemi,
+                (vec!["o_orderkey"], vec!["l_orderkey"]),
+                None,
+            )?
+            .build()?;
+
+        let optimized = optimal_left_deep_join_plan(plan, &MockStatsEstimator)?;
+
+        // Walk the left spine of the left-deep tree to find the deepest
+        // (first-executed) join.
+        fn deepest_join(plan: &LogicalPlan) -> Option<&datafusion_expr::Join> {
+            match plan {
+                LogicalPlan::Join(j) => deepest_join(&j.left).or(Some(j)),
+                other => other.inputs().first().and_then(|p| deepest_join(p)),
+            }
+        }
+
+        let innermost = deepest_join(&optimized).expect("expected at least one Join");
+
+        assert!(
+            matches!(
+                innermost.join_type,
+                JoinType::LeftSemi | JoinType::RightSemi
+            ),
+            "expected deepest join to be a semi join (placed first in the chain), \
+             got {:?} in plan:\n{}",
+            innermost.join_type,
+            optimized.display_indent()
+        );
 
         Ok(())
     }
