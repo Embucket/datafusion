@@ -23,7 +23,7 @@ use std::sync::Arc;
 use crate::TableProvider;
 
 use arrow::datatypes::SchemaRef;
-use datafusion_common::{Constraints, internal_err};
+use datafusion_common::{Constraints, Statistics, internal_err};
 use datafusion_expr::{Expr, TableProviderFilterPushDown, TableSource, TableType};
 
 /// Implements [`TableSource`] for a [`TableProvider`]
@@ -76,6 +76,10 @@ impl TableSource for DefaultTableSource {
 
     fn get_column_default(&self, column: &str) -> Option<&Expr> {
         self.table_provider.get_column_default(column)
+    }
+
+    fn statistics(&self) -> Option<Statistics> {
+        self.table_provider.statistics()
     }
 }
 

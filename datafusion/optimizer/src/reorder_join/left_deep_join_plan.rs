@@ -207,7 +207,8 @@ impl<'graph> PrecedenceTreeNode<'graph> {
         let node = query_graph
             .get_node(node_id)
             .ok_or_else(|| plan_datafusion_err!("Root node not found"))?;
-        let input_cardinality = cost_estimator.cardinality(&node.plan).unwrap_or(1.0);
+        let input_cardinality =
+            cost_estimator.cardinality(&node.plan, None).unwrap_or(1.0);
 
         let children = node
             .connections()
@@ -220,7 +221,9 @@ impl<'graph> PrecedenceTreeNode<'graph> {
                     .find(|x| *x != node_id && remaining.contains(x))?;
 
                 remaining.remove(&other);
-                let child_selectivity = cost_estimator.selectivity(edge);
+                let other_plan = &query_graph.get_node(other)?.plan;
+                let child_selectivity =
+                    cost_estimator.selectivity(edge, &node.plan, other_plan);
                 Some(PrecedenceTreeNode::from_query_node(
                     other,
                     child_selectivity,

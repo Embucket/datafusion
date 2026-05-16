@@ -20,7 +20,7 @@
 use crate::{Expr, LogicalPlan};
 
 use arrow::datatypes::SchemaRef;
-use datafusion_common::{Constraints, Result};
+use datafusion_common::{Constraints, Result, Statistics};
 
 use std::{any::Any, borrow::Cow};
 
@@ -125,6 +125,14 @@ pub trait TableSource: Any + Sync + Send {
 
     /// Get the default value for a column, if available.
     fn get_column_default(&self, _column: &str) -> Option<&Expr> {
+        None
+    }
+
+    /// Get statistics for this table, if available
+    /// Although not presently used in mainline DataFusion, this allows implementation specific
+    /// behavior for downstream repositories, in conjunction with specialized optimizer rules to
+    /// perform operations such as re-ordering of joins.
+    fn statistics(&self) -> Option<Statistics> {
         None
     }
 }
