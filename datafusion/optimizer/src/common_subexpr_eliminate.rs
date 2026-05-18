@@ -836,12 +836,12 @@ mod test {
     use std::any::Any;
     use std::iter;
 
-    use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+    use arrow::datatypes::{DataType, Field, Schema};
     use datafusion_expr::logical_plan::{JoinType, table_scan};
     use datafusion_expr::window_frame::WindowFrame;
     use datafusion_expr::{
         AccumulatorFactoryFunction, AggregateUDF, ColumnarValue, ScalarFunctionArgs,
-        ScalarUDF, ScalarUDFImpl, Signature, SimpleAggregateUDF, TableSource, Volatility,
+        ScalarUDF, ScalarUDFImpl, Signature, SimpleAggregateUDF, Volatility,
         grouping_set, is_null, not,
     };
     use datafusion_expr::{lit, logical_plan::builder::LogicalPlanBuilder};
