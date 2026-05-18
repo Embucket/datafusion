@@ -20,3 +20,6 @@
 pub mod cost;
 pub mod join_graph;
 pub mod left_deep_join_plan;
+pub mod rule;
+
+pub use rule::ReorderJoinRule;
