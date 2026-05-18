@@ -159,7 +159,11 @@ struct QueryNode {
 
 impl QueryNode {
     fn rank(&self) -> f64 {
-        (self.selectivity - 1.0) / self.cost
+        if self.cost == 0.0 {
+            0.0
+        } else {
+            (self.selectivity - 1.0) / self.cost
+        }
     }
 }
 

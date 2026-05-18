@@ -144,24 +144,61 @@ fn estimate_cardinality(plan: &LogicalPlan, column: Option<&Column>) -> Result<f
         },
         LogicalPlan::Aggregate(agg) => match column {
             None => {
+                // Ungrouped aggregate → exactly 1 row.
+                if agg.group_expr.is_empty() {
+                    return Ok(1.0);
+                }
                 let input = estimate_cardinality(&agg.input, None)?;
-                Ok(0.1 * input)
+                // Per-group-key NDV from the child plan, where available.
+                // Mirrors duckdb's `ExtractAggregationStats`
+                // (relation_statistics_helper.cpp:380-415): start with the
+                // product of per-key NDVs, apply a correlation correction,
+                // then use the Occupancy-Problem formula to estimate the
+                // number of group-key tuples actually occupied given
+                // `input` rows.
+                let ndvs: Vec<f64> = agg
+                    .group_expr
+                    .iter()
+                    .filter_map(|e| match e {
+                        Expr::Column(c) => Some(c),
+                        _ => None,
+                    })
+                    .filter_map(|c| estimate_cardinality(&agg.input, Some(c)).ok())
+                    .map(|n| if n <= 0.0 { 1.0 } else { n })
+                    .collect();
+                if ndvs.is_empty() || ndvs.len() < agg.group_expr.len() {
+                    // No (or partial) per-key NDV. Half the input is a
+                    // less-pessimistic default than `0.1 * input`, matching
+                    // duckdb's fallback at relation_statistics_helper.cpp:394.
+                    return Ok((input / 2.0).max(1.0));
+                }
+                let product: f64 = ndvs.iter().product();
+                let correction = 0.95_f64.powi((ndvs.len() as i32) - 1);
+                let product = product * correction;
+                let mult = 1.0 - (-input / product).exp();
+                let new_card = if mult == 0.0 { input } else { product * mult };
+                Ok(new_card.min(input).max(1.0))
             }
             Some(c) => {
                 // Group-by keys are unique in the aggregate's output, so
                 // NDV(group_key) equals the post-aggregate row count.
+                // Match by column name only — a SubqueryAlias wrapping the
+                // aggregate rewrites the relation prefix, so a strict
+                // `relation == relation` comparison would miss legitimate
+                // group keys.
                 let is_group_key = agg.group_expr.iter().any(|e| match e {
-                    Expr::Column(g) => g.name == c.name && g.relation == c.relation,
+                    Expr::Column(g) => g.name == c.name,
                     _ => false,
                 });
                 if is_group_key {
                     estimate_cardinality(plan, None)
                 } else {
-                    plan_err!(
-                        "Cannot estimate NDV of non-group-by column \
-                         `{}` through Aggregate",
-                        c.name
-                    )
+                    // For non-group columns, the post-aggregate NDV is
+                    // bounded by the row count (most one distinct value per
+                    // output row). Return that as a loose upper bound
+                    // instead of erroring, so callers (e.g.
+                    // `selectivity()`) can still compute a fallback.
+                    estimate_cardinality(plan, None)
                 }
             }
         },
@@ -231,6 +268,48 @@ fn estimate_cardinality(plan: &LogicalPlan, column: Option<&Column>) -> Result<f
                     Ok(rows * DEFAULT_SEMI_ANTI_SELECTIVITY)
                 }
                 Some(c) => estimate_cardinality(preserved, Some(c)),
+            }
+        }
+        // Inner joins (and the cross-product, encoded as Inner with empty
+        // `on`) appear here when an upstream caller asks about a join
+        // subtree that the flattener absorbed as an opaque graph node
+        // (e.g. when a projection or other wrapper sits between joins).
+        // Estimate via the same NDV-of-the-largest-side formula
+        // `selectivity()` uses for inner equi-joins, falling back to 0.1
+        // when NDV is unavailable.
+        LogicalPlan::Join(j) if j.join_type == JoinType::Inner => {
+            let left_card = estimate_cardinality(&j.left, None)?;
+            let right_card = estimate_cardinality(&j.right, None)?;
+            let cross = left_card * right_card;
+            let sel = if let Some((a, b)) = j.on.first() {
+                let ndv_max = match (a, b) {
+                    (Expr::Column(ca), Expr::Column(cb)) => {
+                        let na = estimate_cardinality(&j.left, Some(ca))
+                            .ok()
+                            .or_else(|| estimate_cardinality(&j.right, Some(ca)).ok());
+                        let nb = estimate_cardinality(&j.right, Some(cb))
+                            .ok()
+                            .or_else(|| estimate_cardinality(&j.left, Some(cb)).ok());
+                        match (na, nb) {
+                            (Some(x), Some(y)) if x.max(y) > 0.0 => Some(x.max(y)),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+                ndv_max.map(|n| 1.0 / n).unwrap_or(0.1)
+            } else {
+                1.0
+            };
+            match column {
+                None => Ok((sel * cross).max(1.0)),
+                Some(c) => {
+                    // NDV of a column on the join output is bounded by the
+                    // child-side NDV (joins don't create new distinct values
+                    // for already-existing columns).
+                    estimate_cardinality(&j.left, Some(c))
+                        .or_else(|_| estimate_cardinality(&j.right, Some(c)))
+                }
             }
         }
         x => {
