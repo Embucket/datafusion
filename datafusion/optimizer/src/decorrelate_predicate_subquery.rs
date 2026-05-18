@@ -124,25 +124,26 @@ impl OptimizerRule for DecorrelatePredicateSubquery {
         // Additionally handle subqueries embedded in Join.filter expressions
         if let LogicalPlan::Join(join) = plan {
             if let Some(predicate) = &join.filter
-                && has_subquery(predicate) {
-                    let (new_left, new_predicate) = rewrite_inner_subqueries(
-                        Arc::unwrap_or_clone(join.left),
-                        predicate.clone(),
-                        config,
-                    )?;
+                && has_subquery(predicate)
+            {
+                let (new_left, new_predicate) = rewrite_inner_subqueries(
+                    Arc::unwrap_or_clone(join.left),
+                    predicate.clone(),
+                    config,
+                )?;
 
-                    let new_join = LogicalJoin::try_new(
-                        Arc::new(new_left),
-                        Arc::clone(&join.right),
-                        join.on.clone(),
-                        Some(new_predicate),
-                        join.join_type,
-                        join.join_constraint,
-                        join.null_equality,
-                        join.null_aware,
-                    )?;
-                    return Ok(Transformed::yes(LogicalPlan::Join(new_join)));
-                }
+                let new_join = LogicalJoin::try_new(
+                    Arc::new(new_left),
+                    Arc::clone(&join.right),
+                    join.on.clone(),
+                    Some(new_predicate),
+                    join.join_type,
+                    join.join_constraint,
+                    join.null_equality,
+                    join.null_aware,
+                )?;
+                return Ok(Transformed::yes(LogicalPlan::Join(new_join)));
+            }
             return Ok(Transformed::no(LogicalPlan::Join(join)));
         }
 

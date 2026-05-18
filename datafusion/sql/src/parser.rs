@@ -554,9 +554,10 @@ impl<'a> DFParser<'a> {
                         for offset in [2, 4] {
                             if let Token::Word(w) =
                                 self.parser.peek_nth_token(offset).token
-                                && w.keyword == Keyword::VOLUME {
-                                    return self.parse_and_handle_statement();
-                                }
+                                && w.keyword == Keyword::VOLUME
+                            {
+                                return self.parse_and_handle_statement();
+                            }
                         }
                         self.parser.next_token(); // CREATE
                         self.parse_create()
