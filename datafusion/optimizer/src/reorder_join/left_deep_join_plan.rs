@@ -760,4 +760,108 @@ mod tests {
 
         Ok(())
     }
+
+    /// Walk a plan and verify every `Join.on` column is resolvable in the
+    /// join's own left or right schema.
+    fn assert_join_on_columns_resolvable(plan: &LogicalPlan) {
+        if let LogicalPlan::Join(j) = plan {
+            let left = j.left.schema();
+            let right = j.right.schema();
+            for (lk, rk) in &j.on {
+                for c in lk.column_refs().into_iter().chain(rk.column_refs()) {
+                    let in_left = left.has_column(c)
+                        || left.has_column_with_unqualified_name(&c.name);
+                    let in_right = right.has_column(c)
+                        || right.has_column_with_unqualified_name(&c.name);
+                    assert!(
+                        in_left || in_right,
+                        "Join on-key references `{}` not present in either side.\n\
+                         Left fields:  {:?}\n\
+                         Right fields: {:?}\n\
+                         Full plan:\n{}",
+                        c,
+                        left.fields().iter().map(|f| f.name()).collect::<Vec<_>>(),
+                        right.fields().iter().map(|f| f.name()).collect::<Vec<_>>(),
+                        plan.display_indent()
+                    );
+                }
+            }
+        }
+        for input in plan.inputs() {
+            assert_join_on_columns_resolvable(input);
+        }
+    }
+
+    /// Repro: a single `Join` with a multi-pair `on` where the pairs span
+    /// *different* already-extracted node pairs. Here the outer join has
+    /// `on = [(c_custkey, l_partkey), (o_orderkey, l_orderkey)]` —
+    /// the first pair connects customer↔lineitem, the second connects
+    /// orders↔lineitem. Each reconstructed join must only carry the
+    /// equi-pair(s) whose columns are present in its left and right
+    /// inputs; bundling all pairs into every edge produces joins that
+    /// reference columns missing from their schemas.
+    #[test]
+    fn test_multi_pair_join_keys_split_to_correct_edges() -> Result<()> {
+        let customer = scan_tpch_table("customer");
+        let orders = scan_tpch_table("orders");
+        let lineitem = scan_tpch_table("lineitem");
+
+        let plan = LogicalPlanBuilder::from(customer)
+            .join(
+                orders,
+                JoinType::Inner,
+                (vec!["c_custkey"], vec!["o_custkey"]),
+                None,
+            )?
+            .join(
+                lineitem,
+                JoinType::Inner,
+                (
+                    vec!["c_custkey", "o_orderkey"],
+                    vec!["l_partkey", "l_orderkey"],
+                ),
+                None,
+            )?
+            .build()?;
+
+        let optimized = optimal_left_deep_join_plan(plan, &TestCostEstimator)?;
+        assert_join_on_columns_resolvable(&optimized);
+        Ok(())
+    }
+
+    /// Repro: one outer Join with multi-pair `on` where the two equi-pairs
+    /// connect *different* node pairs after extraction. Without
+    /// per-pair edge construction the customer↔lineitem edge would carry
+    /// the orders↔lineitem keys (and vice-versa), and the resulting
+    /// three edges form a triangle (cycle) that IK84 can't process.
+    #[test]
+    fn test_multi_pair_on_creates_cycle_then_resolves() -> Result<()> {
+        let customer = scan_tpch_table("customer");
+        let orders = scan_tpch_table("orders");
+        let lineitem = scan_tpch_table("lineitem");
+
+        // Outer join `on = [(c_custkey, l_orderkey), (o_orderkey, l_partkey)]`.
+        // Pairs map to: customer↔lineitem AND orders↔lineitem.
+        let plan = LogicalPlanBuilder::from(customer)
+            .join(
+                orders,
+                JoinType::Inner,
+                (vec!["c_custkey"], vec!["o_custkey"]),
+                None,
+            )?
+            .join(
+                lineitem,
+                JoinType::Inner,
+                (
+                    vec!["c_custkey", "o_orderkey"],
+                    vec!["l_orderkey", "l_partkey"],
+                ),
+                None,
+            )?
+            .build()?;
+
+        let optimized = optimal_left_deep_join_plan(plan, &TestCostEstimator)?;
+        assert_join_on_columns_resolvable(&optimized);
+        Ok(())
+    }
 }

@@ -219,6 +219,60 @@ impl JoinGraph {
     pub(crate) fn get_edge(&self, key: EdgeId) -> Option<&Edge> {
         self.edges.get(key)
     }
+
+    /// Returns the id of an edge directly connecting `a` and `b`, if one
+    /// exists.
+    fn find_edge_between(&self, a: NodeId, b: NodeId) -> Option<EdgeId> {
+        let node_a = self.nodes.get(a)?;
+        node_a.connections.iter().copied().find(|&eid| {
+            self.edges
+                .get(eid)
+                .map(|e| e.nodes.contains(&b))
+                .unwrap_or(false)
+        })
+    }
+
+    /// Appends `pairs` to the given edge's `on` list.
+    fn extend_edge_on(&mut self, edge_id: EdgeId, pairs: Vec<(Expr, Expr)>) {
+        if let Some(edge) = self.edges.get_mut(edge_id) {
+            edge.on.extend(pairs);
+        }
+    }
+
+    /// Returns true if a path already connects `from` to `to`, treating
+    /// edges as undirected. Used to detect cycles before adding a new
+    /// edge; if a path exists, the new edge would close a cycle.
+    fn path_exists(&self, from: NodeId, to: NodeId) -> bool {
+        use std::collections::HashSet;
+        if from == to {
+            return true;
+        }
+        let mut visited: HashSet<NodeId> = HashSet::new();
+        let mut stack: Vec<NodeId> = vec![from];
+        while let Some(n) = stack.pop() {
+            if !visited.insert(n) {
+                continue;
+            }
+            if let Some(node) = self.nodes.get(n) {
+                for &eid in &node.connections {
+                    if let Some(edge) = self.edges.get(eid) {
+                        for &neighbour in &edge.nodes {
+                            if neighbour == n {
+                                continue;
+                            }
+                            if neighbour == to {
+                                return true;
+                            }
+                            if !visited.contains(&neighbour) {
+                                stack.push(neighbour);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
 }
 
 /// Extracts the join subtree from a logical plan, separating it from wrapper operators.
@@ -339,18 +393,27 @@ fn flatten_joins_recursive(plan: LogicalPlan, join_graph: &mut JoinGraph) -> Res
                 join_graph,
             )?;
 
-            // Process each equijoin predicate to find which nodes it connects
+            // Group each equi-pair by which two nodes it connects. A
+            // single `Join.on` can mix pairs that span different node-
+            // pairs (e.g. an outer join in a bushy plan whose `on`
+            // contains keys from disjoint sub-trees); putting all pairs
+            // on every edge produces edges that reference columns
+            // missing from their endpoints' schemas, and the resulting
+            // multi-edge structure forms a cycle that IK84 can't
+            // process.
+            use std::collections::HashMap;
+            let mut pairs_by_node_pair: HashMap<(NodeId, NodeId), Vec<(Expr, Expr)>> =
+                HashMap::new();
+            let mut insertion_order: Vec<(NodeId, NodeId)> = Vec::new();
+
             for (left_key, right_key) in &join.on {
-                // Extract column references from both join keys
                 let left_columns = left_key.column_refs();
                 let right_columns = right_key.column_refs();
 
-                // Filter nodes by checking which ones contain the columns from each expression
                 let matching_nodes: Vec<NodeId> = join_graph
                     .nodes()
                     .filter_map(|(node_id, node)| {
                         let schema = node.plan.schema();
-                        // Check if this node's schema contains columns from either left or right key
                         let has_left =
                             check_all_columns_from_schema(&left_columns, schema.as_ref())
                                 .unwrap_or(false);
@@ -359,8 +422,6 @@ fn flatten_joins_recursive(plan: LogicalPlan, join_graph: &mut JoinGraph) -> Res
                             schema.as_ref(),
                         )
                         .unwrap_or(false);
-
-                        // Include node if it contains columns from either key (but not both, as that would be invalid)
                         if (has_left && !has_right) || (!has_left && has_right) {
                             Some(node_id)
                         } else {
@@ -369,7 +430,6 @@ fn flatten_joins_recursive(plan: LogicalPlan, join_graph: &mut JoinGraph) -> Res
                     })
                     .collect();
 
-                // We should have exactly two nodes: one with left_key columns, one with right_key columns
                 if matching_nodes.len() != 2 {
                     return plan_err!(
                         "Could not find exactly two nodes for join predicate: {} = {} (found {} nodes)",
@@ -379,21 +439,49 @@ fn flatten_joins_recursive(plan: LogicalPlan, join_graph: &mut JoinGraph) -> Res
                     );
                 }
 
-                let node_id_a = matching_nodes[0];
-                let node_id_b = matching_nodes[1];
-
-                // Add an edge if one doesn't exist yet
-                if let Some(node_a) = join_graph.get_node(node_id_a)
-                    && node_a.connection_with(node_id_b, join_graph).is_none()
-                {
-                    join_graph.add_edge(
-                        node_id_a,
-                        node_id_b,
-                        join.on.clone(),
-                        join.join_type,
-                        join.null_equality,
-                    );
+                let mut endpoints = [matching_nodes[0], matching_nodes[1]];
+                endpoints.sort();
+                let key = (endpoints[0], endpoints[1]);
+                if !pairs_by_node_pair.contains_key(&key) {
+                    insertion_order.push(key);
                 }
+                pairs_by_node_pair
+                    .entry(key)
+                    .or_default()
+                    .push((left_key.clone(), right_key.clone()));
+            }
+
+            for (node_a, node_b) in insertion_order {
+                let pairs = pairs_by_node_pair.remove(&(node_a, node_b)).unwrap();
+
+                // If a prior recursive call already connected these two
+                // nodes by an edge, merge our pairs into it instead of
+                // adding a parallel edge.
+                if let Some(existing_edge_id) =
+                    join_graph.find_edge_between(node_a, node_b)
+                {
+                    join_graph.extend_edge_on(existing_edge_id, pairs);
+                    continue;
+                }
+
+                // Cycle check: adding this edge would close a cycle.
+                // IK84 needs a tree, so demote the equi-pairs of this
+                // group to side-channel filter conjuncts; they'll be
+                // re-applied as a Filter above the reordered join.
+                if join_graph.path_exists(node_a, node_b) {
+                    for (l, r) in pairs {
+                        join_graph.add_filter(l.eq(r));
+                    }
+                    continue;
+                }
+
+                join_graph.add_edge(
+                    node_a,
+                    node_b,
+                    pairs,
+                    join.join_type,
+                    join.null_equality,
+                );
             }
 
             Ok(())
