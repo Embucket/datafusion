@@ -17,7 +17,7 @@
 
 use std::{collections::HashSet, fmt::Debug, sync::Arc};
 
-use datafusion_common::{Result, plan_datafusion_err, plan_err};
+use datafusion_common::{Result, plan_datafusion_err, plan_err, tree_node::TreeNode};
 use datafusion_expr::{Expr, Filter, JoinConstraint, JoinType, LogicalPlan};
 
 use crate::reorder_join::{
@@ -75,6 +75,13 @@ pub fn optimal_left_deep_join_plan(
     plan: LogicalPlan,
     cost_estimator: &dyn JoinCostEstimator,
 ) -> Result<LogicalPlan> {
+    // No joins anywhere in the plan: nothing to reorder. Returning the
+    // input unchanged lets callers wire this in unconditionally without
+    // having to pre-check.
+    if !plan.exists(|p| Ok(matches!(p, LogicalPlan::Join(_))))? {
+        return Ok(plan);
+    }
+
     // Convert join subtree to query graph
     let (query_graph, wrappers) = JoinGraph::try_from_logical_plan(plan)?;
 
@@ -826,6 +833,24 @@ mod tests {
 
         let optimized = optimal_left_deep_join_plan(plan, &TestCostEstimator)?;
         assert_join_on_columns_resolvable(&optimized);
+        Ok(())
+    }
+
+    /// A plan with no joins anywhere should pass through untouched —
+    /// previously the entry point errored out with "Plan does not contain
+    /// any join nodes" which made it unsafe to wire in unconditionally.
+    #[test]
+    fn test_plan_without_joins_passes_through() -> Result<()> {
+        use datafusion_expr::{col, lit};
+
+        let plan = LogicalPlanBuilder::from(scan_tpch_table("customer"))
+            .filter(col("c_custkey").gt(lit(100)))?
+            .project(vec![col("c_name")])?
+            .build()?;
+
+        let before = format!("{}", plan.display_indent());
+        let after = optimal_left_deep_join_plan(plan, &TestCostEstimator)?;
+        assert_eq!(before, format!("{}", after.display_indent()));
         Ok(())
     }
 
