@@ -156,7 +156,24 @@ impl<T: DecimalType> DecimalAverager<T> {
     #[inline(always)]
     pub fn avg(&self, sum: T::Native, count: T::Native) -> Result<T::Native> {
         if let Ok(value) = sum.mul_checked(self.target_mul.div_wrapping(self.sum_mul)) {
-            let new_value = value.div_wrapping(count);
+            let mut new_value = value.div_wrapping(count);
+
+            // Round half away from zero (Snowflake semantics) instead of
+            // truncating toward zero: if twice the remainder reaches the
+            // divisor, bump the quotient one step in the sign of the exact
+            // result. `abs_rem >= count - abs_rem` avoids overflowing 2*rem.
+            let rem = value.mod_wrapping(count);
+            if !rem.is_zero() {
+                let negative = rem.is_lt(T::Native::ZERO);
+                let abs_rem = if negative { rem.neg_wrapping() } else { rem };
+                if abs_rem.is_ge(count.sub_wrapping(abs_rem)) {
+                    new_value = if negative {
+                        new_value.sub_wrapping(T::Native::ONE)
+                    } else {
+                        new_value.add_wrapping(T::Native::ONE)
+                    };
+                }
+            }
 
             let validate = T::validate_decimal_precision(
                 new_value,
@@ -262,5 +279,28 @@ impl<T: ArrowPrimitiveType> GenericDistinctBuffer<T> {
         let num_elements = self.values.len();
         let fixed_size = size_of_val(self) + size_of_val(&self.values);
         estimate_memory_size::<T::Native>(num_elements, fixed_size).unwrap()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::datatypes::Decimal128Type;
+
+    #[test]
+    fn decimal_averager_rounds_half_away_from_zero() {
+        // sum scale 0 -> target scale 4 (Snowflake AVG semantics verified
+        // live: AVG rounds the last digit half away from zero, both signs).
+        let averager = DecimalAverager::<Decimal128Type>::try_new(0, 10, 4).unwrap();
+        // 5/3 = 1.666666... -> 1.6667, not the truncated 1.6666
+        assert_eq!(averager.avg(5, 3).unwrap(), 16667);
+        assert_eq!(averager.avg(-5, 3).unwrap(), -16667);
+        // 1/32 = 0.03125: exact half at the last digit rounds away from zero
+        // (0.0313), where truncation and half-even both give 0.0312.
+        assert_eq!(averager.avg(1, 32).unwrap(), 313);
+        assert_eq!(averager.avg(-1, 32).unwrap(), -313);
+        // Exact quotients are unchanged.
+        assert_eq!(averager.avg(6, 3).unwrap(), 20000);
+        assert_eq!(averager.avg(1, 8).unwrap(), 1250);
     }
 }
