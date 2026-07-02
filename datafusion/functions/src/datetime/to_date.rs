@@ -147,7 +147,7 @@ impl ScalarUDFImpl for ToDateFunc {
             validate_data_types(&args, "to_date")?;
         }
         match args[0].data_type() {
-            Null | Int32 | Int64 | Float64 | Date32 | Date64 | Timestamp(_, _) => {
+            Null | Int32 | Int64 | Date32 | Date64 | Timestamp(_, _) => {
                 args[0].cast_to(&Date32, None)
             }
             UInt8 | UInt16 | UInt32 | UInt64 | Int8 | Int16 => {
@@ -174,12 +174,14 @@ impl ScalarUDFImpl for ToDateFunc {
             }
             Float16
             | Float32
+            | Float64
             | Decimal32(_, _)
             | Decimal64(_, _)
             | Decimal128(_, _)
             | Decimal256(_, _) => {
                 // The only way this makes sense is to get the Int64 value of the float
-                // or decimal and then cast that to Date32.
+                // or decimal and then cast that to Date32. (Arrow has no direct
+                // Float64 -> Date32 cast either, so Float64 takes this path too.)
                 args[0].cast_to(&Int64, None)?.cast_to(&Date32, None)
             }
             Utf8View | LargeUtf8 | Utf8 => self.to_date(&args),

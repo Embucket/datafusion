@@ -338,7 +338,20 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     return plan_err!("PIVOT value column is required");
                 }
 
-                let column_name = value_column.last().unwrap().to_string();
+                // Normalize like every other identifier: rendering the expression to a
+                // string keeps the quote characters, so a quoted pivot column
+                // (`FOR "2023_Q1" IN ...`) would never match its schema field.
+                let column_name = match value_column.last().unwrap() {
+                    sqlparser::ast::Expr::Identifier(ident) => {
+                        self.ident_normalizer.normalize(ident.clone())
+                    }
+                    sqlparser::ast::Expr::CompoundIdentifier(idents) => self
+                        .ident_normalizer
+                        .normalize(idents.last().unwrap().clone()),
+                    other => {
+                        return plan_err!("Unsupported PIVOT value column: {other}");
+                    }
+                };
                 let pivot_column = Column::new(None::<&str>, column_name);
 
                 let default_on_null_expr = default_on_null

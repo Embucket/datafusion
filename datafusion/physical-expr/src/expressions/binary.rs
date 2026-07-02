@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod decimal_div;
 mod kernels;
 
 use crate::PhysicalExpr;
@@ -349,6 +350,16 @@ impl PhysicalExpr for BinaryExpr {
             Operator::Minus => return apply(&lhs, &rhs, sub_wrapping),
             Operator::Multiply if self.fail_on_overflow => return apply(&lhs, &rhs, mul),
             Operator::Multiply => return apply(&lhs, &rhs, mul_wrapping),
+            // Decimal division rounds half away from zero (Snowflake
+            // semantics); arrow's `div` kernel truncates.
+            Operator::Divide
+                if decimal_div::is_decimal_division(
+                    &left_data_type,
+                    &right_data_type,
+                ) =>
+            {
+                return apply(&lhs, &rhs, decimal_div::div_half_away_from_zero);
+            }
             Operator::Divide => return apply(&lhs, &rhs, div),
             Operator::Modulo => return apply(&lhs, &rhs, rem),
 
@@ -4052,8 +4063,10 @@ mod tests {
             Field::new("a", DataType::Int32, true),
             Field::new("b", DataType::Decimal128(10, 2), true),
         ]));
+        // 123/122.00 = 1.00819672... rounds half away from zero to 1.0082
+        // (decimal division no longer truncates; see decimal_div module).
         let expect = Arc::new(create_decimal_array(
-            &[Some(1000000), None, Some(1008196), Some(1000000)],
+            &[Some(1000000), None, Some(1008197), Some(1000000)],
             16,
             4,
         )) as ArrayRef;
