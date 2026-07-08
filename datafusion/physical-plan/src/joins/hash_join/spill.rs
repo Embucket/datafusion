@@ -2693,4 +2693,95 @@ mod tests {
             );
         }
     }
+    /// Dropping the stream mid-way through the chunked fallback must release
+    /// every reservation (chunk data, table estimate, headroom, scratch).
+    #[tokio::test]
+    async fn pool_released_when_dropped_mid_chunked_fallback() {
+        let key = Int32Array::from(vec![42; 100_000]);
+        let build: Vec<RecordBatch> = (0..6)
+            .map(|i| {
+                let vals = Int32Array::from_iter_values(i * 100_000..(i + 1) * 100_000);
+                RecordBatch::try_new(
+                    test_schema(),
+                    vec![Arc::new(key.clone()), Arc::new(vals)],
+                )
+                .unwrap()
+            })
+            .collect();
+        let probe = vec![
+            RecordBatch::try_new(
+                test_schema(),
+                vec![
+                    Arc::new(Int32Array::from(vec![42, 42, 42, 42])),
+                    Arc::new(Int32Array::from(vec![0, 1, 2, 3])),
+                ],
+            )
+            .unwrap(),
+        ];
+
+        let join = join_from_batches(
+            build,
+            probe,
+            JoinType::Inner,
+            NullEquality::NullEqualsNothing,
+        );
+        let ctx = spill_task_ctx(4 * 1024 * 1024);
+        let mut stream = join.execute(0, Arc::clone(&ctx)).unwrap();
+        // Pull a couple of batches (deep inside the chunked fallback given
+        // the all-equal keys), then drop mid-flight.
+        let first = stream.next().await;
+        assert!(matches!(first, Some(Ok(_))), "expected output before drop");
+        let _ = stream.next().await;
+        drop(stream);
+
+        assert_eq!(
+            ctx.memory_pool().reserved(),
+            0,
+            "mid-chunk drop must release all join memory"
+        );
+    }
+
+    /// A probe-side error arriving while the spilled probe is being
+    /// scattered must propagate as-is and release all memory.
+    #[tokio::test]
+    async fn probe_error_during_spill_scatter_propagates() {
+        use crate::test::exec::MockExec;
+        use datafusion_common::exec_err;
+
+        let build = chunked_build_batches(1_000_000);
+        let schema = test_schema();
+        let good = make_batch(0, 4096);
+        let right = Arc::new(MockExec::new(
+            vec![Ok(good), exec_err!("bad probe data")],
+            Arc::clone(&schema),
+        ));
+
+        let left = TestMemoryExec::try_new_exec(&[build], schema, None).unwrap();
+        let on = vec![(
+            Arc::new(Column::new("k", 0)) as _,
+            Arc::new(Column::new("k", 0)) as _,
+        )];
+        let join = Arc::new(
+            HashJoinExec::try_new(
+                left,
+                right,
+                on,
+                None,
+                &JoinType::Inner,
+                None,
+                PartitionMode::Partitioned,
+                NullEquality::NullEqualsNothing,
+                false,
+            )
+            .unwrap(),
+        );
+
+        let ctx = spill_task_ctx(4 * 1024 * 1024);
+        let err = common::collect(join.execute(0, Arc::clone(&ctx)).unwrap())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("bad probe data"), "got: {err}");
+        assert_eq!(ctx.memory_pool().reserved(), 0);
+    }
 }
