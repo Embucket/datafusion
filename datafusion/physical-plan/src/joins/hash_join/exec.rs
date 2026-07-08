@@ -1365,6 +1365,10 @@ impl ExecutionPlan for HashJoinExec {
                 probe_spill: Arc::new(probe_spill),
                 spill_engaged: MetricBuilder::new(&self.metrics)
                     .counter("join_spill_engaged", partition),
+                repartition_passes: MetricBuilder::new(&self.metrics)
+                    .counter("join_spill_repartition_passes", partition),
+                fallback_chunks: MetricBuilder::new(&self.metrics)
+                    .counter("join_spill_fallback_chunks", partition),
                 partition_count_override: exec_options.hash_join_spill_partition_count,
                 headroom_bytes: exec_options.hash_join_spill_headroom_bytes,
                 max_recursion_depth: exec_options.hash_join_spill_max_recursion_depth,
@@ -1854,6 +1858,10 @@ struct BuildSideState {
     metrics: BuildProbeJoinMetrics,
     reservation: MemoryReservation,
     bounds_accumulators: Option<Vec<CollectLeftAccumulator>>,
+    /// Bytes of the hash-table estimate already reserved (spill mode only:
+    /// the estimate is reserved incrementally so overflow surfaces during
+    /// batch collection, where the scatter fallback can engage).
+    table_reserved: usize,
     /// Present when the spill fallback is enabled and applicable.
     spill: Option<Arc<HashJoinSpillContext>>,
     /// Present once the build has switched into scatter mode.
@@ -1885,6 +1893,7 @@ impl BuildSideState {
                         .collect::<Result<Vec<_>>>()
                 })
                 .transpose()?,
+            table_reserved: 0,
             spill: None,
             scatter: None,
             headroom: None,
@@ -1946,6 +1955,9 @@ impl BuildSideState {
             drop(batch);
             self.reservation.shrink(size);
         }
+        // No table will be built for this build side anymore.
+        self.reservation.shrink(self.table_reserved);
+        self.table_reserved = 0;
 
         self.scatter = Some(scatter);
         self.headroom = Some(headroom);
@@ -2052,10 +2064,20 @@ async fn collect_left_input(
             }
 
             let batch_size = get_record_batch_memory_size(&batch);
+            // In spill mode, also reserve the hash table's estimated growth
+            // for the rows in this batch, so "data fits but the table will
+            // not" is detected here — where the scatter fallback can engage —
+            // rather than at table construction time.
+            let table_delta = if state.spill.is_some() {
+                hash_table_estimate(state.num_rows)?.saturating_sub(state.table_reserved)
+            } else {
+                0
+            };
             // Reserve memory for incoming batch
-            match state.reservation.try_grow(batch_size) {
+            match state.reservation.try_grow(batch_size + table_delta) {
                 Ok(()) => {
                     state.metrics.build_mem_used.add(batch_size);
+                    state.table_reserved += table_delta;
                     state.batches.push(batch);
                     state.batch_sizes.push(batch_size);
                 }
@@ -2081,6 +2103,7 @@ async fn collect_left_input(
         metrics,
         reservation,
         bounds_accumulators,
+        table_reserved,
         spill: _,
         scatter,
         headroom,
@@ -2132,6 +2155,7 @@ async fn collect_left_input(
         &config,
         null_equality,
         &array_map_created_count,
+        table_reserved,
     )?;
 
     Ok(BuildPhaseOutput::InMemory(Arc::new(data)))
@@ -2146,9 +2170,27 @@ async fn collect_left_input(
 /// spills (grace hash join). All memory is accounted against `reservation`,
 /// which is moved into the returned [`JoinLeftData`].
 ///
+/// Estimated memory footprint of the join hash table for `num_rows` build
+/// rows — the same formula [`build_left_data`] uses, exposed so spill-mode
+/// loaders can pre-reserve it incrementally while batches stream in.
+pub(super) fn hash_table_estimate(num_rows: usize) -> Result<usize> {
+    if num_rows > u32::MAX as usize {
+        estimate_memory_size::<(u64, u64)>(num_rows, size_of::<JoinHashMapU64>())
+    } else {
+        estimate_memory_size::<(u32, u64)>(num_rows, size_of::<JoinHashMapU32>())
+    }
+}
+
 /// `mask_bounds` clears the computed bounds from the result when they were
 /// only collected for the perfect-hash decision and dynamic-filter pushdown
 /// is disabled.
+///
+/// `prereserved_table_bytes` is how much of the hash table's estimated size
+/// the caller already holds in `reservation` (spill-mode loaders reserve the
+/// estimate incrementally, via [`hash_table_estimate`], so overflow surfaces
+/// while batches stream rather than at table construction). The fast path
+/// passes 0 and this function grows the full estimate itself, exactly as
+/// before.
 #[expect(clippy::too_many_arguments)]
 pub(super) fn build_left_data(
     batches: &[RecordBatch],
@@ -2165,6 +2207,7 @@ pub(super) fn build_left_data(
     config: &ConfigOptions,
     null_equality: NullEquality,
     array_map_created_count: &Count,
+    prereserved_table_bytes: usize,
 ) -> Result<JoinLeftData> {
     let (join_hash_map, batch, left_values) =
         if let Some((array_map, batch, left_value)) = try_create_array_map(
@@ -2179,11 +2222,15 @@ pub(super) fn build_left_data(
         )? {
             array_map_created_count.add(1);
             metrics.build_mem_used.add(array_map.size());
+            // The perfect-hash map replaces the hash table the caller
+            // pre-reserved for; release that estimate.
+            reservation.shrink(prereserved_table_bytes);
 
             (Map::ArrayMap(array_map), batch, left_value)
         } else {
             // Estimation of memory size, required for hashtable, prior to allocation.
             // Final result can be verified using `RawTable.allocation_info()`
+            // (Same formula as `hash_table_estimate`; keep them in sync.)
             let fixed_size_u32 = size_of::<JoinHashMapU32>();
             let fixed_size_u64 = size_of::<JoinHashMapU64>();
 
@@ -2193,13 +2240,17 @@ pub(super) fn build_left_data(
             let mut hashmap: Box<dyn JoinHashMapType> = if num_rows > u32::MAX as usize {
                 let estimated_hashtable_size =
                     estimate_memory_size::<(u64, u64)>(num_rows, fixed_size_u64)?;
-                reservation.try_grow(estimated_hashtable_size)?;
+                reservation.try_grow(
+                    estimated_hashtable_size.saturating_sub(prereserved_table_bytes),
+                )?;
                 metrics.build_mem_used.add(estimated_hashtable_size);
                 Box::new(JoinHashMapU64::with_capacity(num_rows))
             } else {
                 let estimated_hashtable_size =
                     estimate_memory_size::<(u32, u64)>(num_rows, fixed_size_u32)?;
-                reservation.try_grow(estimated_hashtable_size)?;
+                reservation.try_grow(
+                    estimated_hashtable_size.saturating_sub(prereserved_table_bytes),
+                )?;
                 metrics.build_mem_used.add(estimated_hashtable_size);
                 Box::new(JoinHashMapU32::with_capacity(num_rows))
             };

@@ -46,7 +46,9 @@ use std::task::{Context, Poll};
 
 use crate::hash_utils::create_hashes;
 use crate::joins::PartitionMode;
-use crate::joins::hash_join::exec::{BuildPhaseOutput, build_left_data};
+use crate::joins::hash_join::exec::{
+    BuildPhaseOutput, build_left_data, hash_table_estimate,
+};
 use crate::joins::hash_join::shared_bounds::PartitionBounds;
 use crate::joins::hash_join::stream::{
     BuildSide, BuildSideInitialState, HashJoinStream, HashJoinStreamState,
@@ -85,15 +87,34 @@ const WRITE_BUFFER_FLUSH_BYTES: usize = 1024 * 1024;
 /// finite limit.
 const DEFAULT_PARTITION_TARGET_BYTES: usize = 128 * 1024 * 1024;
 
+/// SplitMix64 finalizer: a strong 64-bit mixer for seed derivation.
+fn splitmix64(seed: u64) -> u64 {
+    let mut z = seed.wrapping_add(0x9E3779B97F4A7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+    z ^ (z >> 31)
+}
+
 /// Hash seeds for scattering rows into disk partitions.
 ///
 /// Must stay independent from `REPARTITION_RANDOM_STATE` (0,0,0,0) and
 /// `HASH_JOIN_SEED` ('J','O','I','N'): rows arrive pre-bucketed by the former
-/// and are hashed by the latter inside each pair's hash table. The seed
-/// varies per recursion level so a repartition pass re-randomizes bucket
-/// assignment.
+/// and are hashed by the latter inside each pair's hash table.
+///
+/// All four seeds are derived from the level through a strong mixer: ahash
+/// folds some seed words in ADDITIVELY, so states differing only by a small
+/// constant in one word produce hashes shifted by a constant — under `% K`
+/// that maps an entire parent partition into a single child, making
+/// recursive repartitioning useless. (Caught by
+/// `recursive_scatter_levels_are_decorrelated`.)
 pub(super) fn scatter_random_state(level: usize) -> RandomState {
-    RandomState::with_seeds('S' as u64, 'P' as u64, 'L' as u64, 0xC0FFEE + level as u64)
+    let base = 0x53_50_4C_00_C0_FF_EE_00u64 ^ (level as u64);
+    RandomState::with_seeds(
+        splitmix64(base),
+        splitmix64(base ^ 0xA5A5_A5A5_A5A5_A5A5),
+        splitmix64(base.rotate_left(17)),
+        splitmix64(base.rotate_left(43) ^ 0x5A5A_5A5A_5A5A_5A5A),
+    )
 }
 
 /// Choose the number of disk partitions when spilling engages.
@@ -133,9 +154,12 @@ pub(super) struct HashJoinSpillContext {
     pub(super) probe_spill: Arc<SpillManager>,
     /// Incremented once when a build side switches into scatter mode.
     pub(super) spill_engaged: Count,
+    /// Incremented per recursive repartition pass on an oversized pair.
+    pub(super) repartition_passes: Count,
+    /// Incremented per chunk executed by the chunked build fallback.
+    pub(super) fallback_chunks: Count,
     pub(super) partition_count_override: usize,
     pub(super) headroom_bytes: usize,
-    #[expect(dead_code)] // used by recursive repartitioning (M4)
     pub(super) max_recursion_depth: usize,
     pub(super) max_spill_file_size: usize,
     /// Output partition index (consumer naming / diagnostics).
@@ -148,7 +172,6 @@ pub(super) struct HashJoinSpillContext {
 /// One side's scattered partition: the rotated spill files plus totals.
 pub(super) struct SpilledSide {
     pub(super) files: Vec<RefCountedTempFile>,
-    #[expect(dead_code)] // used by recursion sizing decisions (M4)
     pub(super) bytes: usize,
     pub(super) rows: usize,
 }
@@ -444,6 +467,40 @@ pub(super) struct InnerJoinSpec {
     pub(super) batch_size: usize,
 }
 
+/// Fan-out when an oversized pair is recursively repartitioned.
+const CHILD_FANOUT: usize = 8;
+
+/// One partition pair waiting to be joined.
+struct PairWork {
+    build: SpilledSide,
+    probe: SpilledSide,
+    /// Recursion level this pair's data was scattered at.
+    level: usize,
+    /// False once a repartition pass failed to shrink the data
+    /// (duplicate-key mass): further passes cannot help, go straight to the
+    /// chunked fallback.
+    allow_recursion: bool,
+}
+
+/// Per-pair state carried through the chunked fallback: the remaining build
+/// stream and the probe files that get re-read once per chunk.
+struct ChunkedState {
+    pair_id: usize,
+    level: usize,
+    /// None once the build partition is fully consumed.
+    build_stream: Option<SendableRecordBatchStream>,
+    /// A batch that did not fit in the previous chunk; leads the next one.
+    pending: Option<RecordBatch>,
+    probe_files: Vec<RefCountedTempFile>,
+    chunk_index: usize,
+}
+
+impl ChunkedState {
+    fn exhausted(&self) -> bool {
+        self.build_stream.is_none() && self.pending.is_none()
+    }
+}
+
 enum DriverPhase {
     /// Scatter the entire probe stream into `K` disk partitions.
     ScatterProbe {
@@ -454,29 +511,76 @@ enum DriverPhase {
     NextPair,
     /// Stream the pair's build partition into memory under its reservation.
     LoadBuild {
-        pair: usize,
+        pair_id: usize,
+        level: usize,
+        allow_recursion: bool,
+        probe: SpilledSide,
         stream: SendableRecordBatchStream,
         batches: Vec<RecordBatch>,
         num_rows: usize,
         reservation: MemoryReservation,
+        /// Bytes of the hash-table estimate reserved so far (grows with the
+        /// row count so table overflow surfaces during the load).
+        table_reserved: usize,
+        parent_build_bytes: usize,
     },
     /// Run the pair's in-memory join and forward its output.
     RunPair {
         inner: SendableRecordBatchStream,
+    },
+    /// The pair's build side did not fit: re-scatter the remaining build
+    /// rows (already-loaded ones went in first) at the next seed level.
+    RepartitionBuild {
+        level: usize,
+        probe: SpilledSide,
+        stream: SendableRecordBatchStream,
+        scatter: SideScatter,
+        parent_build_bytes: usize,
+    },
+    /// Re-scatter the oversized pair's probe partition with the same child
+    /// seed, then enqueue the child pairs.
+    RepartitionProbe {
+        children_build: Vec<SpilledSide>,
+        child_level: usize,
+        allow_recursion: bool,
+        stream: SendableRecordBatchStream,
+        scatter: SideScatter,
+    },
+    /// Chunked fallback: load the next slice of build rows that fits.
+    ChunkedLoad {
+        state: ChunkedState,
+        batches: Vec<RecordBatch>,
+        num_rows: usize,
+        reservation: MemoryReservation,
+        table_reserved: usize,
+    },
+    /// Chunked fallback: run one chunk's join over a full probe re-read.
+    ChunkedRun {
+        inner: SendableRecordBatchStream,
+        state: ChunkedState,
     },
     Done,
 }
 
 /// Drives the spilled join: probe scatter, then a sequential loop over
 /// partition pairs, each joined by an ordinary in-memory [`HashJoinStream`].
+///
+/// A pair whose build side exceeds the budget is recursively repartitioned
+/// with a fresh seed (up to `hash_join_spill_max_recursion_depth` passes);
+/// when repartitioning cannot shrink it (duplicate-key mass), build-side
+/// emission join types degrade to a chunked build over full probe re-reads,
+/// and the rest surface a descriptive resources-exhausted error.
 pub(super) struct SpillJoinDriver {
     ctx: Arc<HashJoinSpillContext>,
     spec: InnerJoinSpec,
     phase: DriverPhase,
-    build_parts: Vec<Option<SpilledSide>>,
-    probe_parts: Vec<Option<SpilledSide>>,
-    next_pair: usize,
-    level: usize,
+    /// Build partitions from the initial scatter, consumed when the probe
+    /// scatter finishes and the pair queue is built.
+    initial_build: Vec<SpilledSide>,
+    base_level: usize,
+    queue: VecDeque<PairWork>,
+    /// Monotonic pair counter for reservation naming across recursion.
+    pair_seq: usize,
     /// Outer metrics: probe input rows/batches are recorded during scatter.
     outer_metrics: BuildProbeJoinMetrics,
     /// Private metrics for inner per-pair streams (not exposed; prevents
@@ -515,10 +619,10 @@ impl SpillJoinDriver {
         Self {
             spec,
             phase: DriverPhase::ScatterProbe { probe, scatter },
-            build_parts: partitions.into_iter().map(Some).collect(),
-            probe_parts: Vec::new(),
-            next_pair: 0,
-            level,
+            initial_build: partitions,
+            base_level: level,
+            queue: VecDeque::new(),
+            pair_seq: 0,
             outer_metrics,
             inner_metrics_set: ExecutionPlanMetricsSet::new(),
             _headroom: headroom,
@@ -545,6 +649,21 @@ impl SpillJoinDriver {
         }
     }
 
+    /// Chunking the build side is correct only for join types whose output
+    /// is decided per build row (each build row lives in exactly one chunk).
+    /// Types that emit unmatched PROBE rows would need cross-chunk match
+    /// tracking, which chunked execution cannot provide.
+    fn chunked_fallback_supported(&self) -> bool {
+        matches!(
+            self.spec.join_type,
+            JoinType::Inner
+                | JoinType::Left
+                | JoinType::LeftSemi
+                | JoinType::LeftAnti
+                | JoinType::LeftMark
+        )
+    }
+
     pub(super) fn poll_next(
         &mut self,
         cx: &mut Context<'_>,
@@ -562,6 +681,21 @@ impl SpillJoinDriver {
                     Some(item) => return Poll::Ready(Some(item)),
                     None => self.phase = DriverPhase::NextPair,
                 },
+                DriverPhase::RepartitionBuild { .. } => {
+                    ready!(self.poll_repartition_build(cx))?;
+                }
+                DriverPhase::RepartitionProbe { .. } => {
+                    ready!(self.poll_repartition_probe(cx))?;
+                }
+                DriverPhase::ChunkedLoad { .. } => {
+                    ready!(self.poll_chunked_load(cx))?;
+                }
+                DriverPhase::ChunkedRun { .. } => {
+                    match ready!(self.poll_chunked_run(cx)) {
+                        Some(item) => return Poll::Ready(Some(item)),
+                        None => self.finish_chunk()?,
+                    }
+                }
                 DriverPhase::Done => return Poll::Ready(None),
             }
         }
@@ -592,52 +726,61 @@ impl SpillJoinDriver {
                 else {
                     return Poll::Ready(internal_err!("expected ScatterProbe phase"));
                 };
-                self.probe_parts = scatter.finish()?.into_iter().map(Some).collect();
+                let probe_parts = scatter.finish()?;
+                let level = self.base_level;
+                self.queue = std::mem::take(&mut self.initial_build)
+                    .into_iter()
+                    .zip(probe_parts)
+                    .map(|(build, probe)| PairWork {
+                        build,
+                        probe,
+                        level,
+                        allow_recursion: true,
+                    })
+                    .collect();
             }
         }
         Poll::Ready(Ok(()))
     }
 
-    /// Pick the next pair; skip pairs an inner join cannot produce rows for.
+    /// Pop the next pair; skip pairs this join type provably emits nothing
+    /// for.
     fn select_next_pair(&mut self) -> Result<()> {
         loop {
-            let pair = self.next_pair;
-            if pair >= self.build_parts.len() {
+            let Some(work) = self.queue.pop_front() else {
                 self.phase = DriverPhase::Done;
                 return Ok(());
-            }
-            self.next_pair += 1;
-
-            let (Some(build), Some(probe)) =
-                (self.build_parts[pair].take(), self.probe_parts[pair].take())
-            else {
-                return internal_err!(
-                    "spilled hash join partition {pair} already consumed"
-                );
             };
 
-            if self.can_skip_pair(build.rows, probe.rows) {
+            if self.can_skip_pair(work.build.rows, work.probe.rows) {
                 // Dropping the sides deletes their spill files.
                 continue;
             }
 
+            let pair_id = self.pair_seq;
+            self.pair_seq += 1;
+
             let reservation = MemoryConsumer::new(format!(
                 "HashJoinSpillPartition[{}.{}]",
-                self.ctx.partition, pair
+                self.ctx.partition, pair_id
             ))
             .with_can_spill(true)
             .register(&self.ctx.pool);
 
+            let parent_build_bytes = work.build.bytes;
             let stream =
-                spilled_side_stream(build.files, Arc::clone(&self.ctx.build_spill));
-            // Stash the probe side back; consumed when the pair's join starts.
-            self.probe_parts[pair] = Some(probe);
+                spilled_side_stream(work.build.files, Arc::clone(&self.ctx.build_spill));
             self.phase = DriverPhase::LoadBuild {
-                pair,
+                pair_id,
+                level: work.level,
+                allow_recursion: work.allow_recursion,
+                probe: work.probe,
                 stream,
                 batches: Vec::new(),
                 num_rows: 0,
                 reservation,
+                table_reserved: 0,
+                parent_build_bytes,
             };
             return Ok(());
         }
@@ -655,43 +798,440 @@ impl SpillJoinDriver {
             Some(batch) => {
                 let batch = batch?;
                 let size = get_record_batch_memory_size(&batch);
-                let DriverPhase::LoadBuild {
-                    pair,
-                    batches,
-                    num_rows,
-                    reservation,
-                    ..
-                } = &mut self.phase
-                else {
-                    return Poll::Ready(internal_err!("expected LoadBuild phase"));
+                let grow_result = {
+                    let DriverPhase::LoadBuild {
+                        reservation,
+                        num_rows,
+                        table_reserved,
+                        ..
+                    } = &mut self.phase
+                    else {
+                        return Poll::Ready(internal_err!("expected LoadBuild phase"));
+                    };
+                    // Also reserve the hash table's estimated growth so the
+                    // pair overflows here (where recursion/fallback applies)
+                    // rather than at table construction.
+                    let table_delta = hash_table_estimate(*num_rows + batch.num_rows())?
+                        .saturating_sub(*table_reserved);
+                    reservation
+                        .try_grow(size + table_delta)
+                        .map(|()| table_delta)
                 };
-                if let Err(e) = reservation.try_grow(size) {
-                    // Recursive repartitioning arrives in M4; for now an
-                    // oversized partition surfaces the clean
-                    // resources-exhausted error.
-                    return Poll::Ready(Err(oversize_partition_err(
-                        e, *pair, self.level,
-                    )));
+                match grow_result {
+                    Ok(table_delta) => {
+                        let DriverPhase::LoadBuild {
+                            batches,
+                            num_rows,
+                            table_reserved,
+                            ..
+                        } = &mut self.phase
+                        else {
+                            return Poll::Ready(internal_err!(
+                                "expected LoadBuild phase"
+                            ));
+                        };
+                        *num_rows += batch.num_rows();
+                        *table_reserved += table_delta;
+                        batches.push(batch);
+                    }
+                    Err(e) => {
+                        return Poll::Ready(self.handle_oversized_build(batch, e));
+                    }
                 }
-                *num_rows += batch.num_rows();
-                batches.push(batch);
             }
             None => {
                 let DriverPhase::LoadBuild {
-                    pair,
+                    pair_id,
+                    probe,
                     batches,
                     num_rows,
                     reservation,
+                    table_reserved,
                     ..
                 } = std::mem::replace(&mut self.phase, DriverPhase::NextPair)
                 else {
                     return Poll::Ready(internal_err!("expected LoadBuild phase"));
                 };
-                let inner = self.start_pair_join(pair, batches, num_rows, reservation)?;
+                let inner = self.build_inner_join(
+                    pair_id,
+                    batches,
+                    num_rows,
+                    reservation,
+                    table_reserved,
+                    probe.files,
+                )?;
                 self.phase = DriverPhase::RunPair { inner };
             }
         }
         Poll::Ready(Ok(()))
+    }
+
+    /// The current pair's build partition exceeded the budget mid-load.
+    /// Choose: recursive repartition, chunked fallback, or a clean error.
+    fn handle_oversized_build(
+        &mut self,
+        failed_batch: RecordBatch,
+        source: DataFusionError,
+    ) -> Result<()> {
+        let (level, allow_recursion) = {
+            let DriverPhase::LoadBuild {
+                level,
+                allow_recursion,
+                ..
+            } = &self.phase
+            else {
+                return internal_err!("expected LoadBuild phase");
+            };
+            (*level, *allow_recursion)
+        };
+
+        if allow_recursion && level < self.ctx.max_recursion_depth {
+            self.begin_repartition(failed_batch)
+        } else if self.chunked_fallback_supported() {
+            self.begin_chunked(failed_batch)
+        } else {
+            let join_type = self.spec.join_type;
+            Err(source.context(format!(
+                "spilled hash join partition remains oversized after {level} \
+                 repartition pass(es) (extreme key skew), and join type \
+                 {join_type:?} decides probe-side rows from matches against \
+                 the WHOLE build side, which the chunked build fallback \
+                 cannot track across chunks; increase the memory budget to \
+                 run this join"
+            )))
+        }
+    }
+
+    /// Re-scatter the oversized pair's build side at the next seed level:
+    /// already-loaded batches first (releasing their memory), then the rest
+    /// of the pair's build stream.
+    fn begin_repartition(&mut self, failed_batch: RecordBatch) -> Result<()> {
+        let DriverPhase::LoadBuild {
+            level,
+            probe,
+            stream,
+            batches,
+            reservation,
+            parent_build_bytes,
+            ..
+        } = std::mem::replace(&mut self.phase, DriverPhase::NextPair)
+        else {
+            return internal_err!("expected LoadBuild phase");
+        };
+
+        self.ctx.repartition_passes.add(1);
+        let child_level = level + 1;
+        let mut scatter = SideScatter::new(
+            CHILD_FANOUT,
+            self.ctx.on_left.clone(),
+            scatter_random_state(child_level),
+            &self.ctx.build_spill,
+            self.ctx.max_spill_file_size,
+            self.ctx.headroom_bytes / 2,
+            "hash_join_build_respill",
+        );
+
+        for batch in batches {
+            scatter.scatter_batch(&batch)?;
+        }
+        // The freed bytes exactly cover the scattered batches — this
+        // reservation held nothing else.
+        drop(reservation);
+        scatter.scatter_batch(&failed_batch)?;
+        drop(failed_batch);
+
+        self.phase = DriverPhase::RepartitionBuild {
+            level,
+            probe,
+            stream,
+            scatter,
+            parent_build_bytes,
+        };
+        Ok(())
+    }
+
+    fn poll_repartition_build(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        let polled = {
+            let DriverPhase::RepartitionBuild { stream, .. } = &mut self.phase else {
+                return Poll::Ready(internal_err!("expected RepartitionBuild phase"));
+            };
+            ready!(stream.poll_next_unpin(cx))
+        };
+        match polled {
+            Some(batch) => {
+                let batch = batch?;
+                let DriverPhase::RepartitionBuild { scatter, .. } = &mut self.phase
+                else {
+                    return Poll::Ready(internal_err!("expected RepartitionBuild phase"));
+                };
+                scatter.scatter_batch(&batch)?;
+            }
+            None => {
+                let DriverPhase::RepartitionBuild {
+                    level,
+                    probe,
+                    scatter,
+                    parent_build_bytes,
+                    ..
+                } = std::mem::replace(&mut self.phase, DriverPhase::NextPair)
+                else {
+                    return Poll::Ready(internal_err!("expected RepartitionBuild phase"));
+                };
+                let children_build = scatter.finish()?;
+
+                // No-shrink shortcut: when the largest child still holds
+                // most of the parent, the mass sits on duplicate keys and
+                // more passes cannot split it — the children go straight to
+                // the fallback if they do not fit.
+                let max_child = children_build.iter().map(|c| c.bytes).max();
+                let allow_recursion = max_child
+                    .is_none_or(|m| m.saturating_mul(4) <= parent_build_bytes * 3);
+
+                let child_level = level + 1;
+                let probe_scatter = SideScatter::new(
+                    CHILD_FANOUT,
+                    self.spec.on_right.clone(),
+                    scatter_random_state(child_level),
+                    &self.ctx.probe_spill,
+                    self.ctx.max_spill_file_size,
+                    self.ctx.headroom_bytes / 2,
+                    "hash_join_probe_respill",
+                );
+                let probe_stream =
+                    spilled_side_stream(probe.files, Arc::clone(&self.ctx.probe_spill));
+                self.phase = DriverPhase::RepartitionProbe {
+                    children_build,
+                    child_level,
+                    allow_recursion,
+                    stream: probe_stream,
+                    scatter: probe_scatter,
+                };
+            }
+        }
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_repartition_probe(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        let polled = {
+            let DriverPhase::RepartitionProbe { stream, .. } = &mut self.phase else {
+                return Poll::Ready(internal_err!("expected RepartitionProbe phase"));
+            };
+            ready!(stream.poll_next_unpin(cx))
+        };
+        match polled {
+            Some(batch) => {
+                let batch = batch?;
+                let DriverPhase::RepartitionProbe { scatter, .. } = &mut self.phase
+                else {
+                    return Poll::Ready(internal_err!("expected RepartitionProbe phase"));
+                };
+                scatter.scatter_batch(&batch)?;
+            }
+            None => {
+                let DriverPhase::RepartitionProbe {
+                    children_build,
+                    child_level,
+                    allow_recursion,
+                    scatter,
+                    ..
+                } = std::mem::replace(&mut self.phase, DriverPhase::NextPair)
+                else {
+                    return Poll::Ready(internal_err!("expected RepartitionProbe phase"));
+                };
+                let children_probe = scatter.finish()?;
+                // Children go to the FRONT so their disk space is reclaimed
+                // before other top-level pairs run.
+                for (build, probe) in children_build.into_iter().zip(children_probe).rev()
+                {
+                    self.queue.push_front(PairWork {
+                        build,
+                        probe,
+                        level: child_level,
+                        allow_recursion,
+                    });
+                }
+            }
+        }
+        Poll::Ready(Ok(()))
+    }
+
+    /// Enter the chunked fallback: the already-loaded batches (which fit)
+    /// become chunk 0; the failed batch leads chunk 1.
+    fn begin_chunked(&mut self, failed_batch: RecordBatch) -> Result<()> {
+        let DriverPhase::LoadBuild {
+            pair_id,
+            level,
+            probe,
+            stream,
+            batches,
+            num_rows,
+            reservation,
+            table_reserved,
+            ..
+        } = std::mem::replace(&mut self.phase, DriverPhase::NextPair)
+        else {
+            return internal_err!("expected LoadBuild phase");
+        };
+
+        if batches.is_empty() {
+            // Not even one batch fits: nothing to chunk.
+            return internal_err!(
+                "spilled hash join partition {pair_id}: a single build batch \
+                 exceeds the memory budget"
+            );
+        }
+
+        let state = ChunkedState {
+            pair_id,
+            level,
+            build_stream: Some(stream),
+            pending: Some(failed_batch),
+            probe_files: probe.files,
+            chunk_index: 0,
+        };
+        let inner = self.start_chunk_join(
+            &state,
+            batches,
+            num_rows,
+            reservation,
+            table_reserved,
+        )?;
+        self.phase = DriverPhase::ChunkedRun { inner, state };
+        Ok(())
+    }
+
+    /// One step of loading the next chunk of build rows.
+    fn poll_chunked_load(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        // A pending batch from the previous chunk leads this one.
+        let pending_step = {
+            let DriverPhase::ChunkedLoad {
+                state,
+                batches,
+                num_rows,
+                reservation,
+                table_reserved,
+            } = &mut self.phase
+            else {
+                return Poll::Ready(internal_err!("expected ChunkedLoad phase"));
+            };
+            if let Some(batch) = state.pending.take() {
+                let size = get_record_batch_memory_size(&batch);
+                let table_delta = hash_table_estimate(*num_rows + batch.num_rows())?
+                    .saturating_sub(*table_reserved);
+                match reservation.try_grow(size + table_delta) {
+                    Ok(()) => {
+                        *num_rows += batch.num_rows();
+                        *table_reserved += table_delta;
+                        batches.push(batch);
+                        true
+                    }
+                    Err(e) => {
+                        if batches.is_empty() {
+                            let pair_id = state.pair_id;
+                            return Poll::Ready(Err(e.context(format!(
+                                "spilled hash join partition {pair_id}: a single \
+                                 build batch exceeds the memory budget"
+                            ))));
+                        }
+                        // Chunk full before the pending batch: run with what
+                        // we have, keep the batch pending.
+                        state.pending = Some(batch);
+                        return Poll::Ready(self.start_chunk_run());
+                    }
+                }
+            } else {
+                false
+            }
+        };
+        if pending_step {
+            return Poll::Ready(Ok(()));
+        }
+
+        // Poll the build stream (it may already be exhausted).
+        let polled = {
+            let DriverPhase::ChunkedLoad { state, .. } = &mut self.phase else {
+                return Poll::Ready(internal_err!("expected ChunkedLoad phase"));
+            };
+            match &mut state.build_stream {
+                Some(stream) => ready!(stream.poll_next_unpin(cx)),
+                None => None,
+            }
+        };
+        match polled {
+            Some(batch) => {
+                let batch = batch?;
+                let size = get_record_batch_memory_size(&batch);
+                let DriverPhase::ChunkedLoad {
+                    state,
+                    batches,
+                    num_rows,
+                    reservation,
+                    table_reserved,
+                } = &mut self.phase
+                else {
+                    return Poll::Ready(internal_err!("expected ChunkedLoad phase"));
+                };
+                let table_delta = hash_table_estimate(*num_rows + batch.num_rows())?
+                    .saturating_sub(*table_reserved);
+                match reservation.try_grow(size + table_delta) {
+                    Ok(()) => {
+                        *num_rows += batch.num_rows();
+                        *table_reserved += table_delta;
+                        batches.push(batch);
+                    }
+                    Err(e) => {
+                        if batches.is_empty() {
+                            let pair_id = state.pair_id;
+                            return Poll::Ready(Err(e.context(format!(
+                                "spilled hash join partition {pair_id}: a single \
+                                 build batch exceeds the memory budget"
+                            ))));
+                        }
+                        state.pending = Some(batch);
+                        return Poll::Ready(self.start_chunk_run());
+                    }
+                }
+            }
+            None => {
+                {
+                    let DriverPhase::ChunkedLoad { state, .. } = &mut self.phase else {
+                        return Poll::Ready(internal_err!("expected ChunkedLoad phase"));
+                    };
+                    state.build_stream = None;
+                }
+                return Poll::Ready(self.start_chunk_run());
+            }
+        }
+        Poll::Ready(Ok(()))
+    }
+
+    /// Transition ChunkedLoad -> ChunkedRun with the accumulated chunk.
+    fn start_chunk_run(&mut self) -> Result<()> {
+        let DriverPhase::ChunkedLoad {
+            state,
+            batches,
+            num_rows,
+            reservation,
+            table_reserved,
+        } = std::mem::replace(&mut self.phase, DriverPhase::NextPair)
+        else {
+            return internal_err!("expected ChunkedLoad phase");
+        };
+        if batches.is_empty() {
+            // Final poll found no more rows: the pair is done.
+            debug_assert!(state.exhausted());
+            self.phase = DriverPhase::NextPair;
+            return Ok(());
+        }
+        let inner = self.start_chunk_join(
+            &state,
+            batches,
+            num_rows,
+            reservation,
+            table_reserved,
+        )?;
+        self.phase = DriverPhase::ChunkedRun { inner, state };
+        Ok(())
     }
 
     fn poll_run_pair(
@@ -704,16 +1244,77 @@ impl SpillJoinDriver {
         inner.poll_next_unpin(cx)
     }
 
-    /// Build the pair's `JoinLeftData` from the loaded batches and construct
-    /// the inner in-memory join stream over the pair's probe partition.
-    fn start_pair_join(
+    fn poll_chunked_run(
         &mut self,
-        pair: usize,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<RecordBatch>>> {
+        let DriverPhase::ChunkedRun { inner, .. } = &mut self.phase else {
+            return Poll::Ready(Some(internal_err!("expected ChunkedRun phase")));
+        };
+        inner.poll_next_unpin(cx)
+    }
+
+    /// A chunk's join finished: move to the next chunk or the next pair.
+    fn finish_chunk(&mut self) -> Result<()> {
+        let DriverPhase::ChunkedRun { state, .. } =
+            std::mem::replace(&mut self.phase, DriverPhase::NextPair)
+        else {
+            return internal_err!("expected ChunkedRun phase");
+        };
+        if state.exhausted() {
+            // Dropping the state deletes the probe partition's files.
+            return Ok(());
+        }
+        let mut state = state;
+        state.chunk_index += 1;
+        let reservation = MemoryConsumer::new(format!(
+            "HashJoinSpillChunk[{}.{}.{}]",
+            self.ctx.partition, state.pair_id, state.chunk_index
+        ))
+        .with_can_spill(true)
+        .register(&self.ctx.pool);
+        self.phase = DriverPhase::ChunkedLoad {
+            state,
+            batches: Vec::new(),
+            num_rows: 0,
+            reservation,
+            table_reserved: 0,
+        };
+        Ok(())
+    }
+
+    /// Build one chunk's `JoinLeftData` and join it against a full re-read
+    /// of the pair's probe partition.
+    fn start_chunk_join(
+        &mut self,
+        state: &ChunkedState,
         batches: Vec<RecordBatch>,
         num_rows: usize,
         reservation: MemoryReservation,
+        table_reserved: usize,
     ) -> Result<SendableRecordBatchStream> {
-        let inner_metrics = BuildProbeJoinMetrics::new(pair, &self.inner_metrics_set);
+        self.ctx.fallback_chunks.add(1);
+        let _ = state.level; // recorded for diagnostics via consumer names
+        self.build_inner_join(
+            state.pair_id,
+            batches,
+            num_rows,
+            reservation,
+            table_reserved,
+            state.probe_files.clone(),
+        )
+    }
+
+    fn build_inner_join(
+        &mut self,
+        pair_id: usize,
+        batches: Vec<RecordBatch>,
+        num_rows: usize,
+        reservation: MemoryReservation,
+        table_reserved: usize,
+        probe_files: Vec<RefCountedTempFile>,
+    ) -> Result<SendableRecordBatchStream> {
+        let inner_metrics = BuildProbeJoinMetrics::new(pair_id, &self.inner_metrics_set);
         let array_map_count = Count::new();
         let need_bitmap = need_produce_result_in_final(self.spec.join_type);
 
@@ -732,16 +1333,12 @@ impl SpillJoinDriver {
             &self.ctx.config,
             self.spec.null_equality,
             &array_map_count,
+            table_reserved,
         )?;
         drop(batches);
 
-        let probe = self.probe_parts[pair].take().ok_or_else(|| {
-            DataFusionError::Internal(format!(
-                "probe partition {pair} missing for spilled hash join"
-            ))
-        })?;
         let probe_stream =
-            spilled_side_stream(probe.files, Arc::clone(&self.ctx.probe_spill));
+            spilled_side_stream(probe_files, Arc::clone(&self.ctx.probe_spill));
 
         let build_output = BuildPhaseOutput::InMemory(Arc::new(left_data));
         let left_fut = OnceFut::new(std::future::ready(Ok(build_output)));
@@ -771,17 +1368,6 @@ impl SpillJoinDriver {
 
         Ok(Box::pin(inner))
     }
-}
-
-fn oversize_partition_err(
-    source: DataFusionError,
-    pair: usize,
-    level: usize,
-) -> DataFusionError {
-    source.context(format!(
-        "spilled hash join partition {pair} (repartition level {level}) does not fit \
-         in the memory budget"
-    ))
 }
 
 #[cfg(test)]
@@ -1370,6 +1956,293 @@ mod tests {
                     "{join_type:?}/{null_equality:?} spilled vs in-memory mismatch"
                 );
             }
+        }
+    }
+    /// Extreme duplicate-key skew: every build row has the same key, so
+    /// repartitioning cannot shrink the partition and the chunked fallback
+    /// must carry the join. Inner join: matches only.
+    #[tokio::test]
+    async fn extreme_skew_falls_back_to_chunked_inner() {
+        // 600k rows, all key=42 (~4.8MB) vs a 4MB pool.
+        let key = Int32Array::from(vec![42; 100_000]);
+        let build: Vec<RecordBatch> = (0..6)
+            .map(|i| {
+                let vals = Int32Array::from_iter_values(i * 100_000..(i + 1) * 100_000);
+                RecordBatch::try_new(
+                    test_schema(),
+                    vec![Arc::new(key.clone()), Arc::new(vals)],
+                )
+                .unwrap()
+            })
+            .collect();
+        // 4 probe rows match key 42; 4 miss.
+        let probe = vec![
+            RecordBatch::try_new(
+                test_schema(),
+                vec![
+                    Arc::new(Int32Array::from(vec![42, 42, 42, 42, 1, 2, 3, 4])),
+                    Arc::new(Int32Array::from(vec![0, 1, 2, 3, 4, 5, 6, 7])),
+                ],
+            )
+            .unwrap(),
+        ];
+
+        let spilled_join = join_from_batches(
+            build.clone(),
+            probe.clone(),
+            JoinType::Inner,
+            NullEquality::NullEqualsNothing,
+        );
+        let ctx = spill_task_ctx(4 * 1024 * 1024);
+        let spilled = common::collect(spilled_join.execute(0, Arc::clone(&ctx)).unwrap())
+            .await
+            .unwrap();
+
+        let metrics = spilled_join.metrics().unwrap();
+        assert!(
+            metrics
+                .sum_by_name("join_spill_repartition_passes")
+                .map(|m| m.as_usize())
+                .unwrap_or(0)
+                >= 1,
+            "skewed pair should attempt at least one repartition pass"
+        );
+        assert!(
+            metrics
+                .sum_by_name("join_spill_fallback_chunks")
+                .map(|m| m.as_usize())
+                .unwrap_or(0)
+                >= 2,
+            "skewed pair must run multiple fallback chunks"
+        );
+
+        let reference_join = join_from_batches(
+            build,
+            probe,
+            JoinType::Inner,
+            NullEquality::NullEqualsNothing,
+        );
+        let reference = common::collect(
+            reference_join
+                .execute(0, Arc::new(TaskContext::default()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result_fingerprint(&spilled), result_fingerprint(&reference));
+        assert_eq!(ctx.memory_pool().reserved(), 0);
+    }
+
+    /// Chunked fallback with a build-side-emission type: LeftAnti emits
+    /// every build row exactly once across all chunks.
+    #[tokio::test]
+    async fn extreme_skew_falls_back_to_chunked_left_anti() {
+        let key = Int32Array::from(vec![42; 100_000]);
+        let build: Vec<RecordBatch> = (0..6)
+            .map(|i| {
+                let vals = Int32Array::from_iter_values(i * 100_000..(i + 1) * 100_000);
+                RecordBatch::try_new(
+                    test_schema(),
+                    vec![Arc::new(key.clone()), Arc::new(vals)],
+                )
+                .unwrap()
+            })
+            .collect();
+        // No probe row matches key 42: all 600k build rows are anti-matches.
+        let probe = vec![make_batch(100, 64)];
+
+        let spilled_join = join_from_batches(
+            build.clone(),
+            probe.clone(),
+            JoinType::LeftAnti,
+            NullEquality::NullEqualsNothing,
+        );
+        let ctx = spill_task_ctx(4 * 1024 * 1024);
+        let spilled = common::collect(spilled_join.execute(0, Arc::clone(&ctx)).unwrap())
+            .await
+            .unwrap();
+        let spilled_rows: usize = spilled.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(spilled_rows, 600_000);
+
+        let reference_join = join_from_batches(
+            build,
+            probe,
+            JoinType::LeftAnti,
+            NullEquality::NullEqualsNothing,
+        );
+        let reference = common::collect(
+            reference_join
+                .execute(0, Arc::new(TaskContext::default()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result_fingerprint(&spilled), result_fingerprint(&reference));
+    }
+
+    /// Probe-side-emission types cannot use the chunked fallback: extreme
+    /// skew must surface a descriptive clean error, not wrong results.
+    #[tokio::test]
+    async fn extreme_skew_unsupported_type_is_a_clean_error() {
+        let key = Int32Array::from(vec![42; 100_000]);
+        let build: Vec<RecordBatch> = (0..6)
+            .map(|i| {
+                let vals = Int32Array::from_iter_values(i * 100_000..(i + 1) * 100_000);
+                RecordBatch::try_new(
+                    test_schema(),
+                    vec![Arc::new(key.clone()), Arc::new(vals)],
+                )
+                .unwrap()
+            })
+            .collect();
+        let probe = vec![make_batch(0, 1024)];
+
+        let join = join_from_batches(
+            build,
+            probe,
+            JoinType::RightSemi,
+            NullEquality::NullEqualsNothing,
+        );
+        let ctx = spill_task_ctx(4 * 1024 * 1024);
+        let err = common::collect(join.execute(0, Arc::clone(&ctx)).unwrap())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("extreme key skew") && err.contains("RightSemi"),
+            "expected a descriptive skew error, got: {err}"
+        );
+        assert_eq!(ctx.memory_pool().reserved(), 0);
+    }
+
+    /// Moderate skew (too few initial partitions) is fixed by one recursion
+    /// pass — no fallback chunks needed.
+    #[tokio::test]
+    async fn recursion_splits_oversized_uniform_partitions() {
+        let build = chunked_build_batches(1_000_000);
+        let probe = vec![make_batch(996_000, 8192)];
+
+        let spilled_join = join_from_batches(
+            build.clone(),
+            probe.clone(),
+            JoinType::Inner,
+            NullEquality::NullEqualsNothing,
+        );
+        // Force only 2 initial partitions: each ~4MB against a 4MB pool, so
+        // both need one repartition pass into 8 children each.
+        let runtime = RuntimeEnvBuilder::new()
+            .with_memory_limit(4 * 1024 * 1024, 1.0)
+            .build_arc()
+            .unwrap();
+        let mut session_config = SessionConfig::default().with_batch_size(4096);
+        {
+            let exec = &mut session_config.options_mut().execution;
+            exec.enable_hash_join_spill = true;
+            exec.hash_join_spill_headroom_bytes = 256 * 1024;
+            exec.hash_join_spill_partition_count = 2;
+        }
+        let ctx = Arc::new(
+            TaskContext::default()
+                .with_session_config(session_config)
+                .with_runtime(runtime),
+        );
+        let spilled = common::collect(spilled_join.execute(0, Arc::clone(&ctx)).unwrap())
+            .await
+            .unwrap();
+
+        let metrics = spilled_join.metrics().unwrap();
+        assert!(
+            metrics
+                .sum_by_name("join_spill_repartition_passes")
+                .map(|m| m.as_usize())
+                .unwrap_or(0)
+                >= 1,
+            "expected at least one repartition pass"
+        );
+        assert_eq!(
+            metrics
+                .sum_by_name("join_spill_fallback_chunks")
+                .map(|m| m.as_usize()),
+            Some(0),
+            "uniform keys must not need the chunked fallback"
+        );
+
+        let reference_join = join_from_batches(
+            build,
+            probe,
+            JoinType::Inner,
+            NullEquality::NullEqualsNothing,
+        );
+        let reference = common::collect(
+            reference_join
+                .execute(0, Arc::new(TaskContext::default()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result_fingerprint(&spilled), result_fingerprint(&reference));
+        assert_eq!(ctx.memory_pool().reserved(), 0);
+    }
+    /// Re-scattering one level's partition at the next level must spread it
+    /// across all children. (Catches additive seed correlation: with weakly
+    /// derived per-level seeds, `hash_l1 = hash_l0 + const`, so a parent
+    /// partition maps into a single child under `% K` and recursion never
+    /// shrinks anything.)
+    #[tokio::test]
+    async fn recursive_scatter_levels_are_decorrelated() {
+        const K: u64 = 8;
+        let candidates = Int32Array::from_iter_values(0..200_000);
+        let candidate_arrays: Vec<arrow::array::ArrayRef> =
+            vec![Arc::new(candidates.clone())];
+        for parent_level in 0..3usize {
+            let mut hashes = vec![0u64; candidates.len()];
+            create_hashes(
+                &candidate_arrays,
+                &scatter_random_state(parent_level),
+                &mut hashes,
+            )
+            .unwrap();
+            // Keys in the parent scatter's bucket 0.
+            let selected: Vec<i32> = hashes
+                .iter()
+                .enumerate()
+                .filter(|(_, h)| *h % K == 0)
+                .map(|(i, _)| candidates.value(i))
+                .collect();
+            let keys = Int32Array::from(selected.clone());
+            let vals = Int32Array::from(vec![0; selected.len()]);
+            let batch =
+                RecordBatch::try_new(test_schema(), vec![Arc::new(keys), Arc::new(vals)])
+                    .unwrap();
+
+            let env = Arc::new(RuntimeEnv::default());
+            let manager = test_spill_manager(Arc::clone(&env));
+            let mut scatter = SideScatter::new(
+                K as usize,
+                key_exprs(),
+                scatter_random_state(parent_level + 1),
+                &manager,
+                128 * 1024 * 1024,
+                1024 * 1024,
+                "test_level_decorrelation",
+            );
+            scatter.scatter_batch(&batch).unwrap();
+            let sides = scatter.finish().unwrap();
+            let non_empty = sides.iter().filter(|s| s.rows > 0).count();
+            assert_eq!(
+                non_empty,
+                K as usize,
+                "level {parent_level}->{}: child scatter must use every \
+                 partition",
+                parent_level + 1
+            );
+            let max = sides.iter().map(|s| s.rows).max().unwrap();
+            let min = sides.iter().map(|s| s.rows).min().unwrap();
+            assert!(
+                max < min * 3,
+                "level {parent_level}->{}: got min={min} max={max}",
+                parent_level + 1
+            );
         }
     }
 }
