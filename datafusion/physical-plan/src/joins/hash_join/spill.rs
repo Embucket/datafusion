@@ -42,10 +42,12 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 use std::task::{Context, Poll};
 
 use crate::hash_utils::create_hashes;
 use crate::joins::PartitionMode;
+use crate::joins::SharedBitmapBuilder;
 use crate::joins::hash_join::exec::{
     BuildPhaseOutput, build_left_data, hash_table_estimate,
 };
@@ -63,7 +65,7 @@ use crate::spill::spill_manager::SpillManager;
 use crate::stream::RecordBatchStreamAdapter;
 use crate::{RecordBatchStream, SendableRecordBatchStream};
 
-use arrow::array::{Array, StringViewArray, UInt32Array};
+use arrow::array::{Array, BooleanBufferBuilder, StringViewArray, UInt32Array};
 use arrow::compute::{concat_batches, take_record_batch};
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
@@ -77,7 +79,9 @@ use datafusion_physical_expr::PhysicalExprRef;
 use datafusion_physical_expr_common::utils::evaluate_expressions_to_arrays;
 
 use ahash::RandomState;
+use futures::future::BoxFuture;
 use futures::{Stream, StreamExt, ready};
+use parking_lot::Mutex;
 
 /// Per-partition write-buffer flush threshold: coalesce scattered slices into
 /// IPC batches of roughly this size before writing.
@@ -122,20 +126,26 @@ pub(super) fn scatter_random_state(level: usize) -> RandomState {
 /// `buffered_bytes` is what fit in memory before the reservation failed; the
 /// 4x factor assumes overflow happened early in the stream. Recursion
 /// corrects underestimates, so precision is not important.
+/// `concurrent_consumers` is how many partition tables can be resident at
+/// once: 1 for Partitioned mode (one pair at a time), N for a shared
+/// CollectLeft build whose N probe partitions walk the k's out of sync —
+/// the per-partition target shrinks accordingly.
 pub(super) fn compute_partition_count(
     buffered_bytes: usize,
     pool_limit: &MemoryLimit,
     override_count: usize,
+    concurrent_consumers: usize,
 ) -> usize {
     if override_count > 0 {
         return override_count;
     }
-    let target = match pool_limit {
+    let base_target = match pool_limit {
         MemoryLimit::Finite(limit) => {
             (*limit / 16).clamp(32 * 1024 * 1024, 256 * 1024 * 1024)
         }
         _ => DEFAULT_PARTITION_TARGET_BYTES,
     };
+    let target = base_target / concurrent_consumers.max(1);
     buffered_bytes
         .saturating_mul(4)
         .div_ceil(target.max(1))
@@ -188,6 +198,75 @@ pub(super) struct SpilledBuild {
     /// Headroom reservation kept alive for the probe scatter and the
     /// partition-pair loop; dropped when the spill join completes.
     pub(super) headroom: MemoryReservation,
+}
+
+/// A spilled build shared by all `CollectLeft` probe partitions.
+///
+/// The single build was scattered once into `K` disk partitions; each of the
+/// `probe_threads` output partitions scatters ITS OWN probe stream with the
+/// same seed and then walks k = 0..K, loading its OWN copy of k's hash
+/// table (memory: at most one table per probe partition at a time, which is
+/// what the auto partition-count sizing assumes). What IS shared per k is
+/// the visited bitmap and the probe-completion counter injected into each
+/// copy's [`JoinLeftData`]: matches from every probe partition mark one
+/// bitmap, and the existing last-finisher logic emits unmatched build rows
+/// exactly once. Row order is deterministic across copies (same files, same
+/// order), so bitmap indices agree.
+///
+/// [`JoinLeftData`]: super::exec::JoinLeftData
+pub(super) struct SharedSpilledBuild {
+    pub(super) partitions: Vec<SharedSpilledSide>,
+    pub(super) partition_count: usize,
+    pub(super) level: usize,
+    /// Bounds for dynamic-filter reporting (exact — accumulators keep
+    /// running during the scatter).
+    pub(super) bounds: Option<PartitionBounds>,
+    /// Number of probe partitions that will walk the shared build.
+    pub(super) probe_threads: usize,
+    /// Per-k shared visited bitmap + probe-completion counter.
+    shared_state: Vec<(Arc<SharedBitmapBuilder>, Arc<AtomicUsize>)>,
+    /// Scatter headroom, held until the whole shared build is dropped.
+    _headroom: MemoryReservation,
+}
+
+/// One shared build partition: file handles are `Arc`d so every output
+/// partition can read them.
+pub(super) struct SharedSpilledSide {
+    pub(super) files: Arc<Vec<RefCountedTempFile>>,
+}
+
+impl SharedSpilledBuild {
+    pub(super) fn new(
+        partitions: Vec<SpilledSide>,
+        level: usize,
+        bounds: Option<PartitionBounds>,
+        probe_threads: usize,
+        headroom: MemoryReservation,
+    ) -> Self {
+        let partition_count = partitions.len();
+        let partitions = partitions
+            .into_iter()
+            .map(|side| SharedSpilledSide {
+                files: Arc::new(side.files),
+            })
+            .collect();
+        Self {
+            partitions,
+            partition_count,
+            level,
+            bounds,
+            probe_threads,
+            shared_state: (0..partition_count)
+                .map(|_| {
+                    (
+                        Arc::new(Mutex::new(BooleanBufferBuilder::new(0))),
+                        Arc::new(AtomicUsize::new(probe_threads)),
+                    )
+                })
+                .collect(),
+            _headroom: headroom,
+        }
+    }
 }
 
 /// A single partition's spill writer: buffers scattered slices and appends
@@ -1334,6 +1413,7 @@ impl SpillJoinDriver {
             self.spec.null_equality,
             &array_map_count,
             table_reserved,
+            None,
         )?;
         drop(batches);
 
@@ -1368,6 +1448,259 @@ impl SpillJoinDriver {
 
         Ok(Box::pin(inner))
     }
+}
+
+enum SharedDriverPhase {
+    /// Scatter this output partition's OWN probe stream into `K` partitions.
+    ScatterProbe {
+        probe: SendableRecordBatchStream,
+        scatter: SideScatter,
+    },
+    /// Move to the next shared build partition.
+    NextK,
+    /// Run k's join: shared build (lazily built once across partitions)
+    /// against this partition's probe files for k.
+    RunK {
+        inner: SendableRecordBatchStream,
+    },
+    Done,
+}
+
+/// Drives one output partition's share of a spilled `CollectLeft` join.
+///
+/// Unlike the Partitioned-mode driver, every k MUST run even when this
+/// partition's probe side is empty: the shared `JoinLeftData` counts probe
+/// completions, and skipping would leave the counter high so unmatched
+/// build rows would never be emitted. Oversized shared partitions surface a
+/// clean error (no recursion/chunking for the shared build in v1 — the
+/// shared visited bitmap cannot be split across chunks).
+pub(super) struct SharedSpillJoinDriver {
+    ctx: Arc<HashJoinSpillContext>,
+    spec: InnerJoinSpec,
+    shared: Arc<SharedSpilledBuild>,
+    phase: SharedDriverPhase,
+    probe_parts: Vec<Option<SpilledSide>>,
+    next_k: usize,
+    /// Outer metrics: probe input rows/batches are recorded during scatter.
+    outer_metrics: BuildProbeJoinMetrics,
+    /// Private metrics for inner per-k streams.
+    inner_metrics_set: ExecutionPlanMetricsSet,
+}
+
+impl SharedSpillJoinDriver {
+    pub(super) fn new(
+        shared: Arc<SharedSpilledBuild>,
+        probe: SendableRecordBatchStream,
+        ctx: Arc<HashJoinSpillContext>,
+        spec: InnerJoinSpec,
+        outer_metrics: BuildProbeJoinMetrics,
+    ) -> Self {
+        let scatter = SideScatter::new(
+            shared.partition_count,
+            spec.on_right.clone(),
+            scatter_random_state(shared.level),
+            &ctx.probe_spill,
+            ctx.max_spill_file_size,
+            ctx.headroom_bytes / 2,
+            "hash_join_probe_spill",
+        );
+        Self {
+            spec,
+            phase: SharedDriverPhase::ScatterProbe { probe, scatter },
+            probe_parts: Vec::new(),
+            next_k: 0,
+            outer_metrics,
+            inner_metrics_set: ExecutionPlanMetricsSet::new(),
+            ctx,
+            shared,
+        }
+    }
+
+    pub(super) fn poll_next(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<RecordBatch>>> {
+        loop {
+            match &self.phase {
+                SharedDriverPhase::ScatterProbe { .. } => {
+                    ready!(self.poll_scatter_probe(cx))?;
+                }
+                SharedDriverPhase::NextK => self.start_next_k()?,
+                SharedDriverPhase::RunK { .. } => {
+                    let polled = {
+                        let SharedDriverPhase::RunK { inner } = &mut self.phase else {
+                            return Poll::Ready(Some(internal_err!(
+                                "expected RunK phase"
+                            )));
+                        };
+                        ready!(inner.poll_next_unpin(cx))
+                    };
+                    match polled {
+                        Some(item) => return Poll::Ready(Some(item)),
+                        None => {
+                            self.phase = SharedDriverPhase::NextK;
+                        }
+                    }
+                }
+                SharedDriverPhase::Done => return Poll::Ready(None),
+            }
+        }
+    }
+
+    fn poll_scatter_probe(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        let polled = {
+            let SharedDriverPhase::ScatterProbe { probe, .. } = &mut self.phase else {
+                return Poll::Ready(internal_err!("expected ScatterProbe phase"));
+            };
+            ready!(probe.poll_next_unpin(cx))
+        };
+        match polled {
+            Some(batch) => {
+                let batch = batch?;
+                self.outer_metrics.input_batches.add(1);
+                self.outer_metrics.input_rows.add(batch.num_rows());
+                let SharedDriverPhase::ScatterProbe { scatter, .. } = &mut self.phase
+                else {
+                    return Poll::Ready(internal_err!("expected ScatterProbe phase"));
+                };
+                scatter.scatter_batch(&batch)?;
+            }
+            None => {
+                let SharedDriverPhase::ScatterProbe { scatter, .. } =
+                    std::mem::replace(&mut self.phase, SharedDriverPhase::NextK)
+                else {
+                    return Poll::Ready(internal_err!("expected ScatterProbe phase"));
+                };
+                self.probe_parts = scatter.finish()?.into_iter().map(Some).collect();
+            }
+        }
+        Poll::Ready(Ok(()))
+    }
+
+    fn start_next_k(&mut self) -> Result<()> {
+        let k = self.next_k;
+        if k >= self.shared.partition_count {
+            self.phase = SharedDriverPhase::Done;
+            return Ok(());
+        }
+        self.next_k += 1;
+
+        let probe = self.probe_parts[k].take().ok_or_else(|| {
+            DataFusionError::Internal(format!(
+                "shared spill probe partition {k} already consumed"
+            ))
+        })?;
+
+        let (bitmap, counter) = &self.shared.shared_state[k];
+        let left_fut = OnceFut::new(shared_build_loader(
+            Arc::clone(&self.ctx),
+            Arc::clone(&self.shared.partitions[k].files),
+            k,
+            self.spec.random_state.clone(),
+            self.spec.join_type,
+            self.spec.null_equality,
+            self.shared.probe_threads,
+            (Arc::clone(bitmap), Arc::clone(counter)),
+        ));
+
+        let inner_metrics = BuildProbeJoinMetrics::new(k, &self.inner_metrics_set);
+        let probe_stream =
+            spilled_side_stream(probe.files, Arc::clone(&self.ctx.probe_spill));
+        let inner = HashJoinStream::new(
+            self.spec.partition,
+            Arc::clone(&self.spec.schema),
+            self.spec.on_right.clone(),
+            self.spec.filter.clone(),
+            self.spec.join_type,
+            probe_stream,
+            self.spec.random_state.clone(),
+            inner_metrics,
+            self.spec.column_indices.clone(),
+            self.spec.null_equality,
+            HashJoinStreamState::WaitBuildSide,
+            BuildSide::Initial(BuildSideInitialState { left_fut }),
+            self.spec.batch_size,
+            vec![],
+            false,
+            None,
+            PartitionMode::CollectLeft,
+            false,
+            None,
+            None,
+        );
+        self.phase = SharedDriverPhase::RunK {
+            inner: Box::pin(inner),
+        };
+        Ok(())
+    }
+}
+
+/// Load shared build partition `k` into memory and construct its
+/// `JoinLeftData` with `probe_threads_count = N` so the existing
+/// last-finisher machinery handles shared unmatched-row emission.
+#[expect(clippy::too_many_arguments)]
+fn shared_build_loader(
+    ctx: Arc<HashJoinSpillContext>,
+    files: Arc<Vec<RefCountedTempFile>>,
+    k: usize,
+    random_state: RandomState,
+    join_type: JoinType,
+    null_equality: NullEquality,
+    probe_threads: usize,
+    shared_state: (Arc<SharedBitmapBuilder>, Arc<AtomicUsize>),
+) -> BoxFuture<'static, Result<BuildPhaseOutput>> {
+    Box::pin(async move {
+        let reservation =
+            MemoryConsumer::new(format!("HashJoinSpillShared[{}.{k}]", ctx.partition))
+                .with_can_spill(true)
+                .register(&ctx.pool);
+
+        let mut stream =
+            spilled_side_stream(files.as_ref().clone(), Arc::clone(&ctx.build_spill));
+        let mut batches = Vec::new();
+        let mut num_rows = 0usize;
+        let mut table_reserved = 0usize;
+        while let Some(batch) = stream.next().await {
+            let batch = batch?;
+            let size = get_record_batch_memory_size(&batch);
+            let table_delta = hash_table_estimate(num_rows + batch.num_rows())?
+                .saturating_sub(table_reserved);
+            reservation.try_grow(size + table_delta).map_err(|e| {
+                e.context(format!(
+                    "shared spilled hash join build partition {k} does not fit \
+                     in the memory budget (CollectLeft spill does not \
+                     repartition recursively); increase the memory budget"
+                ))
+            })?;
+            table_reserved += table_delta;
+            num_rows += batch.num_rows();
+            batches.push(batch);
+        }
+
+        let metrics_set = ExecutionPlanMetricsSet::new();
+        let inner_metrics = BuildProbeJoinMetrics::new(k, &metrics_set);
+        let array_map_count = Count::new();
+        let need_bitmap = need_produce_result_in_final(join_type);
+        let data = build_left_data(
+            &batches,
+            num_rows,
+            ctx.build_spill.schema(),
+            &ctx.on_left,
+            &random_state,
+            reservation,
+            &inner_metrics,
+            need_bitmap,
+            probe_threads,
+            None,
+            false,
+            &ctx.config,
+            null_equality,
+            &array_map_count,
+            table_reserved,
+            Some(shared_state),
+        )?;
+        Ok(BuildPhaseOutput::InMemory(Arc::new(data)))
+    })
 }
 
 #[cfg(test)]
@@ -2242,6 +2575,121 @@ mod tests {
                 max < min * 3,
                 "level {parent_level}->{}: got min={min} max={max}",
                 parent_level + 1
+            );
+        }
+    }
+    /// Build a CollectLeft-mode join: one shared build, two probe partitions.
+    fn collect_left_join(
+        left_batches: Vec<RecordBatch>,
+        right_parts: Vec<Vec<RecordBatch>>,
+        join_type: JoinType,
+    ) -> Arc<dyn ExecutionPlan> {
+        let left_schema = left_batches[0].schema();
+        let right_schema = right_parts[0][0].schema();
+        let left =
+            TestMemoryExec::try_new_exec(&[left_batches], Arc::clone(&left_schema), None)
+                .unwrap();
+        let right =
+            TestMemoryExec::try_new_exec(&right_parts, Arc::clone(&right_schema), None)
+                .unwrap();
+        let on = vec![(
+            Arc::new(Column::new_with_schema("k", &left_schema).unwrap()) as _,
+            Arc::new(Column::new_with_schema("k", &right_schema).unwrap()) as _,
+        )];
+        Arc::new(
+            HashJoinExec::try_new(
+                left,
+                right,
+                on,
+                None,
+                &join_type,
+                None,
+                PartitionMode::CollectLeft,
+                NullEquality::NullEqualsNothing,
+                false,
+            )
+            .unwrap(),
+        )
+    }
+
+    /// CollectLeft spill: the shared scattered build must produce identical
+    /// results to the in-memory join across all probe partitions — including
+    /// exactly-once unmatched build emission (Left/Full/LeftAnti), which
+    /// exercises the shared per-k bitmap and last-finisher accounting.
+    #[tokio::test]
+    async fn collect_left_forced_spill_matches_in_memory() {
+        use JoinType::*;
+        for join_type in [Inner, Left, LeftAnti, Full] {
+            let build = chunked_build_batches(2_000_000);
+            // Partition 0 half-overlaps the build key range; partition 1 is
+            // fully matched.
+            let right_parts =
+                vec![vec![make_batch(1_996_000, 8192)], vec![make_batch(0, 4096)]];
+
+            let spilled_join =
+                collect_left_join(build.clone(), right_parts.clone(), join_type);
+            // Two probe partitions walk the shared k's out of sync, so the
+            // pool must admit two resident per-k tables at once: K=32 keeps
+            // each table ~2.7MB against the 8MB pool.
+            let runtime = RuntimeEnvBuilder::new()
+                .with_memory_limit(8 * 1024 * 1024, 1.0)
+                .build_arc()
+                .unwrap();
+            let mut session_config = SessionConfig::default().with_batch_size(4096);
+            {
+                let exec = &mut session_config.options_mut().execution;
+                exec.enable_hash_join_spill = true;
+                exec.hash_join_spill_headroom_bytes = 256 * 1024;
+                exec.hash_join_spill_partition_count = 32;
+            }
+            let ctx = Arc::new(
+                TaskContext::default()
+                    .with_session_config(session_config)
+                    .with_runtime(runtime),
+            );
+            // Poll both output partitions concurrently (as real plans do):
+            // out-of-sync consumption is what the shared per-k accounting
+            // must survive.
+            let s0 = spilled_join.execute(0, Arc::clone(&ctx)).unwrap();
+            let s1 = spilled_join.execute(1, Arc::clone(&ctx)).unwrap();
+            let (r0, r1) = futures::join!(common::collect(s0), common::collect(s1));
+            let mut spilled =
+                r0.unwrap_or_else(|e| panic!("{join_type:?} partition 0 failed: {e}"));
+            spilled.extend(
+                r1.unwrap_or_else(|e| panic!("{join_type:?} partition 1 failed: {e}")),
+            );
+
+            let metrics = spilled_join.metrics().unwrap();
+            assert_eq!(
+                metrics
+                    .sum_by_name("join_spill_engaged")
+                    .map(|m| m.as_usize()),
+                Some(1),
+                "{join_type:?} must have engaged spilling"
+            );
+
+            let reference_join = collect_left_join(build, right_parts, join_type);
+            let ref_ctx = Arc::new(TaskContext::default());
+            let (f0, f1) = futures::join!(
+                common::collect(reference_join.execute(0, Arc::clone(&ref_ctx)).unwrap()),
+                common::collect(reference_join.execute(1, ref_ctx).unwrap())
+            );
+            let mut reference = f0.unwrap();
+            reference.extend(f1.unwrap());
+
+            assert_eq!(
+                result_fingerprint(&spilled),
+                result_fingerprint(&reference),
+                "{join_type:?} CollectLeft spilled vs in-memory mismatch"
+            );
+            // The exec node's left_fut cache retains the shared build (and
+            // its scatter headroom) until the plan drops — the same lifetime
+            // the in-memory CollectLeft build has today.
+            drop(spilled_join);
+            assert_eq!(
+                ctx.memory_pool().reserved(),
+                0,
+                "{join_type:?} leaked memory"
             );
         }
     }
