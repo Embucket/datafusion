@@ -1325,8 +1325,12 @@ impl ExecutionPlan for HashJoinExec {
 
         // Spill applies to Partitioned-mode joins over a working DiskManager.
         // (CollectLeft's shared build is a follow-up; null-aware anti joins
-        // need global probe-side knowledge and are excluded. Non-inner join
-        // types arrive with per-partition bitmap support.)
+        // need global probe-side knowledge and are excluded.)
+        //
+        // Every join type is supported: disk partitions are key-disjoint, so
+        // each pair's in-memory join sees all rows for its keys — unmatched
+        // detection (visited bitmaps, probe-side null padding) is complete
+        // within a pair.
         //
         // A spilled join emits probe rows partition-by-partition, so it CANNOT
         // preserve probe-side ordering. When this operator advertises that it
@@ -1338,7 +1342,6 @@ impl ExecutionPlan for HashJoinExec {
         let spill_context = if can_spill
             && self.mode == PartitionMode::Partitioned
             && !self.null_aware
-            && self.join_type == JoinType::Inner
             && !would_break_output_order
             && context.runtime_env().disk_manager.tmp_files_enabled()
         {

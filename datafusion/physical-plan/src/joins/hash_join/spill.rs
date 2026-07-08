@@ -526,13 +526,22 @@ impl SpillJoinDriver {
         }
     }
 
-    /// Whether an empty side lets the pair be skipped entirely. Inner joins
-    /// produce nothing when either side is empty. (Join types that emit
-    /// unmatched rows arrive in M3 and must still run such pairs.)
+    /// Whether an empty side lets the pair be skipped entirely, i.e. the
+    /// join type provably produces no rows for it. Pairs that emit unmatched
+    /// rows from a non-empty side must still run: the inner stream handles
+    /// an empty probe (unmatched build emission) and an empty build
+    /// (probe-side null padding) natively.
     fn can_skip_pair(&self, build_rows: usize, probe_rows: usize) -> bool {
+        use JoinType::*;
         match self.spec.join_type {
-            JoinType::Inner => build_rows == 0 || probe_rows == 0,
-            _ => false,
+            // Emit only matches: either side empty means no output.
+            Inner | LeftSemi | RightSemi => build_rows == 0 || probe_rows == 0,
+            // Emit (un)matched build rows: only an empty build side is silent.
+            Left | LeftAnti | LeftMark => build_rows == 0,
+            // Emit (un)matched probe rows: only an empty probe side is silent.
+            Right | RightAnti | RightMark => probe_rows == 0,
+            // Emits unmatched rows from both sides.
+            Full => build_rows == 0 && probe_rows == 0,
         }
     }
 
@@ -846,6 +855,23 @@ mod tests {
             .collect();
         rows.sort();
         rows
+    }
+
+    /// Cheap multiset fingerprint of a result set: (row count, wrapping sum
+    /// of row hashes). Equal row multisets yield equal fingerprints; the
+    /// converse holds with overwhelming probability, which is plenty for
+    /// comparing a spilled run against its in-memory reference.
+    fn result_fingerprint(batches: &[RecordBatch]) -> (usize, u64) {
+        let state = RandomState::with_seeds(1, 2, 3, 4);
+        let mut count = 0usize;
+        let mut sum = 0u64;
+        for batch in batches.iter().filter(|b| b.num_rows() > 0) {
+            let mut hashes = vec![0u64; batch.num_rows()];
+            create_hashes(batch.columns(), &state, &mut hashes).unwrap();
+            count += batch.num_rows();
+            sum = hashes.iter().fold(sum, |acc, h| acc.wrapping_add(*h));
+        }
+        (count, sum)
     }
 
     #[tokio::test]
@@ -1163,5 +1189,187 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("Resources exhausted"), "got: {err}");
+    }
+    /// Build a Partitioned-mode join from explicit batch lists.
+    fn join_from_batches(
+        left_batches: Vec<RecordBatch>,
+        right_batches: Vec<RecordBatch>,
+        join_type: JoinType,
+        null_equality: NullEquality,
+    ) -> Arc<dyn ExecutionPlan> {
+        let left_schema = left_batches[0].schema();
+        let right_schema = right_batches[0].schema();
+        let left =
+            TestMemoryExec::try_new_exec(&[left_batches], Arc::clone(&left_schema), None)
+                .unwrap();
+        let right = TestMemoryExec::try_new_exec(
+            &[right_batches],
+            Arc::clone(&right_schema),
+            None,
+        )
+        .unwrap();
+        let on = vec![(
+            Arc::new(Column::new_with_schema("k", &left_schema).unwrap()) as _,
+            Arc::new(Column::new_with_schema("k", &right_schema).unwrap()) as _,
+        )];
+        Arc::new(
+            HashJoinExec::try_new(
+                left,
+                right,
+                on,
+                None,
+                &join_type,
+                None,
+                PartitionMode::Partitioned,
+                null_equality,
+                false,
+            )
+            .unwrap(),
+        )
+    }
+
+    fn chunked_build_batches(rows: usize) -> Vec<RecordBatch> {
+        (0..rows.div_ceil(100_000))
+            .map(|i| make_batch(i as i32 * 100_000, 100_000.min(rows - i * 100_000)))
+            .collect()
+    }
+
+    /// Every join type must produce identical results spilled vs in-memory.
+    /// The probe range half-overlaps the build range so matches, unmatched
+    /// build rows, and unmatched probe rows all occur.
+    #[tokio::test]
+    async fn forced_spill_matches_in_memory_for_all_join_types() {
+        use JoinType::*;
+        let join_types = [
+            Inner, Left, Right, Full, LeftSemi, LeftAnti, RightSemi, RightAnti, LeftMark,
+            RightMark,
+        ];
+        for join_type in join_types {
+            let build = chunked_build_batches(1_000_000);
+            // 8192 probe rows: first half matches build keys, second half
+            // (>= 1M) has no build match.
+            let probe = vec![make_batch(996_000, 8192)];
+
+            let spilled_join = join_from_batches(
+                build.clone(),
+                probe.clone(),
+                join_type,
+                NullEquality::NullEqualsNothing,
+            );
+            let ctx = spill_task_ctx(4 * 1024 * 1024);
+            let spilled =
+                common::collect(spilled_join.execute(0, Arc::clone(&ctx)).unwrap())
+                    .await
+                    .unwrap_or_else(|e| panic!("{join_type:?} spilled run failed: {e}"));
+            let metrics = spilled_join.metrics().unwrap();
+            assert_eq!(
+                metrics
+                    .sum_by_name("join_spill_engaged")
+                    .map(|m| m.as_usize()),
+                Some(1),
+                "{join_type:?} must have engaged spilling"
+            );
+
+            let reference_join = join_from_batches(
+                build,
+                probe,
+                join_type,
+                NullEquality::NullEqualsNothing,
+            );
+            let reference = common::collect(
+                reference_join
+                    .execute(0, Arc::new(TaskContext::default()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(
+                result_fingerprint(&spilled),
+                result_fingerprint(&reference),
+                "{join_type:?} results differ between spilled and in-memory"
+            );
+            assert_eq!(ctx.memory_pool().reserved(), 0, "{join_type:?} leaked");
+        }
+    }
+
+    fn nullable_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int32, true),
+            Field::new("v", DataType::Int32, false),
+        ]))
+    }
+
+    /// Like `make_batch` but every 100th key is NULL. All NULL keys hash to
+    /// one disk partition, and under NullEqualsNull they cross-join — the
+    /// density keeps that product (and the partition skew, which is the
+    /// chunked fallback's job) small.
+    fn make_nullable_batch(start: i32, len: usize) -> RecordBatch {
+        let keys = Int32Array::from_iter(
+            (start..start + len as i32).map(|i| (i % 100 != 0).then_some(i)),
+        );
+        let vals = Int32Array::from_iter_values((0..len as i32).map(|v| v * 10));
+        RecordBatch::try_new(nullable_schema(), vec![Arc::new(keys), Arc::new(vals)])
+            .unwrap()
+    }
+
+    /// NULL join keys must behave identically spilled vs in-memory under
+    /// both null-equality semantics (all NULLs scatter to one partition, so
+    /// NullEqualsNull matching stays complete).
+    #[tokio::test]
+    async fn forced_spill_null_equality_matrix() {
+        use JoinType::*;
+        for join_type in [Inner, Left, Full] {
+            for null_equality in [
+                NullEquality::NullEqualsNothing,
+                NullEquality::NullEqualsNull,
+            ] {
+                let build: Vec<RecordBatch> = (0..10)
+                    .map(|i| make_nullable_batch(i * 100_000, 100_000))
+                    .collect();
+                // Half the probe keys match build keys, half exceed them.
+                let probe = vec![make_nullable_batch(999_500, 1024)];
+
+                let spilled_join = join_from_batches(
+                    build.clone(),
+                    probe.clone(),
+                    join_type,
+                    null_equality,
+                );
+                let ctx = spill_task_ctx(4 * 1024 * 1024);
+                let spilled =
+                    common::collect(spilled_join.execute(0, Arc::clone(&ctx)).unwrap())
+                        .await
+                        .unwrap_or_else(|e| {
+                            panic!(
+                                "{join_type:?}/{null_equality:?} spilled run failed: {e}"
+                            )
+                        });
+                let metrics = spilled_join.metrics().unwrap();
+                assert_eq!(
+                    metrics
+                        .sum_by_name("join_spill_engaged")
+                        .map(|m| m.as_usize()),
+                    Some(1),
+                    "{join_type:?}/{null_equality:?} must have engaged spilling"
+                );
+
+                let reference_join =
+                    join_from_batches(build, probe, join_type, null_equality);
+                let reference = common::collect(
+                    reference_join
+                        .execute(0, Arc::new(TaskContext::default()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+                assert_eq!(
+                    result_fingerprint(&spilled),
+                    result_fingerprint(&reference),
+                    "{join_type:?}/{null_equality:?} spilled vs in-memory mismatch"
+                );
+            }
+        }
     }
 }
