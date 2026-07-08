@@ -1321,7 +1321,7 @@ impl ExecutionPlan for HashJoinExec {
         // When the spill fallback is enabled, the build-side reservation is
         // spillable: on overflow the operator scatters the build side to disk
         // instead of failing, so spilling pools may treat it accordingly.
-        let can_spill = context
+        let spill_flag = context
             .session_config()
             .options()
             .execution
@@ -1343,7 +1343,7 @@ impl ExecutionPlan for HashJoinExec {
         // operators consuming out-of-order rows.
         let would_break_output_order = Self::maintains_input_order(self.join_type)[1]
             && self.right.output_ordering().is_some();
-        let spill_context = if can_spill
+        let spill_context = if spill_flag
             && matches!(
                 self.mode,
                 PartitionMode::Partitioned | PartitionMode::CollectLeft
@@ -1393,7 +1393,7 @@ impl ExecutionPlan for HashJoinExec {
                 let left_stream = self.left.execute(0, Arc::clone(&context))?;
 
                 let reservation = MemoryConsumer::new("HashJoinInput")
-                    .with_can_spill(can_spill)
+                    .with_can_spill(spill_context.is_some())
                     .register(context.memory_pool());
 
                 Ok(collect_left_input(
@@ -1419,7 +1419,7 @@ impl ExecutionPlan for HashJoinExec {
 
                 let reservation =
                     MemoryConsumer::new(format!("HashJoinInput[{partition}]"))
-                        .with_can_spill(can_spill)
+                        .with_can_spill(spill_context.is_some())
                         .register(context.memory_pool());
 
                 OnceFut::new(collect_left_input(
