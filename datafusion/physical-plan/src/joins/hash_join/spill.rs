@@ -999,6 +999,12 @@ impl SpillJoinDriver {
         };
 
         self.ctx.repartition_passes.add(1);
+        log::info!(
+            "hash join spill: repartitioning oversized pair (partition={} level={} parent_bytes={})",
+            self.ctx.partition,
+            level,
+            parent_build_bytes
+        );
         let child_level = level + 1;
         let mut scatter = SideScatter::new(
             CHILD_FANOUT,
@@ -1373,6 +1379,13 @@ impl SpillJoinDriver {
         table_reserved: usize,
     ) -> Result<SendableRecordBatchStream> {
         self.ctx.fallback_chunks.add(1);
+        log::info!(
+            "hash join spill: chunked fallback chunk (partition={} pair={} chunk={} rows={})",
+            self.ctx.partition,
+            state.pair_id,
+            state.chunk_index,
+            num_rows
+        );
         let _ = state.level; // recorded for diagnostics via consumer names
         self.build_inner_join(
             state.pair_id,

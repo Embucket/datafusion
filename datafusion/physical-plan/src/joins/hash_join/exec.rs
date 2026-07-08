@@ -1924,6 +1924,12 @@ impl BuildSideState {
             .clone()
             .ok_or_else(|| internal_datafusion_err!("engage_spill without context"))?;
         ctx.spill_engaged.add(1);
+        log::info!(
+            "hash join spill engaged: partition={} buffered_bytes={} rows={}",
+            ctx.partition,
+            self.batch_sizes.iter().sum::<usize>(),
+            self.num_rows
+        );
 
         let buffered: usize = self.batch_sizes.iter().sum();
         let partition_count = compute_partition_count(
