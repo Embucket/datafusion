@@ -28,7 +28,7 @@ use crate::coalesce::{LimitedBatchCoalescer, PushBatchStatus};
 use crate::joins::Map;
 use crate::joins::MapOffset;
 use crate::joins::PartitionMode;
-use crate::joins::hash_join::exec::JoinLeftData;
+use crate::joins::hash_join::exec::{BuildPhaseOutput, JoinLeftData};
 use crate::joins::hash_join::shared_bounds::{
     PartitionBounds, PartitionBuildData, SharedBuildAccumulator,
 };
@@ -69,7 +69,7 @@ pub(super) enum BuildSide {
 /// Container for BuildSide::Initial related data
 pub(super) struct BuildSideInitialState {
     /// Future for building hash table from build-side input
-    pub(super) left_fut: OnceFut<JoinLeftData>,
+    pub(super) left_fut: OnceFut<BuildPhaseOutput>,
 }
 
 /// Container for BuildSide::Ready related data
@@ -482,13 +482,17 @@ impl HashJoinStream {
     ) -> Poll<Result<StatefulStreamResult<Option<RecordBatch>>>> {
         let build_timer = self.join_metrics.build_time.timer();
         // build hash table from left (build) side, if not yet done
-        let left_data = ready!(
+        let build_output = ready!(
             self.build_side
                 .try_as_initial_mut()?
                 .left_fut
                 .get_shared(cx)
         )?;
         build_timer.done();
+
+        let left_data = match build_output.as_ref() {
+            BuildPhaseOutput::InMemory(data) => Arc::clone(data),
+        };
 
         // Note: For null-aware anti join, we need to check the probe side (right) for NULLs,
         // not the build side (left). The probe-side NULL check happens during process_probe_batch.

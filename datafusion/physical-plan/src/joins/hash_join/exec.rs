@@ -251,6 +251,14 @@ impl JoinLeftData {
     }
 }
 
+/// Result of the build phase: either the classic fully in-memory build, or
+/// (when `enable_hash_join_spill` is on and the memory budget was exceeded)
+/// a build side that has been scattered into disk partitions to be joined
+/// pair-by-pair within the budget.
+pub(super) enum BuildPhaseOutput {
+    InMemory(Arc<JoinLeftData>),
+}
+
 /// Helps to build [`HashJoinExec`].
 ///
 /// Builder can be created from an existing [`HashJoinExec`] using [`From::from`].
@@ -734,7 +742,7 @@ pub struct HashJoinExec {
     ///
     /// Each output stream waits on the `OnceAsync` to signal the completion of
     /// the hash table creation.
-    left_fut: Arc<OnceAsync<JoinLeftData>>,
+    left_fut: Arc<OnceAsync<BuildPhaseOutput>>,
     /// Shared the `SeededRandomState` for the hashing algorithm (seeds preserved for serialization)
     random_state: SeededRandomState,
     /// Partitioning mode to use
@@ -1295,12 +1303,22 @@ impl ExecutionPlan for HashJoinExec {
         let array_map_created_count = MetricBuilder::new(&self.metrics)
             .counter(ARRAY_MAP_CREATED_COUNT_METRIC_NAME, partition);
 
+        // When the spill fallback is enabled, the build-side reservation is
+        // spillable: on overflow the operator scatters the build side to disk
+        // instead of failing, so spilling pools may treat it accordingly.
+        let can_spill = context
+            .session_config()
+            .options()
+            .execution
+            .enable_hash_join_spill;
+
         let left_fut = match self.mode {
             PartitionMode::CollectLeft => self.left_fut.try_once(|| {
                 let left_stream = self.left.execute(0, Arc::clone(&context))?;
 
-                let reservation =
-                    MemoryConsumer::new("HashJoinInput").register(context.memory_pool());
+                let reservation = MemoryConsumer::new("HashJoinInput")
+                    .with_can_spill(can_spill)
+                    .register(context.memory_pool());
 
                 Ok(collect_left_input(
                     self.random_state.random_state().clone(),
@@ -1321,6 +1339,7 @@ impl ExecutionPlan for HashJoinExec {
 
                 let reservation =
                     MemoryConsumer::new(format!("HashJoinInput[{partition}]"))
+                        .with_can_spill(can_spill)
                         .register(context.memory_pool());
 
                 OnceFut::new(collect_left_input(
@@ -1845,7 +1864,7 @@ async fn collect_left_input(
     config: Arc<ConfigOptions>,
     null_equality: NullEquality,
     array_map_created_count: Count,
-) -> Result<JoinLeftData> {
+) -> Result<BuildPhaseOutput> {
     let schema = left_stream.schema();
 
     let should_collect_min_max_for_phj =
@@ -1889,12 +1908,12 @@ async fn collect_left_input(
         batches,
         num_rows,
         metrics,
-        mut reservation,
+        reservation,
         bounds_accumulators,
     } = state;
 
     // Compute bounds
-    let mut bounds = match bounds_accumulators {
+    let bounds = match bounds_accumulators {
         Some(accumulators) if num_rows > 0 => {
             let bounds = accumulators
                 .into_iter()
@@ -1905,12 +1924,61 @@ async fn collect_left_input(
         _ => None,
     };
 
+    let data = build_left_data(
+        &batches,
+        num_rows,
+        &schema,
+        &on_left,
+        &random_state,
+        reservation,
+        &metrics,
+        with_visited_indices_bitmap,
+        probe_threads_count,
+        bounds,
+        should_collect_min_max_for_phj && !should_compute_dynamic_filters,
+        &config,
+        null_equality,
+        &array_map_created_count,
+    )?;
+
+    Ok(BuildPhaseOutput::InMemory(Arc::new(data)))
+}
+
+/// Builds the in-memory join structures (hash table or perfect-hash
+/// [`ArrayMap`], concatenated build batch, join-key arrays, visited bitmap,
+/// membership pushdown) from an already-collected set of build batches.
+///
+/// Extracted from [`collect_left_input`] so the same code serves both the
+/// classic fully in-memory build and per-partition builds when the join
+/// spills (grace hash join). All memory is accounted against `reservation`,
+/// which is moved into the returned [`JoinLeftData`].
+///
+/// `mask_bounds` clears the computed bounds from the result when they were
+/// only collected for the perfect-hash decision and dynamic-filter pushdown
+/// is disabled.
+#[expect(clippy::too_many_arguments)]
+pub(super) fn build_left_data(
+    batches: &[RecordBatch],
+    num_rows: usize,
+    schema: &SchemaRef,
+    on_left: &[PhysicalExprRef],
+    random_state: &RandomState,
+    mut reservation: MemoryReservation,
+    metrics: &BuildProbeJoinMetrics,
+    with_visited_indices_bitmap: bool,
+    probe_threads_count: usize,
+    mut bounds: Option<PartitionBounds>,
+    mask_bounds: bool,
+    config: &ConfigOptions,
+    null_equality: NullEquality,
+    array_map_created_count: &Count,
+) -> Result<JoinLeftData> {
     let (join_hash_map, batch, left_values) =
         if let Some((array_map, batch, left_value)) = try_create_array_map(
             &bounds,
-            &schema,
-            &batches,
-            &on_left,
+            schema,
+            batches,
+            on_left,
             &mut reservation,
             config.execution.perfect_hash_join_small_build_threshold,
             config.execution.perfect_hash_join_min_key_density,
@@ -1953,11 +2021,11 @@ async fn collect_left_input(
                 hashes_buffer.clear();
                 hashes_buffer.resize(batch.num_rows(), 0);
                 update_hash(
-                    &on_left,
+                    on_left,
                     batch,
                     &mut *hashmap,
                     offset,
-                    &random_state,
+                    random_state,
                     &mut hashes_buffer,
                     0,
                     true,
@@ -1966,9 +2034,9 @@ async fn collect_left_input(
             }
 
             // Merge all batches into a single batch, so we can directly index into the arrays
-            let batch = concat_batches(&schema, batches_iter.clone())?;
+            let batch = concat_batches(schema, batches_iter.clone())?;
 
-            let left_values = evaluate_expressions_to_arrays(&on_left, &batch)?;
+            let left_values = evaluate_expressions_to_arrays(on_left, &batch)?;
 
             (Map::HashMap(hashmap), batch, left_values)
         };
@@ -2014,7 +2082,7 @@ async fn collect_left_input(
         }
     };
 
-    if should_collect_min_max_for_phj && !should_compute_dynamic_filters {
+    if mask_bounds {
         bounds = None;
     }
 
