@@ -37,6 +37,10 @@ use crate::joins::hash_join::inlist_builder::build_struct_inlist_values;
 use crate::joins::hash_join::shared_bounds::{
     ColumnBounds, PartitionBounds, PushdownStrategy, SharedBuildAccumulator,
 };
+use crate::joins::hash_join::spill::{
+    HashJoinSpillContext, SideScatter, SpilledBuild, compute_partition_count,
+    scatter_random_state,
+};
 use crate::joins::hash_join::stream::{
     BuildSide, BuildSideInitialState, HashJoinStream, HashJoinStreamState,
 };
@@ -46,6 +50,7 @@ use crate::joins::utils::{
     swap_join_projection, update_hash,
 };
 use crate::joins::{JoinOn, JoinOnRef, PartitionMode, SharedBitmapBuilder};
+use crate::metrics::SpillMetrics;
 use crate::metrics::{Count, MetricBuilder};
 use crate::projection::{
     EmbeddedProjection, JoinData, ProjectionExec, try_embed_projection,
@@ -53,6 +58,7 @@ use crate::projection::{
 };
 use crate::repartition::REPARTITION_RANDOM_STATE;
 use crate::spill::get_record_batch_memory_size;
+use crate::spill::spill_manager::SpillManager;
 use crate::{
     DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, Partitioning,
     PlanProperties, SendableRecordBatchStream, Statistics,
@@ -74,8 +80,8 @@ use arrow_schema::{DataType, Schema};
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::utils::memory::estimate_memory_size;
 use datafusion_common::{
-    JoinSide, JoinType, NullEquality, Result, assert_or_internal_err, internal_err,
-    plan_err, project_schema,
+    DataFusionError, JoinSide, JoinType, NullEquality, Result, assert_or_internal_err,
+    internal_datafusion_err, internal_err, plan_err, project_schema,
 };
 use datafusion_execution::TaskContext;
 use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
@@ -255,8 +261,13 @@ impl JoinLeftData {
 /// (when `enable_hash_join_spill` is on and the memory budget was exceeded)
 /// a build side that has been scattered into disk partitions to be joined
 /// pair-by-pair within the budget.
+///
+/// The `Spilled` payload sits behind a `Mutex<Option<..>>` because `OnceFut`
+/// shares its output as an `Arc`, while the spill-join driver needs to take
+/// ownership; in `Partitioned` mode there is exactly one consumer per build.
 pub(super) enum BuildPhaseOutput {
     InMemory(Arc<JoinLeftData>),
+    Spilled(Mutex<Option<SpilledBuild>>),
 }
 
 /// Helps to build [`HashJoinExec`].
@@ -1312,6 +1323,57 @@ impl ExecutionPlan for HashJoinExec {
             .execution
             .enable_hash_join_spill;
 
+        // Spill applies to Partitioned-mode joins over a working DiskManager.
+        // (CollectLeft's shared build is a follow-up; null-aware anti joins
+        // need global probe-side knowledge and are excluded. Non-inner join
+        // types arrive with per-partition bitmap support.)
+        //
+        // A spilled join emits probe rows partition-by-partition, so it CANNOT
+        // preserve probe-side ordering. When this operator advertises that it
+        // maintains the right input's order and that input is actually
+        // ordered, spilling stays disabled rather than risk downstream
+        // operators consuming out-of-order rows.
+        let would_break_output_order = Self::maintains_input_order(self.join_type)[1]
+            && self.right.output_ordering().is_some();
+        let spill_context = if can_spill
+            && self.mode == PartitionMode::Partitioned
+            && !self.null_aware
+            && self.join_type == JoinType::Inner
+            && !would_break_output_order
+            && context.runtime_env().disk_manager.tmp_files_enabled()
+        {
+            let options = context.session_config().options();
+            let exec_options = &options.execution;
+            let build_spill = SpillManager::new(
+                context.runtime_env(),
+                SpillMetrics::new(&self.metrics, partition),
+                self.left.schema(),
+            )
+            .with_compression_type(exec_options.spill_compression);
+            let probe_spill = SpillManager::new(
+                context.runtime_env(),
+                SpillMetrics::new(&self.metrics, partition),
+                self.right.schema(),
+            )
+            .with_compression_type(exec_options.spill_compression);
+            Some(Arc::new(HashJoinSpillContext {
+                pool: Arc::clone(context.memory_pool()),
+                build_spill: Arc::new(build_spill),
+                probe_spill: Arc::new(probe_spill),
+                spill_engaged: MetricBuilder::new(&self.metrics)
+                    .counter("join_spill_engaged", partition),
+                partition_count_override: exec_options.hash_join_spill_partition_count,
+                headroom_bytes: exec_options.hash_join_spill_headroom_bytes,
+                max_recursion_depth: exec_options.hash_join_spill_max_recursion_depth,
+                max_spill_file_size: exec_options.max_spill_file_size_bytes,
+                partition,
+                on_left: on_left.clone(),
+                config: Arc::clone(context.session_config().options()),
+            }))
+        } else {
+            None
+        };
+
         let left_fut = match self.mode {
             PartitionMode::CollectLeft => self.left_fut.try_once(|| {
                 let left_stream = self.left.execute(0, Arc::clone(&context))?;
@@ -1332,6 +1394,8 @@ impl ExecutionPlan for HashJoinExec {
                     Arc::clone(context.session_config().options()),
                     self.null_equality,
                     array_map_created_count,
+                    // CollectLeft spill (shared scattered build) is a follow-up.
+                    None,
                 ))
             })?,
             PartitionMode::Partitioned => {
@@ -1354,6 +1418,7 @@ impl ExecutionPlan for HashJoinExec {
                     Arc::clone(context.session_config().options()),
                     self.null_equality,
                     array_map_created_count,
+                    spill_context.clone(),
                 ))
             }
             PartitionMode::Auto => {
@@ -1432,6 +1497,7 @@ impl ExecutionPlan for HashJoinExec {
             self.mode,
             self.null_aware,
             self.fetch,
+            spill_context,
         )))
     }
 
@@ -1778,10 +1844,19 @@ impl CollectLeftAccumulator {
 /// State for collecting the build-side data during hash join
 struct BuildSideState {
     batches: Vec<RecordBatch>,
+    /// Reserved memory size recorded per buffered batch, so scattering can
+    /// shrink the reservation by exactly what was grown.
+    batch_sizes: Vec<usize>,
     num_rows: usize,
     metrics: BuildProbeJoinMetrics,
     reservation: MemoryReservation,
     bounds_accumulators: Option<Vec<CollectLeftAccumulator>>,
+    /// Present when the spill fallback is enabled and applicable.
+    spill: Option<Arc<HashJoinSpillContext>>,
+    /// Present once the build has switched into scatter mode.
+    scatter: Option<SideScatter>,
+    /// Headroom reservation acquired at spill engage; handed to the driver.
+    headroom: Option<MemoryReservation>,
 }
 
 impl BuildSideState {
@@ -1795,6 +1870,7 @@ impl BuildSideState {
     ) -> Result<Self> {
         Ok(Self {
             batches: Vec::new(),
+            batch_sizes: Vec::new(),
             num_rows: 0,
             metrics,
             reservation,
@@ -1806,7 +1882,78 @@ impl BuildSideState {
                         .collect::<Result<Vec<_>>>()
                 })
                 .transpose()?,
+            spill: None,
+            scatter: None,
+            headroom: None,
         })
+    }
+
+    /// Switch into scatter mode after the build reservation first failed:
+    /// acquire the scatter headroom, then re-scatter every already-buffered
+    /// batch to disk, releasing its memory.
+    fn engage_spill(&mut self) -> Result<()> {
+        let ctx = self
+            .spill
+            .clone()
+            .ok_or_else(|| internal_datafusion_err!("engage_spill without context"))?;
+        ctx.spill_engaged.add(1);
+
+        let buffered: usize = self.batch_sizes.iter().sum();
+        let partition_count = compute_partition_count(
+            buffered,
+            &ctx.pool.memory_limit(),
+            ctx.partition_count_override,
+        );
+        let mut scatter = SideScatter::new(
+            partition_count,
+            ctx.on_left.clone(),
+            scatter_random_state(0),
+            &ctx.build_spill,
+            ctx.max_spill_file_size,
+            ctx.headroom_bytes / 2,
+            "hash_join_build_spill",
+        );
+
+        // Acquire scratch headroom; if even that fails, scatter buffered
+        // batches one at a time (each frees more than the transient scratch
+        // uses) and retry. With nothing left to free, give up cleanly.
+        let headroom =
+            MemoryConsumer::new(format!("HashJoinSpillHeadroom[{}]", ctx.partition))
+                .with_can_spill(true)
+                .register(&ctx.pool);
+        loop {
+            match headroom.try_grow(ctx.headroom_bytes) {
+                Ok(()) => break,
+                Err(e) => {
+                    if self.batches.is_empty() {
+                        return Err(e);
+                    }
+                    let batch = self.batches.remove(0);
+                    let size = self.batch_sizes.remove(0);
+                    scatter.scatter_batch(&batch)?;
+                    drop(batch);
+                    self.reservation.shrink(size);
+                }
+            }
+        }
+
+        // Re-scatter the remaining buffered batches oldest-first.
+        for (batch, size) in self.batches.drain(..).zip(self.batch_sizes.drain(..)) {
+            scatter.scatter_batch(&batch)?;
+            drop(batch);
+            self.reservation.shrink(size);
+        }
+
+        self.scatter = Some(scatter);
+        self.headroom = Some(headroom);
+        Ok(())
+    }
+
+    fn scatter_batch(&mut self, batch: &RecordBatch) -> Result<()> {
+        self.scatter
+            .as_mut()
+            .ok_or_else(|| internal_datafusion_err!("scatter_batch without scatter"))?
+            .scatter_batch(batch)
     }
 }
 
@@ -1864,41 +2011,61 @@ async fn collect_left_input(
     config: Arc<ConfigOptions>,
     null_equality: NullEquality,
     array_map_created_count: Count,
+    spill: Option<Arc<HashJoinSpillContext>>,
 ) -> Result<BuildPhaseOutput> {
     let schema = left_stream.schema();
 
     let should_collect_min_max_for_phj =
         should_collect_min_max_for_perfect_hash(&on_left, &schema)?;
 
-    let initial = BuildSideState::try_new(
+    let mut initial = BuildSideState::try_new(
         metrics,
         reservation,
         on_left.clone(),
         &schema,
         should_compute_dynamic_filters || should_collect_min_max_for_phj,
     )?;
+    initial.spill = spill;
 
     let state = left_stream
         .try_fold(initial, |mut state, batch| async move {
-            // Update accumulators if computing bounds
+            // Update accumulators if computing bounds. These keep running in
+            // scatter mode too, so dynamic-filter bounds stay exact under
+            // spill.
             if let Some(ref mut accumulators) = state.bounds_accumulators {
                 for accumulator in accumulators {
                     accumulator.update_batch(&batch)?;
                 }
             }
 
-            // Decide if we spill or not
-            let batch_size = get_record_batch_memory_size(&batch);
-            // Reserve memory for incoming batch
-            state.reservation.try_grow(batch_size)?;
-            // Update metrics
-            state.metrics.build_mem_used.add(batch_size);
             state.metrics.build_input_batches.add(1);
             state.metrics.build_input_rows.add(batch.num_rows());
-            // Update row count
             state.num_rows += batch.num_rows();
-            // Push batch to output
-            state.batches.push(batch);
+
+            if state.scatter.is_some() {
+                // Scatter mode: batches go to disk partitions, not memory.
+                state.scatter_batch(&batch)?;
+                return Ok(state);
+            }
+
+            let batch_size = get_record_batch_memory_size(&batch);
+            // Reserve memory for incoming batch
+            match state.reservation.try_grow(batch_size) {
+                Ok(()) => {
+                    state.metrics.build_mem_used.add(batch_size);
+                    state.batches.push(batch);
+                    state.batch_sizes.push(batch_size);
+                }
+                Err(DataFusionError::ResourcesExhausted(_)) if state.spill.is_some() => {
+                    // The build side no longer fits: switch into scatter
+                    // mode instead of failing. Already-buffered batches are
+                    // re-scattered (releasing their memory), then the
+                    // current batch follows.
+                    state.engage_spill()?;
+                    state.scatter_batch(&batch)?;
+                }
+                Err(e) => return Err(e),
+            }
             Ok(state)
         })
         .await?;
@@ -1906,10 +2073,14 @@ async fn collect_left_input(
     // Extract fields from state
     let BuildSideState {
         batches,
+        batch_sizes: _,
         num_rows,
         metrics,
         reservation,
         bounds_accumulators,
+        spill: _,
+        scatter,
+        headroom,
     } = state;
 
     // Compute bounds
@@ -1923,6 +2094,25 @@ async fn collect_left_input(
         }
         _ => None,
     };
+
+    // Overflowed: the build side lives in disk partitions now. The buffered
+    // batches were all scattered, so the build reservation is back to zero;
+    // the headroom reservation transfers to the spill-join driver.
+    if let Some(scatter) = scatter {
+        let headroom = headroom.ok_or_else(|| {
+            internal_datafusion_err!("scatter engaged without headroom reservation")
+        })?;
+        debug_assert_eq!(reservation.size(), 0);
+        let partitions = scatter.finish()?;
+        let partition_count = partitions.len();
+        return Ok(BuildPhaseOutput::Spilled(Mutex::new(Some(SpilledBuild {
+            partitions,
+            partition_count,
+            level: 0,
+            bounds,
+            headroom,
+        }))));
+    }
 
     let data = build_left_data(
         &batches,

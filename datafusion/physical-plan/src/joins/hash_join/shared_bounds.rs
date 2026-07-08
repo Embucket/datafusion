@@ -136,6 +136,9 @@ fn create_membership_predicate(
         )) as Arc<dyn PhysicalExpr>)),
         // Empty partition - should not create a filter for this
         PushdownStrategy::Empty => Ok(None),
+        // Spilled partition: has data but no in-memory membership structure.
+        // No membership predicate; bounds (handled by the caller) still apply.
+        PushdownStrategy::BoundsOnly => Ok(None),
     }
 }
 
@@ -237,6 +240,10 @@ pub(crate) enum PushdownStrategy {
     Map(Arc<Map>),
     /// There was no data in this partition, do not build a dynamic filter for it
     Empty,
+    /// The partition HAS data but no in-memory membership structure exists
+    /// (its build side spilled to disk). Only bounds may be pushed down;
+    /// unlike `Empty`, this partition's probe rows must NOT be pruned.
+    BoundsOnly,
 }
 
 /// Build-side data reported by a single partition
