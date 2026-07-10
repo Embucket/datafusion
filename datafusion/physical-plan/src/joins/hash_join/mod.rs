@@ -24,4 +24,5 @@ mod exec;
 mod inlist_builder;
 mod partitioned_hash_eval;
 mod shared_bounds;
+mod spill;
 mod stream;

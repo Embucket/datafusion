@@ -910,6 +910,32 @@ config_namespace! {
         /// (i.e., if there's no `DiskManager` configured).
         pub sort_spill_reservation_bytes: usize, default = 10 * 1024 * 1024
 
+        /// When enabled, a hash join whose build side exceeds its memory budget
+        /// partitions both sides to disk (grace hash join) and joins partition
+        /// pairs within the budget instead of failing with a resources-exhausted
+        /// error. The in-memory fast path is unchanged; spilling engages only at
+        /// the moment the build-side memory reservation first fails.
+        ///
+        /// Requires a configured `DiskManager` (spilling stays disabled otherwise).
+        pub enable_hash_join_spill: bool, default = false
+
+        /// Number of disk partitions a spilling hash join scatters each side
+        /// into. 0 (default) sizes automatically from the observed build size
+        /// and the memory budget.
+        pub hash_join_spill_partition_count: usize, default = 0
+
+        /// Reserved memory headroom for a spilling hash join's scatter scratch
+        /// space and per-partition write buffers (analogous to
+        /// `sort_spill_reservation_bytes`).
+        pub hash_join_spill_headroom_bytes: usize, default = 32 * 1024 * 1024
+
+        /// Maximum number of recursive repartition passes a spilling hash join
+        /// applies to a partition whose build side still exceeds the memory
+        /// budget (key skew). When the limit is reached the join falls back to
+        /// a chunked build where supported, or reports a clean
+        /// resources-exhausted error.
+        pub hash_join_spill_max_recursion_depth: usize, default = 2
+
         /// When sorting, below what size should data be concatenated
         /// and sorted in a single RecordBatch rather than sorted in
         /// batches and merged.

@@ -36,6 +36,10 @@ use crate::joins::hash_join::inlist_builder::build_struct_inlist_values;
 use crate::joins::hash_join::shared_bounds::{
     ColumnBounds, PartitionBounds, PushdownStrategy, SharedBuildAccumulator,
 };
+use crate::joins::hash_join::spill::{
+    HashJoinSpillContext, SharedSpilledBuild, SideScatter, SpilledBuild,
+    compute_partition_count, scatter_random_state,
+};
 use crate::joins::hash_join::stream::{
     BuildSide, BuildSideInitialState, HashJoinStream, HashJoinStreamState,
 };
@@ -45,12 +49,15 @@ use crate::joins::utils::{
     swap_join_projection, update_hash,
 };
 use crate::joins::{JoinOn, JoinOnRef, PartitionMode, SharedBitmapBuilder};
+use crate::metrics::SpillMetrics;
 use crate::metrics::{Count, MetricBuilder, MetricCategory};
 use crate::projection::{
     EmbeddedProjection, JoinData, ProjectionExec, try_embed_projection,
     try_pushdown_through_join_with_column_indices,
 };
 use crate::repartition::REPARTITION_RANDOM_STATE;
+use crate::spill::get_record_batch_memory_size;
+use crate::spill::spill_manager::SpillManager;
 use crate::statistics::{ChildStats, StatisticsArgs};
 use crate::{
     ChildrenPropertiesMode, ExecutionPlanProperties, ReplaceChildrenOptions,
@@ -79,8 +86,8 @@ use datafusion_common::config::ConfigOptions;
 use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_common::utils::memory::{RecordBatchMemoryCounter, estimate_memory_size};
 use datafusion_common::{
-    JoinSide, JoinType, NullEquality, Result, assert_or_internal_err, internal_err,
-    plan_err, project_schema,
+    DataFusionError, JoinSide, JoinType, NullEquality, Result, assert_or_internal_err,
+    internal_datafusion_err, internal_err, plan_err, project_schema,
 };
 use datafusion_execution::TaskContext;
 use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
@@ -199,11 +206,13 @@ pub(super) struct JoinLeftData {
     batch: RecordBatch,
     /// The build side on expressions values
     values: Vec<ArrayRef>,
-    /// Shared bitmap builder for visited left indices
-    visited_indices_bitmap: SharedBitmapBuilder,
+    /// Shared bitmap builder for visited left indices. Arc'd so a spilled
+    /// CollectLeft build can share one bitmap per disk partition across the
+    /// independently-built per-probe-partition copies of the hash table.
+    visited_indices_bitmap: Arc<SharedBitmapBuilder>,
     /// Counter of running probe-threads, potentially
-    /// able to update `visited_indices_bitmap`
-    probe_threads_counter: AtomicUsize,
+    /// able to update `visited_indices_bitmap` (Arc'd for the same reason)
+    probe_threads_counter: Arc<AtomicUsize>,
     /// We need to keep this field to maintain accurate memory accounting, even though we don't directly use it.
     /// Without holding onto this reservation, the recorded memory usage would become inconsistent with actual usage.
     /// This could hide potential out-of-memory issues, especially when upstream operators increase their memory consumption.
@@ -258,7 +267,7 @@ impl JoinLeftData {
 
     /// returns a reference to the visited indices bitmap
     pub(super) fn visited_indices_bitmap(&self) -> &SharedBitmapBuilder {
-        &self.visited_indices_bitmap
+        self.visited_indices_bitmap.as_ref()
     }
 
     /// returns a reference to the InList values for filter pushdown
@@ -271,6 +280,21 @@ impl JoinLeftData {
     pub(super) fn report_probe_completed(&self) -> bool {
         self.probe_threads_counter.fetch_sub(1, Ordering::Relaxed) == 1
     }
+}
+
+/// Result of the build phase: either the classic fully in-memory build, or
+/// (when `enable_hash_join_spill` is on and the memory budget was exceeded)
+/// a build side that has been scattered into disk partitions to be joined
+/// pair-by-pair within the budget.
+///
+/// The `Spilled` payload sits behind a `Mutex<Option<..>>` because `OnceFut`
+/// shares its output as an `Arc`, while the spill-join driver needs to take
+/// ownership; in `Partitioned` mode there is exactly one consumer per build.
+pub(super) enum BuildPhaseOutput {
+    InMemory(Arc<JoinLeftData>),
+    Spilled(Mutex<Option<SpilledBuild>>),
+    /// CollectLeft: the scattered build is shared by all probe partitions.
+    SpilledShared(Arc<SharedSpilledBuild>),
 }
 
 /// Helps to build [`HashJoinExec`].
@@ -756,7 +780,7 @@ pub struct HashJoinExec {
     ///
     /// Each output stream waits on the `OnceAsync` to signal the completion of
     /// the hash table creation.
-    left_fut: Arc<OnceAsync<JoinLeftData>>,
+    left_fut: Arc<OnceAsync<BuildPhaseOutput>>,
     /// Shared the `SeededRandomState` for the hashing algorithm (seeds preserved for serialization)
     random_state: SeededRandomState,
     /// Partitioning mode to use
@@ -1486,12 +1510,83 @@ impl ExecutionPlan for HashJoinExec {
             .flatten()
             .flatten();
 
+        // When the spill fallback is enabled, the build-side reservation is
+        // spillable: on overflow the operator scatters the build side to disk
+        // instead of failing, so spilling pools may treat it accordingly.
+        let spill_flag = context
+            .session_config()
+            .options()
+            .execution
+            .enable_hash_join_spill;
+
+        // Spill applies to Partitioned-mode joins over a working DiskManager.
+        // (CollectLeft's shared build is a follow-up; null-aware anti joins
+        // need global probe-side knowledge and are excluded.)
+        //
+        // Every join type is supported: disk partitions are key-disjoint, so
+        // each pair's in-memory join sees all rows for its keys — unmatched
+        // detection (visited bitmaps, probe-side null padding) is complete
+        // within a pair.
+        //
+        // A spilled join emits probe rows partition-by-partition, so it CANNOT
+        // preserve probe-side ordering. When this operator advertises that it
+        // maintains the right input's order and that input is actually
+        // ordered, spilling stays disabled rather than risk downstream
+        // operators consuming out-of-order rows.
+        let would_break_output_order = Self::maintains_input_order(self.join_type)[1]
+            && self.right.output_ordering().is_some();
+        let spill_context = if spill_flag
+            && matches!(
+                self.mode,
+                PartitionMode::Partitioned | PartitionMode::CollectLeft
+            )
+            && !self.null_aware
+            && !would_break_output_order
+            && context.runtime_env().disk_manager.tmp_files_enabled()
+        {
+            let options = context.session_config().options();
+            let exec_options = &options.execution;
+            let build_spill = SpillManager::new(
+                context.runtime_env(),
+                SpillMetrics::new(&self.metrics, partition),
+                self.left.schema(),
+            )
+            .with_compression_type(exec_options.spill_compression);
+            let probe_spill = SpillManager::new(
+                context.runtime_env(),
+                SpillMetrics::new(&self.metrics, partition),
+                self.right.schema(),
+            )
+            .with_compression_type(exec_options.spill_compression);
+            Some(Arc::new(HashJoinSpillContext {
+                pool: Arc::clone(context.memory_pool()),
+                build_spill: Arc::new(build_spill),
+                probe_spill: Arc::new(probe_spill),
+                spill_engaged: MetricBuilder::new(&self.metrics)
+                    .counter("join_spill_engaged", partition),
+                repartition_passes: MetricBuilder::new(&self.metrics)
+                    .counter("join_spill_repartition_passes", partition),
+                fallback_chunks: MetricBuilder::new(&self.metrics)
+                    .counter("join_spill_fallback_chunks", partition),
+                partition_count_override: exec_options.hash_join_spill_partition_count,
+                headroom_bytes: exec_options.hash_join_spill_headroom_bytes,
+                max_recursion_depth: exec_options.hash_join_spill_max_recursion_depth,
+                max_spill_file_size: exec_options.max_spill_file_size_bytes.into(),
+                partition,
+                on_left: on_left.clone(),
+                config: Arc::clone(context.session_config().options()),
+            }))
+        } else {
+            None
+        };
+
         let left_fut = match self.mode {
             PartitionMode::CollectLeft => self.left_fut.try_once(|| {
                 let left_stream = self.left.execute(0, Arc::clone(&context))?;
 
-                let reservation =
-                    MemoryConsumer::new("HashJoinInput").register(context.memory_pool());
+                let reservation = MemoryConsumer::new("HashJoinInput")
+                    .with_can_spill(spill_context.is_some())
+                    .register(context.memory_pool());
 
                 Ok(collect_left_input(
                     self.random_state.random_state().clone(),
@@ -1505,6 +1600,10 @@ impl ExecutionPlan for HashJoinExec {
                     Arc::clone(context.session_config().options()),
                     self.null_equality,
                     array_map_created_count,
+                    spill_context.clone(),
+                    // CollectLeft: the scattered build is shared by all
+                    // probe partitions.
+                    true,
                 ))
             })?,
             PartitionMode::Partitioned => {
@@ -1512,6 +1611,7 @@ impl ExecutionPlan for HashJoinExec {
 
                 let reservation =
                     MemoryConsumer::new(format!("HashJoinInput[{partition}]"))
+                        .with_can_spill(spill_context.is_some())
                         .register(context.memory_pool());
                 OnceFut::new(collect_left_input(
                     self.random_state.random_state().clone(),
@@ -1525,6 +1625,8 @@ impl ExecutionPlan for HashJoinExec {
                     Arc::clone(context.session_config().options()),
                     self.null_equality,
                     array_map_created_count,
+                    spill_context.clone(),
+                    false,
                 ))
             }
             PartitionMode::Auto => {
@@ -1576,6 +1678,7 @@ impl ExecutionPlan for HashJoinExec {
             self.mode,
             self.null_aware,
             self.fetch,
+            spill_context,
         )))
     }
 
@@ -2148,6 +2251,9 @@ impl CollectLeftAccumulator {
 /// State for collecting the build-side data during hash join
 struct BuildSideState {
     batches: Vec<RecordBatch>,
+    /// Reserved memory size recorded per buffered batch, so scattering can
+    /// shrink the reservation by exactly what was grown.
+    batch_sizes: Vec<usize>,
     num_rows: usize,
     metrics: BuildProbeJoinMetrics,
     reservation: MemoryReservation,
@@ -2156,6 +2262,20 @@ struct BuildSideState {
     /// underlying buffers (e.g. when the input emits zero-copy slices of one
     /// larger batch), so each buffer must be reserved only once.
     memory_counter: RecordBatchMemoryCounter,
+    /// Bytes of the hash-table estimate already reserved (spill mode only:
+    /// the estimate is reserved incrementally so overflow surfaces during
+    /// batch collection, where the scatter fallback can engage).
+    table_reserved: usize,
+    /// How many spilled-partition tables can be resident at once (1 for
+    /// Partitioned mode; the probe partition count for a shared CollectLeft
+    /// build). Sizes the scatter's partition count.
+    concurrent_table_consumers: usize,
+    /// Present when the spill fallback is enabled and applicable.
+    spill: Option<Arc<HashJoinSpillContext>>,
+    /// Present once the build has switched into scatter mode.
+    scatter: Option<SideScatter>,
+    /// Headroom reservation acquired at spill engage; handed to the driver.
+    headroom: Option<MemoryReservation>,
 }
 
 impl BuildSideState {
@@ -2169,6 +2289,7 @@ impl BuildSideState {
     ) -> Result<Self> {
         Ok(Self {
             batches: Vec::new(),
+            batch_sizes: Vec::new(),
             num_rows: 0,
             metrics,
             reservation,
@@ -2181,7 +2302,90 @@ impl BuildSideState {
                         .collect::<Result<Vec<_>>>()
                 })
                 .transpose()?,
+            table_reserved: 0,
+            concurrent_table_consumers: 1,
+            spill: None,
+            scatter: None,
+            headroom: None,
         })
+    }
+
+    /// Switch into scatter mode after the build reservation first failed:
+    /// acquire the scatter headroom, then re-scatter every already-buffered
+    /// batch to disk, releasing its memory.
+    fn engage_spill(&mut self) -> Result<()> {
+        let ctx = self
+            .spill
+            .clone()
+            .ok_or_else(|| internal_datafusion_err!("engage_spill without context"))?;
+        ctx.spill_engaged.add(1);
+        log::info!(
+            "hash join spill engaged: partition={} buffered_bytes={} rows={}",
+            ctx.partition,
+            self.batch_sizes.iter().sum::<usize>(),
+            self.num_rows
+        );
+
+        let buffered: usize = self.batch_sizes.iter().sum();
+        let partition_count = compute_partition_count(
+            buffered,
+            &ctx.pool.memory_limit(),
+            ctx.partition_count_override,
+            self.concurrent_table_consumers,
+        );
+        let mut scatter = SideScatter::new(
+            partition_count,
+            ctx.on_left.clone(),
+            scatter_random_state(0),
+            &ctx.build_spill,
+            ctx.max_spill_file_size,
+            ctx.headroom_bytes / 2,
+            "hash_join_build_spill",
+        );
+
+        // Acquire scratch headroom; if even that fails, scatter buffered
+        // batches one at a time (each frees more than the transient scratch
+        // uses) and retry. With nothing left to free, give up cleanly.
+        let headroom =
+            MemoryConsumer::new(format!("HashJoinSpillHeadroom[{}]", ctx.partition))
+                .with_can_spill(true)
+                .register(&ctx.pool);
+        loop {
+            match headroom.try_grow(ctx.headroom_bytes) {
+                Ok(()) => break,
+                Err(e) => {
+                    if self.batches.is_empty() {
+                        return Err(e);
+                    }
+                    let batch = self.batches.remove(0);
+                    let size = self.batch_sizes.remove(0);
+                    scatter.scatter_batch(&batch)?;
+                    drop(batch);
+                    self.reservation.shrink(size);
+                }
+            }
+        }
+
+        // Re-scatter the remaining buffered batches oldest-first.
+        for (batch, size) in self.batches.drain(..).zip(self.batch_sizes.drain(..)) {
+            scatter.scatter_batch(&batch)?;
+            drop(batch);
+            self.reservation.shrink(size);
+        }
+        // No table will be built for this build side anymore.
+        self.reservation.shrink(self.table_reserved);
+        self.table_reserved = 0;
+
+        self.scatter = Some(scatter);
+        self.headroom = Some(headroom);
+        Ok(())
+    }
+
+    fn scatter_batch(&mut self, batch: &RecordBatch) -> Result<()> {
+        self.scatter
+            .as_mut()
+            .ok_or_else(|| internal_datafusion_err!("scatter_batch without scatter"))?
+            .scatter_batch(batch)
     }
 }
 
@@ -2239,41 +2443,82 @@ async fn collect_left_input(
     config: Arc<ConfigOptions>,
     null_equality: NullEquality,
     array_map_created_count: Count,
-) -> Result<JoinLeftData> {
+    spill: Option<Arc<HashJoinSpillContext>>,
+    shared_build: bool,
+) -> Result<BuildPhaseOutput> {
     let schema = left_stream.schema();
 
     let should_collect_min_max_for_phj =
         should_collect_min_max_for_perfect_hash(&on_left, &schema)?;
 
-    let initial = BuildSideState::try_new(
+    let mut initial = BuildSideState::try_new(
         metrics,
         reservation,
         on_left.clone(),
         &schema,
         should_compute_dynamic_filters || should_collect_min_max_for_phj,
     )?;
+    initial.spill = spill;
+    if shared_build {
+        initial.concurrent_table_consumers = probe_threads_count;
+    }
 
     let state = left_stream
         .try_fold(initial, |mut state, batch| async move {
-            // Update accumulators if computing bounds
+            // Update accumulators if computing bounds. These keep running in
+            // scatter mode too, so dynamic-filter bounds stay exact under
+            // spill.
             if let Some(ref mut accumulators) = state.bounds_accumulators {
                 for accumulator in accumulators {
                     accumulator.update_batch(&batch)?;
                 }
             }
 
-            // Decide if we spill or not
-            let batch_size = state.memory_counter.count_batch(&batch);
-            // Reserve memory for incoming batch
-            state.reservation.try_grow(batch_size)?;
-            // Update metrics
-            state.metrics.build_mem_used.add(batch_size);
             state.metrics.build_input_batches.add(1);
             state.metrics.build_input_rows.add(batch.num_rows());
-            // Update row count
             state.num_rows += batch.num_rows();
-            // Push batch to output
-            state.batches.push(batch);
+
+            if state.scatter.is_some() {
+                // Scatter mode: batches go to disk partitions, not memory.
+                state.scatter_batch(&batch)?;
+                return Ok(state);
+            }
+
+            // In-memory joins count shared Arrow buffers only once. Spill mode
+            // keeps conservative per-batch accounting so releasing one slice
+            // cannot release a reservation still retained by another slice.
+            let batch_size = if state.spill.is_some() {
+                get_record_batch_memory_size(&batch)
+            } else {
+                state.memory_counter.count_batch(&batch)
+            };
+            // In spill mode, also reserve the hash table's estimated growth
+            // for the rows in this batch, so "data fits but the table will
+            // not" is detected here — where the scatter fallback can engage —
+            // rather than at table construction time.
+            let table_delta = if state.spill.is_some() {
+                hash_table_estimate(state.num_rows)?.saturating_sub(state.table_reserved)
+            } else {
+                0
+            };
+            // Reserve memory for incoming batch
+            match state.reservation.try_grow(batch_size + table_delta) {
+                Ok(()) => {
+                    state.metrics.build_mem_used.add(batch_size);
+                    state.table_reserved += table_delta;
+                    state.batches.push(batch);
+                    state.batch_sizes.push(batch_size);
+                }
+                Err(DataFusionError::ResourcesExhausted(_)) if state.spill.is_some() => {
+                    // The build side no longer fits: switch into scatter
+                    // mode instead of failing. Already-buffered batches are
+                    // re-scattered (releasing their memory), then the
+                    // current batch follows.
+                    state.engage_spill()?;
+                    state.scatter_batch(&batch)?;
+                }
+                Err(e) => return Err(e),
+            }
             Ok(state)
         })
         .await?;
@@ -2281,15 +2526,21 @@ async fn collect_left_input(
     // Extract fields from state
     let BuildSideState {
         batches,
+        batch_sizes: _,
         num_rows,
         metrics,
-        mut reservation,
+        reservation,
         bounds_accumulators,
         memory_counter: _,
+        table_reserved,
+        concurrent_table_consumers: _,
+        spill: _,
+        scatter,
+        headroom,
     } = state;
 
     // Compute bounds
-    let mut bounds = match bounds_accumulators {
+    let bounds = match bounds_accumulators {
         Some(accumulators) if num_rows > 0 => {
             let bounds = accumulators
                 .into_iter()
@@ -2300,12 +2551,113 @@ async fn collect_left_input(
         _ => None,
     };
 
+    // Overflowed: the build side lives in disk partitions now. The buffered
+    // batches were all scattered, so the build reservation is back to zero;
+    // the headroom reservation transfers to the spill-join driver.
+    if let Some(scatter) = scatter {
+        let headroom = headroom.ok_or_else(|| {
+            internal_datafusion_err!("scatter engaged without headroom reservation")
+        })?;
+        debug_assert_eq!(reservation.size(), 0);
+        let partitions = scatter.finish()?;
+        if shared_build {
+            return Ok(BuildPhaseOutput::SpilledShared(Arc::new(
+                SharedSpilledBuild::new(
+                    partitions,
+                    0,
+                    bounds,
+                    probe_threads_count,
+                    headroom,
+                ),
+            )));
+        }
+        let partition_count = partitions.len();
+        return Ok(BuildPhaseOutput::Spilled(Mutex::new(Some(SpilledBuild {
+            partitions,
+            partition_count,
+            level: 0,
+            bounds,
+            headroom,
+        }))));
+    }
+
+    let data = build_left_data(
+        &batches,
+        num_rows,
+        &schema,
+        &on_left,
+        &random_state,
+        reservation,
+        &metrics,
+        with_visited_indices_bitmap,
+        probe_threads_count,
+        bounds,
+        should_collect_min_max_for_phj && !should_compute_dynamic_filters,
+        &config,
+        null_equality,
+        &array_map_created_count,
+        table_reserved,
+        None,
+    )?;
+
+    Ok(BuildPhaseOutput::InMemory(Arc::new(data)))
+}
+
+/// Builds the in-memory join structures (hash table or perfect-hash
+/// [`ArrayMap`], concatenated build batch, join-key arrays, visited bitmap,
+/// membership pushdown) from an already-collected set of build batches.
+///
+/// Extracted from [`collect_left_input`] so the same code serves both the
+/// classic fully in-memory build and per-partition builds when the join
+/// spills (grace hash join). All memory is accounted against `reservation`,
+/// which is moved into the returned [`JoinLeftData`].
+///
+/// Estimated memory footprint of the join hash table for `num_rows` build
+/// rows — the same formula [`build_left_data`] uses, exposed so spill-mode
+/// loaders can pre-reserve it incrementally while batches stream in.
+pub(super) fn hash_table_estimate(num_rows: usize) -> Result<usize> {
+    if num_rows > u32::MAX as usize {
+        estimate_memory_size::<(u64, u64)>(num_rows, size_of::<JoinHashMapU64>())
+    } else {
+        estimate_memory_size::<(u32, u64)>(num_rows, size_of::<JoinHashMapU32>())
+    }
+}
+
+/// `mask_bounds` clears the computed bounds from the result when they were
+/// only collected for the perfect-hash decision and dynamic-filter pushdown
+/// is disabled.
+///
+/// `prereserved_table_bytes` is how much of the hash table's estimated size
+/// the caller already holds in `reservation` (spill-mode loaders reserve the
+/// estimate incrementally, via [`hash_table_estimate`], so overflow surfaces
+/// while batches stream rather than at table construction). The fast path
+/// passes 0 and this function grows the full estimate itself, exactly as
+/// before.
+#[expect(clippy::too_many_arguments)]
+pub(super) fn build_left_data(
+    batches: &[RecordBatch],
+    num_rows: usize,
+    schema: &SchemaRef,
+    on_left: &[PhysicalExprRef],
+    random_state: &RandomState,
+    mut reservation: MemoryReservation,
+    metrics: &BuildProbeJoinMetrics,
+    with_visited_indices_bitmap: bool,
+    probe_threads_count: usize,
+    mut bounds: Option<PartitionBounds>,
+    mask_bounds: bool,
+    config: &ConfigOptions,
+    null_equality: NullEquality,
+    array_map_created_count: &Count,
+    prereserved_table_bytes: usize,
+    shared_state: Option<(Arc<SharedBitmapBuilder>, Arc<AtomicUsize>)>,
+) -> Result<JoinLeftData> {
     let (join_hash_map, batch, left_values) =
         if let Some((array_map, batch, left_value)) = try_create_array_map(
             &bounds,
-            &schema,
-            &batches,
-            &on_left,
+            schema,
+            batches,
+            on_left,
             &mut reservation,
             config.execution.perfect_hash_join_small_build_threshold,
             config.execution.perfect_hash_join_min_key_density,
@@ -2313,11 +2665,15 @@ async fn collect_left_input(
         )? {
             array_map_created_count.add(1);
             metrics.build_mem_used.add(array_map.size());
+            // The perfect-hash map replaces the hash table the caller
+            // pre-reserved for; release that estimate.
+            reservation.shrink(prereserved_table_bytes);
 
             (Map::ArrayMap(array_map), batch, left_value)
         } else {
             // Estimation of memory size, required for hashtable, prior to allocation.
             // Final result can be verified using `RawTable.allocation_info()`
+            // (Same formula as `hash_table_estimate`; keep them in sync.)
             let fixed_size_u32 = size_of::<JoinHashMapU32>();
             let fixed_size_u64 = size_of::<JoinHashMapU64>();
 
@@ -2327,13 +2683,17 @@ async fn collect_left_input(
             let mut hashmap: Box<dyn JoinHashMapType> = if num_rows > u32::MAX as usize {
                 let estimated_hashtable_size =
                     estimate_memory_size::<(u64, u64)>(num_rows, fixed_size_u64)?;
-                reservation.try_grow(estimated_hashtable_size)?;
+                reservation.try_grow(
+                    estimated_hashtable_size.saturating_sub(prereserved_table_bytes),
+                )?;
                 metrics.build_mem_used.add(estimated_hashtable_size);
                 Box::new(JoinHashMapU64::with_capacity(num_rows))
             } else {
                 let estimated_hashtable_size =
                     estimate_memory_size::<(u32, u64)>(num_rows, fixed_size_u32)?;
-                reservation.try_grow(estimated_hashtable_size)?;
+                reservation.try_grow(
+                    estimated_hashtable_size.saturating_sub(prereserved_table_bytes),
+                )?;
                 metrics.build_mem_used.add(estimated_hashtable_size);
                 Box::new(JoinHashMapU32::with_capacity(num_rows))
             };
@@ -2348,11 +2708,11 @@ async fn collect_left_input(
                 hashes_buffer.clear();
                 hashes_buffer.resize(batch.num_rows(), 0);
                 update_hash(
-                    &on_left,
+                    on_left,
                     batch,
                     &mut *hashmap,
                     offset,
-                    &random_state,
+                    random_state,
                     &mut hashes_buffer,
                     0,
                     true,
@@ -2362,24 +2722,47 @@ async fn collect_left_input(
             }
 
             // Merge all batches into a single batch, so we can directly index into the arrays
-            let batch = concat_batches(&schema, batches_iter.clone())?;
+            let batch = concat_batches(schema, batches_iter.clone())?;
 
-            let left_values = evaluate_expressions_to_arrays(&on_left, &batch)?;
+            let left_values = evaluate_expressions_to_arrays(on_left, &batch)?;
 
             (Map::HashMap(hashmap), batch, left_values)
         };
 
-    // Reserve additional memory for visited indices bitmap and create shared builder
-    let visited_indices_bitmap = if with_visited_indices_bitmap {
-        let bitmap_size = bit_util::ceil(batch.num_rows(), 8);
-        reservation.try_grow(bitmap_size)?;
-        metrics.build_mem_used.add(bitmap_size);
+    // Reserve additional memory for visited indices bitmap and create shared
+    // builder. An injected shared state (spilled CollectLeft) is initialized
+    // by whichever probe partition builds this disk partition first.
+    let (visited_indices_bitmap, probe_threads_counter) = match shared_state {
+        Some((bitmap, counter)) => {
+            if with_visited_indices_bitmap {
+                let mut guard = bitmap.lock();
+                if guard.len() < num_rows {
+                    debug_assert_eq!(guard.len(), 0);
+                    let bitmap_size = bit_util::ceil(batch.num_rows(), 8);
+                    reservation.try_grow(bitmap_size)?;
+                    metrics.build_mem_used.add(bitmap_size);
+                    guard.append_n(num_rows, false);
+                }
+            }
+            (bitmap, counter)
+        }
+        None => {
+            let bitmap_buffer = if with_visited_indices_bitmap {
+                let bitmap_size = bit_util::ceil(batch.num_rows(), 8);
+                reservation.try_grow(bitmap_size)?;
+                metrics.build_mem_used.add(bitmap_size);
 
-        let mut bitmap_buffer = BooleanBufferBuilder::new(batch.num_rows());
-        bitmap_buffer.append_n(num_rows, false);
-        bitmap_buffer
-    } else {
-        BooleanBufferBuilder::new(0)
+                let mut bitmap_buffer = BooleanBufferBuilder::new(batch.num_rows());
+                bitmap_buffer.append_n(num_rows, false);
+                bitmap_buffer
+            } else {
+                BooleanBufferBuilder::new(0)
+            };
+            (
+                Arc::new(Mutex::new(bitmap_buffer)),
+                Arc::new(AtomicUsize::new(probe_threads_count)),
+            )
+        }
     };
 
     let map = Arc::new(join_hash_map);
@@ -2410,7 +2793,7 @@ async fn collect_left_input(
         }
     };
 
-    if should_collect_min_max_for_phj && !should_compute_dynamic_filters {
+    if mask_bounds {
         bounds = None;
     }
 
@@ -2418,8 +2801,8 @@ async fn collect_left_input(
         map,
         batch,
         values: left_values,
-        visited_indices_bitmap: Mutex::new(visited_indices_bitmap),
-        probe_threads_counter: AtomicUsize::new(probe_threads_count),
+        visited_indices_bitmap,
+        probe_threads_counter,
         _reservation: reservation,
         bounds,
         membership,
