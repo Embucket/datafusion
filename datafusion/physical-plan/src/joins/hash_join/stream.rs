@@ -28,9 +28,13 @@ use crate::coalesce::{LimitedBatchCoalescer, PushBatchStatus};
 use crate::joins::Map;
 use crate::joins::MapOffset;
 use crate::joins::PartitionMode;
-use crate::joins::hash_join::exec::JoinLeftData;
+use crate::joins::hash_join::exec::{BuildPhaseOutput, JoinLeftData};
 use crate::joins::hash_join::shared_bounds::{
-    PartitionBounds, PartitionBuildData, SharedBuildAccumulator,
+    PartitionBounds, PartitionBuildData, PushdownStrategy, SharedBuildAccumulator,
+};
+use crate::joins::hash_join::spill::{
+    HashJoinSpillContext, InnerJoinSpec, SharedSpillJoinDriver, SpillJoinDriver,
+    empty_record_batch_stream,
 };
 use crate::joins::utils::{
     OnceFut, equal_rows_arr, get_final_indices_from_shared_bitmap,
@@ -69,7 +73,7 @@ pub(super) enum BuildSide {
 /// Container for BuildSide::Initial related data
 pub(super) struct BuildSideInitialState {
     /// Future for building hash table from build-side input
-    pub(super) left_fut: OnceFut<JoinLeftData>,
+    pub(super) left_fut: OnceFut<BuildPhaseOutput>,
 }
 
 /// Container for BuildSide::Ready related data
@@ -133,6 +137,10 @@ pub(super) enum HashJoinStreamState {
     ProcessProbeBatch(ProcessProbeBatchState),
     /// Indicates that probe-side has been fully processed
     ExhaustedProbeSide,
+    /// The build side spilled to disk partitions; `spill_driver` scatters the
+    /// probe side and joins partition pairs, and this stream forwards its
+    /// output.
+    SpillJoin,
     /// Indicates that HashJoinStream execution is completed
     Completed,
 }
@@ -226,6 +234,29 @@ pub(super) struct HashJoinStream {
     output_buffer: LimitedBatchCoalescer,
     /// Whether this is a null-aware anti join
     null_aware: bool,
+    /// Spill support (None when the feature is disabled or inapplicable)
+    spill_ctx: Option<Arc<HashJoinSpillContext>>,
+    /// Drives the partitioned disk join after the build side spilled
+    spill_driver: Option<SpillDriver>,
+}
+
+/// The two spill-join drivers: per-partition (Partitioned mode) and
+/// shared-build (CollectLeft mode).
+pub(super) enum SpillDriver {
+    Owned(Box<SpillJoinDriver>),
+    Shared(Box<SharedSpillJoinDriver>),
+}
+
+impl SpillDriver {
+    fn poll_next(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Option<Result<RecordBatch>>> {
+        match self {
+            SpillDriver::Owned(driver) => driver.poll_next(cx),
+            SpillDriver::Shared(driver) => driver.poll_next(cx),
+        }
+    }
 }
 
 impl RecordBatchStream for HashJoinStream {
@@ -375,6 +406,7 @@ impl HashJoinStream {
         mode: PartitionMode,
         null_aware: bool,
         fetch: Option<usize>,
+        spill_ctx: Option<Arc<HashJoinSpillContext>>,
     ) -> Self {
         // Create output buffer with coalescing and optional fetch limit.
         let output_buffer =
@@ -403,6 +435,8 @@ impl HashJoinStream {
             mode,
             output_buffer,
             null_aware,
+            spill_ctx,
+            spill_driver: None,
         }
     }
 
@@ -442,6 +476,9 @@ impl HashJoinStream {
                 HashJoinStreamState::ExhaustedProbeSide => {
                     handle_state!(self.process_unmatched_build_batch())
                 }
+                HashJoinStreamState::SpillJoin => {
+                    handle_state!(ready!(self.process_spill_join(cx)))
+                }
                 HashJoinStreamState::Completed if !self.output_buffer.is_empty() => {
                     // Flush any remaining buffered data
                     self.output_buffer.finish()?;
@@ -469,8 +506,137 @@ impl HashJoinStream {
         if let Some(ref mut fut) = self.build_waiter {
             ready!(fut.get_shared(cx))?;
         }
-        self.state = HashJoinStreamState::FetchProbeBatch;
+        self.state = if self.spill_driver.is_some() {
+            HashJoinStreamState::SpillJoin
+        } else {
+            HashJoinStreamState::FetchProbeBatch
+        };
         Poll::Ready(Ok(StatefulStreamResult::Continue))
+    }
+
+    /// Report bounds-only pushdown for a spilled build (so peer partitions
+    /// neither deadlock nor prune this partition's probe rows) and route the
+    /// state machine into the spill join.
+    fn report_spill_bounds(&mut self, bounds: Option<PartitionBounds>) -> Result<()> {
+        if let Some(ref build_accumulator) = self.build_accumulator {
+            let build_accumulator = Arc::clone(build_accumulator);
+            let bounds = bounds.unwrap_or_else(|| PartitionBounds::new(vec![]));
+            let build_data = match self.mode {
+                PartitionMode::Partitioned => PartitionBuildData::Partitioned {
+                    partition_id: self.partition,
+                    pushdown: PushdownStrategy::BoundsOnly,
+                    bounds,
+                },
+                PartitionMode::CollectLeft => PartitionBuildData::CollectLeft {
+                    pushdown: PushdownStrategy::BoundsOnly,
+                    bounds,
+                },
+                PartitionMode::Auto => {
+                    return internal_err!(
+                        "PartitionMode::Auto should not be present at execution time"
+                    );
+                }
+            };
+            self.build_waiter = Some(OnceFut::new(async move {
+                build_accumulator.report_build_data(build_data).await
+            }));
+            self.state = HashJoinStreamState::WaitPartitionBoundsReport;
+        } else {
+            self.state = HashJoinStreamState::SpillJoin;
+        }
+        Ok(())
+    }
+
+    /// Take ownership of the probe stream and snapshot the parameters the
+    /// spill drivers need to construct inner per-pair join streams.
+    fn take_probe_and_spec(&mut self) -> (SendableRecordBatchStream, InnerJoinSpec) {
+        let probe_schema = self.right.schema();
+        let probe =
+            std::mem::replace(&mut self.right, empty_record_batch_stream(probe_schema));
+        let spec = InnerJoinSpec {
+            partition: self.partition,
+            schema: Arc::clone(&self.schema),
+            on_right: self.on_right.clone(),
+            filter: self.filter.clone(),
+            join_type: self.join_type,
+            random_state: self.random_state.clone(),
+            column_indices: self.column_indices.clone(),
+            null_equality: self.null_equality,
+            batch_size: self.batch_size,
+        };
+        (probe, spec)
+    }
+
+    /// Hand off to the Partitioned-mode spill-join driver after this
+    /// partition's build side scattered to disk.
+    fn begin_spill_join(
+        &mut self,
+        spilled: crate::joins::hash_join::spill::SpilledBuild,
+    ) -> Poll<Result<StatefulStreamResult<Option<RecordBatch>>>> {
+        let ctx = self.spill_ctx.clone().ok_or_else(|| {
+            internal_datafusion_err!("spilled build without a spill context")
+        })?;
+        self.report_spill_bounds(spilled.bounds.clone())?;
+        let (probe, spec) = self.take_probe_and_spec();
+        self.spill_driver = Some(SpillDriver::Owned(Box::new(SpillJoinDriver::new(
+            spilled,
+            probe,
+            ctx,
+            spec,
+            self.join_metrics.clone(),
+        ))));
+        Poll::Ready(Ok(StatefulStreamResult::Continue))
+    }
+
+    /// Hand off to the CollectLeft shared-build spill driver: this output
+    /// partition scatters its own probe stream and walks the shared build
+    /// partitions.
+    fn begin_shared_spill_join(
+        &mut self,
+        shared: Arc<crate::joins::hash_join::spill::SharedSpilledBuild>,
+    ) -> Poll<Result<StatefulStreamResult<Option<RecordBatch>>>> {
+        let ctx = self.spill_ctx.clone().ok_or_else(|| {
+            internal_datafusion_err!("spilled build without a spill context")
+        })?;
+        self.report_spill_bounds(shared.bounds.clone())?;
+        let (probe, spec) = self.take_probe_and_spec();
+        self.spill_driver =
+            Some(SpillDriver::Shared(Box::new(SharedSpillJoinDriver::new(
+                shared,
+                probe,
+                ctx,
+                spec,
+                self.join_metrics.clone(),
+            ))));
+        Poll::Ready(Ok(StatefulStreamResult::Continue))
+    }
+
+    /// Forward the spill-join driver's output through the output buffer.
+    fn process_spill_join(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Result<StatefulStreamResult<Option<RecordBatch>>>> {
+        let driver = self.spill_driver.as_mut().ok_or_else(|| {
+            internal_datafusion_err!("SpillJoin state without a driver")
+        })?;
+        match ready!(driver.poll_next(cx)) {
+            Some(Ok(batch)) => {
+                let push_status = self.output_buffer.push_batch(batch)?;
+                if push_status == PushBatchStatus::LimitReached {
+                    self.spill_driver = None;
+                    self.output_buffer.finish()?;
+                    self.state = HashJoinStreamState::Completed;
+                }
+                Poll::Ready(Ok(StatefulStreamResult::Continue))
+            }
+            Some(Err(e)) => Poll::Ready(Err(e)),
+            None => {
+                self.spill_driver = None;
+                self.output_buffer.finish()?;
+                self.state = HashJoinStreamState::Completed;
+                Poll::Ready(Ok(StatefulStreamResult::Continue))
+            }
+        }
     }
 
     /// Collects build-side data by polling `OnceFut` future from initialized build-side
@@ -482,13 +648,27 @@ impl HashJoinStream {
     ) -> Poll<Result<StatefulStreamResult<Option<RecordBatch>>>> {
         let build_timer = self.join_metrics.build_time.timer();
         // build hash table from left (build) side, if not yet done
-        let left_data = ready!(
+        let build_output = ready!(
             self.build_side
                 .try_as_initial_mut()?
                 .left_fut
                 .get_shared(cx)
         )?;
         build_timer.done();
+
+        let left_data = match build_output.as_ref() {
+            BuildPhaseOutput::InMemory(data) => Arc::clone(data),
+            BuildPhaseOutput::Spilled(slot) => {
+                let spilled = slot.lock().take().ok_or_else(|| {
+                    internal_datafusion_err!("spilled hash join build already consumed")
+                })?;
+                return self.begin_spill_join(spilled);
+            }
+            BuildPhaseOutput::SpilledShared(shared) => {
+                let shared = Arc::clone(shared);
+                return self.begin_shared_spill_join(shared);
+            }
+        };
 
         // Note: For null-aware anti join, we need to check the probe side (right) for NULLs,
         // not the build side (left). The probe-side NULL check happens during process_probe_batch.
