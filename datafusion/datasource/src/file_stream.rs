@@ -25,6 +25,7 @@ use std::collections::VecDeque;
 use std::mem;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::task::{Context, Poll};
 
 use crate::PartitionedFile;
@@ -43,6 +44,26 @@ use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 use futures::{FutureExt as _, Stream, StreamExt as _, ready};
 
+/// How many file opens to keep in flight per partition, beyond the one being read.
+///
+/// `DATAFUSION_FILE_OPEN_AHEAD`, read once per process, **default 1** — exactly the
+/// historical behaviour, so an unset environment changes nothing.
+///
+/// Object-store scans are latency-bound long before they are bandwidth-bound: on
+/// SPCS/S3 each file open costs 33–61 ms of first-byte wait to deliver 1.5–4.5 MB,
+/// and a depth of one can only hide that behind a single file's decode. Raising the
+/// scan's `target_partitions` hides more of it, but pays for the concurrency twice
+/// over — in per-partition memory share and in scheduling — which is why 4x cores
+/// regressed at TPC-H SF100 and 2x turned a passing SF1000 query into a memory
+/// failure. Deeper pipelining buys the same overlap with neither cost.
+static OPEN_AHEAD: LazyLock<usize> = LazyLock::new(|| {
+    std::env::var("DATAFUSION_FILE_OPEN_AHEAD")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n >= 1)
+        .unwrap_or(1)
+});
+
 /// A stream that iterates record batch by record batch, file over file.
 pub struct FileStream {
     /// An iterator over input files.
@@ -57,6 +78,10 @@ pub struct FileStream {
     file_opener: Arc<dyn FileOpener>,
     /// The stream state
     state: FileStreamState,
+    /// How many opens to keep in flight beyond the file being read. Defaults to
+    /// [`OPEN_AHEAD`]; overridable so the pipelining can be tested at depth without
+    /// a process-wide environment variable.
+    open_ahead: usize,
     /// File stream specific metrics
     file_stream_metrics: FileStreamMetrics,
     /// runtime baseline metrics
@@ -83,6 +108,7 @@ impl FileStream {
             remain: config.limit,
             file_opener,
             state: FileStreamState::Idle,
+            open_ahead: *OPEN_AHEAD,
             file_stream_metrics: FileStreamMetrics::new(metrics, partition),
             baseline_metrics: BaselineMetrics::new(metrics, partition),
             on_error: OnError::Fail,
@@ -93,6 +119,13 @@ impl FileStream {
     ///
     /// If `OnError::Skip` the stream will skip files which encounter an error and continue
     /// If `OnError:Fail` (default) the stream will fail and stop processing when an error occurs
+    /// Keep `depth` opens in flight beyond the file being read. `1` is the
+    /// historical single-file prefetch.
+    pub fn with_open_ahead(mut self, depth: usize) -> Self {
+        self.open_ahead = depth.max(1);
+        self
+    }
+
     pub fn with_on_error(mut self, on_error: OnError) -> Self {
         self.on_error = on_error;
         self
@@ -107,6 +140,48 @@ impl FileStream {
         Some(self.file_opener.open(part_file))
     }
 
+    /// Top `pending` back up to [`OPEN_AHEAD`] opens in flight.
+    ///
+    /// Takes the queue by `&mut` rather than reading it out of `self.state`: the
+    /// `Scan` arm holds `reader` and `pending` as borrows of the state, so calling a
+    /// `&mut self` method there would not compile. Callers hand over an owned queue
+    /// at the transition points instead, which is also the only place the depth can
+    /// change.
+    ///
+    /// An open that fails to *start* is queued as `Ready(Err)` rather than raised
+    /// here, so the error surfaces at the same point in the file order it would have
+    /// without prefetching — otherwise a bad file three ahead could fail the stream
+    /// before the two good files in front of it were returned.
+    fn fill_pending(&mut self, pending: &mut VecDeque<NextOpen>) {
+        while pending.len() < self.open_ahead {
+            match self.start_next_file() {
+                Some(Ok(future)) => pending.push_back(NextOpen::Pending(future)),
+                Some(Err(e)) => {
+                    pending.push_back(NextOpen::Ready(Err(e)));
+                    break;
+                }
+                None => break,
+            }
+        }
+    }
+
+    /// Move to the next queued open, or end the stream when the queue is empty.
+    fn advance_to_next(&mut self, mut pending: VecDeque<NextOpen>) -> bool {
+        match pending.pop_front() {
+            Some(next) => {
+                self.file_stream_metrics.time_opening.start();
+                self.fill_pending(&mut pending);
+                let future = match next {
+                    NextOpen::Pending(future) => future,
+                    NextOpen::Ready(reader) => Box::pin(std::future::ready(reader)),
+                };
+                self.state = FileStreamState::Open { future, pending };
+                true
+            }
+            None => false,
+        }
+    }
+
     fn poll_inner(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<RecordBatch>>> {
         loop {
             match &mut self.state {
@@ -114,7 +189,11 @@ impl FileStream {
                     self.file_stream_metrics.time_opening.start();
 
                     match self.start_next_file().transpose() {
-                        Ok(Some(future)) => self.state = FileStreamState::Open { future },
+                        Ok(Some(future)) => {
+                            let mut pending = VecDeque::new();
+                            self.fill_pending(&mut pending);
+                            self.state = FileStreamState::Open { future, pending };
+                        }
                         Ok(None) => return Poll::Ready(None),
                         Err(e) => {
                             self.state = FileStreamState::Error;
@@ -122,51 +201,49 @@ impl FileStream {
                         }
                     }
                 }
-                FileStreamState::Open { future } => match ready!(future.poll_unpin(cx)) {
-                    Ok(reader) => {
-                        // include time needed to start opening in `start_next_file`
-                        self.file_stream_metrics.time_opening.stop();
-                        let next = self.start_next_file().transpose();
-                        self.file_stream_metrics.time_scanning_until_data.start();
-                        self.file_stream_metrics.time_scanning_total.start();
-
-                        match next {
-                            Ok(Some(next_future)) => {
-                                self.state = FileStreamState::Scan {
-                                    reader,
-                                    next: Some(NextOpen::Pending(next_future)),
-                                };
-                            }
-                            Ok(None) => {
-                                self.state = FileStreamState::Scan { reader, next: None };
-                            }
-                            Err(e) => {
-                                self.state = FileStreamState::Error;
-                                return Poll::Ready(Some(Err(e)));
+                FileStreamState::Open { future, pending } => {
+                    let opened = ready!(future.poll_unpin(cx));
+                    let mut pending = mem::take(pending);
+                    match opened {
+                        Ok(reader) => {
+                            // include time needed to start opening in `start_next_file`
+                            self.file_stream_metrics.time_opening.stop();
+                            self.fill_pending(&mut pending);
+                            self.file_stream_metrics.time_scanning_until_data.start();
+                            self.file_stream_metrics.time_scanning_total.start();
+                            self.state = FileStreamState::Scan { reader, pending };
+                        }
+                        Err(e) => {
+                            self.file_stream_metrics.file_open_errors.add(1);
+                            match self.on_error {
+                                OnError::Skip => {
+                                    self.file_stream_metrics.time_opening.stop();
+                                    // Keep the queue: the opens already in flight are
+                                    // for later files and are still wanted. Dropping
+                                    // it would re-open them from Idle and undo the
+                                    // pipelining after every skipped file.
+                                    if !self.advance_to_next(pending) {
+                                        self.state = FileStreamState::Idle;
+                                    }
+                                }
+                                OnError::Fail => {
+                                    self.state = FileStreamState::Error;
+                                    return Poll::Ready(Some(Err(e)));
+                                }
                             }
                         }
                     }
-                    Err(e) => {
-                        self.file_stream_metrics.file_open_errors.add(1);
-                        match self.on_error {
-                            OnError::Skip => {
-                                self.file_stream_metrics.time_opening.stop();
-                                self.state = FileStreamState::Idle
-                            }
-                            OnError::Fail => {
-                                self.state = FileStreamState::Error;
-                                return Poll::Ready(Some(Err(e)));
-                            }
+                }
+                FileStreamState::Scan { reader, pending } => {
+                    // Drive every queued open, not just the head: they are independent
+                    // object-store round trips and the whole point is to have them in
+                    // flight together. Each resolves in place and waits its turn.
+                    for slot in pending.iter_mut() {
+                        if let NextOpen::Pending(f) = slot
+                            && let Poll::Ready(opened) = f.as_mut().poll(cx)
+                        {
+                            *slot = NextOpen::Ready(opened);
                         }
-                    }
-                },
-                FileStreamState::Scan { reader, next } => {
-                    // We need to poll the next `FileOpenFuture` here to drive it forward
-                    if let Some(next_open_future) = next
-                        && let NextOpen::Pending(f) = next_open_future
-                        && let Poll::Ready(reader) = f.as_mut().poll(cx)
-                    {
-                        *next_open_future = NextOpen::Ready(reader);
                     }
                     match ready!(reader.poll_next_unpin(cx)) {
                         Some(Ok(batch)) => {
@@ -196,26 +273,12 @@ impl FileStream {
 
                             match self.on_error {
                                 // If `OnError::Skip` we skip the file as soon as we hit the first error
-                                OnError::Skip => match mem::take(next) {
-                                    Some(future) => {
-                                        self.file_stream_metrics.time_opening.start();
-
-                                        match future {
-                                            NextOpen::Pending(future) => {
-                                                self.state =
-                                                    FileStreamState::Open { future }
-                                            }
-                                            NextOpen::Ready(reader) => {
-                                                self.state = FileStreamState::Open {
-                                                    future: Box::pin(std::future::ready(
-                                                        reader,
-                                                    )),
-                                                }
-                                            }
-                                        }
+                                OnError::Skip => {
+                                    let pending = mem::take(pending);
+                                    if !self.advance_to_next(pending) {
+                                        return Poll::Ready(None);
                                     }
-                                    None => return Poll::Ready(None),
-                                },
+                                }
                                 OnError::Fail => {
                                     self.state = FileStreamState::Error;
                                     return Poll::Ready(Some(Err(err)));
@@ -226,24 +289,9 @@ impl FileStream {
                             self.file_stream_metrics.time_scanning_until_data.stop();
                             self.file_stream_metrics.time_scanning_total.stop();
 
-                            match mem::take(next) {
-                                Some(future) => {
-                                    self.file_stream_metrics.time_opening.start();
-
-                                    match future {
-                                        NextOpen::Pending(future) => {
-                                            self.state = FileStreamState::Open { future }
-                                        }
-                                        NextOpen::Ready(reader) => {
-                                            self.state = FileStreamState::Open {
-                                                future: Box::pin(std::future::ready(
-                                                    reader,
-                                                )),
-                                            }
-                                        }
-                                    }
-                                }
-                                None => return Poll::Ready(None),
+                            let pending = mem::take(pending);
+                            if !self.advance_to_next(pending) {
+                                return Poll::Ready(None);
                             }
                         }
                     }
@@ -316,16 +364,19 @@ pub enum FileStreamState {
     Open {
         /// A [`FileOpenFuture`] returned by [`FileOpener::open`]
         future: FileOpenFuture,
+        /// Opens already in flight for the files after this one. Carried through
+        /// this state rather than rebuilt, so a queue survives file boundaries.
+        pending: VecDeque<NextOpen>,
     },
     /// Scanning the [`BoxStream`] returned by the completion of a [`FileOpenFuture`]
     /// returned by [`FileOpener::open`]
     Scan {
         /// The reader instance
         reader: BoxStream<'static, Result<RecordBatch>>,
-        /// A [`FileOpenFuture`] for the next file to be processed.
-        /// This allows the next file to be opened in parallel while the
-        /// current file is read.
-        next: Option<NextOpen>,
+        /// Opens already in flight for the files after this one, oldest first, so
+        /// the next several files are being fetched while this one is read. Bounded
+        /// by [`OPEN_AHEAD`]; a depth of 1 is the historical single-file prefetch.
+        pending: VecDeque<NextOpen>,
     },
     /// Encountered an error
     Error,
@@ -494,7 +545,6 @@ mod tests {
         }
     }
 
-    #[derive(Default)]
     struct FileStreamTest {
         /// Number of files in the stream
         num_files: usize,
@@ -504,6 +554,22 @@ mod tests {
         on_error: OnError,
         /// Mock `FileOpener`
         opener: TestOpener,
+        /// Opens kept in flight beyond the file being read.
+        open_ahead: usize,
+    }
+
+    impl Default for FileStreamTest {
+        fn default() -> Self {
+            Self {
+                num_files: 0,
+                limit: None,
+                on_error: OnError::Fail,
+                opener: TestOpener::default(),
+                // Not `usize::default()`: a depth of 0 would mean "never prefetch",
+                // which is not the historical behaviour these tests encode.
+                open_ahead: 1,
+            }
+        }
     }
 
     impl FileStreamTest {
@@ -538,6 +604,14 @@ mod tests {
         }
 
         /// Specify the behavior of the stream when an error occurs
+        /// Run the stream with `depth` opens in flight. `1` is the historical
+        /// behaviour; the point of the depth tests is that nothing observable
+        /// changes when it is raised.
+        pub fn with_open_ahead(mut self, open_ahead: usize) -> Self {
+            self.open_ahead = open_ahead;
+            self
+        }
+
         pub fn with_on_error(mut self, on_error: OnError) -> Self {
             self.on_error = on_error;
             self
@@ -588,7 +662,8 @@ mod tests {
             let file_stream =
                 FileStream::new(&config, 0, Arc::new(self.opener), &metrics_set)
                     .unwrap()
-                    .with_on_error(on_error);
+                    .with_on_error(on_error)
+                    .with_open_ahead(self.open_ahead);
 
             file_stream
                 .collect::<Vec<_>>()
@@ -607,6 +682,108 @@ mod tests {
             .result()
             .await
             .expect("error executing stream")
+    }
+
+    /// Depth changes *when* opens happen, never what the scan returns. Rows, order
+    /// and count must be byte-identical at every depth.
+    #[tokio::test]
+    async fn deeper_pipeline_returns_identical_rows() -> Result<()> {
+        let mut baseline = None;
+        for depth in [1, 2, 4, 16] {
+            let batches = FileStreamTest::new()
+                .with_records(vec![make_partition(3), make_partition(2)])
+                .with_num_files(4)
+                .with_open_ahead(depth)
+                .result()
+                .await?;
+            let rendered =
+                arrow::util::pretty::pretty_format_batches(&batches)?.to_string();
+            match &baseline {
+                None => baseline = Some(rendered),
+                Some(first) => {
+                    assert_eq!(first, &rendered, "depth {depth} changed the result")
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// A depth larger than the file count must not over-read or hang: the queue
+    /// stops filling once `file_iter` is exhausted.
+    #[tokio::test]
+    async fn depth_larger_than_the_file_count_is_harmless() -> Result<()> {
+        let batches = FileStreamTest::new()
+            .with_records(vec![make_partition(3)])
+            .with_num_files(2)
+            .with_open_ahead(32)
+            .result()
+            .await?;
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 6);
+        Ok(())
+    }
+
+    /// The limit must cut at the same row with files open ahead of it; the surplus
+    /// opens are dropped rather than emitted.
+    #[tokio::test]
+    async fn limit_is_respected_at_depth() -> Result<()> {
+        for depth in [1, 4] {
+            let batches = FileStreamTest::new()
+                .with_records(vec![make_partition(3), make_partition(2)])
+                .with_num_files(4)
+                .with_limit(Some(4))
+                .with_open_ahead(depth)
+                .result()
+                .await?;
+            assert_eq!(
+                batches.iter().map(|b| b.num_rows()).sum::<usize>(),
+                4,
+                "depth {depth} changed the limit"
+            );
+        }
+        Ok(())
+    }
+
+    /// Skipping a bad file must skip exactly that file at depth, and must not throw
+    /// away the opens already in flight for the files behind it.
+    #[tokio::test]
+    async fn open_errors_skip_the_same_files_at_depth() -> Result<()> {
+        let mut baseline = None;
+        for depth in [1, 4] {
+            let batches = FileStreamTest::new()
+                .with_records(vec![make_partition(3), make_partition(2)])
+                .with_num_files(4)
+                .with_on_error(OnError::Skip)
+                .with_open_errors(vec![1, 2])
+                .with_open_ahead(depth)
+                .result()
+                .await?;
+            let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+            match baseline {
+                None => baseline = Some(rows),
+                Some(first) => assert_eq!(
+                    first, rows,
+                    "depth {depth} changed which files were skipped"
+                ),
+            }
+        }
+        Ok(())
+    }
+
+    /// A scan error must still fail the stream at depth -- prefetching must not let
+    /// a later file's error escape early or be swallowed.
+    #[tokio::test]
+    async fn scan_errors_fail_the_same_way_at_depth() {
+        for depth in [1, 4] {
+            let result = FileStreamTest::new()
+                .with_records(vec![make_partition(3), make_partition(2)])
+                .with_num_files(4)
+                .with_on_error(OnError::Fail)
+                .with_scan_errors(vec![2])
+                .with_open_ahead(depth)
+                .result()
+                .await;
+            assert!(result.is_err(), "depth {depth} swallowed a scan error");
+        }
     }
 
     #[tokio::test]
