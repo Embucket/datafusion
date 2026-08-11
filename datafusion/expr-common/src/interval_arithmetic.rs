@@ -931,9 +931,18 @@ impl Interval {
     ///   implemented yet, or
     /// - An overflow occurs during the calculation: This case can only arise
     ///   when the calculated cardinality does not fit in an `u64`.
+    ///
+    /// For decimal types, distinct points are counted at the type's scale
+    /// (i.e. one unit of the underlying integer representation), matching
+    /// the integer behavior.
     pub fn cardinality(&self) -> Option<u64> {
         let data_type = self.data_type();
-        if data_type.is_integer() {
+        if data_type.is_integer()
+            || matches!(
+                data_type,
+                DataType::Decimal128(_, _) | DataType::Decimal256(_, _)
+            )
+        {
             self.upper.distance(&self.lower).map(|diff| diff as u64)
         } else if data_type.is_floating() {
             // Negative numbers are sorted in the reverse order. To
@@ -2208,7 +2217,7 @@ mod tests {
     };
 
     use crate::interval_arithmetic::NullableInterval;
-    use arrow::datatypes::DataType;
+    use arrow::datatypes::{DataType, i256};
     use datafusion_common::rounding::{next_down, next_up};
     use datafusion_common::{Result, ScalarValue};
 
@@ -3951,6 +3960,36 @@ mod tests {
             ScalarValue::Float32(Some(0.0_f32)),
         )?;
         assert_eq!(interval.cardinality().unwrap(), 2);
+
+        // Decimals count representable points at the type's scale, like
+        // integers count units.
+        let interval = Interval::try_new(
+            ScalarValue::Decimal128(Some(1), 38, 0),
+            ScalarValue::Decimal128(Some(6_000_000), 38, 0),
+        )?;
+        assert_eq!(interval.cardinality().unwrap(), 6_000_000);
+
+        let interval = Interval::try_new(
+            ScalarValue::Decimal128(Some(100), 12, 2), // 1.00
+            ScalarValue::Decimal128(Some(200), 12, 2), // 2.00
+        )?;
+        assert_eq!(interval.cardinality().unwrap(), 101);
+
+        let interval = Interval::try_new(
+            ScalarValue::Decimal256(Some(i256::from(1)), 76, 0),
+            ScalarValue::Decimal256(Some(i256::from(1_000)), 76, 0),
+        )?;
+        assert_eq!(interval.cardinality().unwrap(), 1_000);
+
+        // A range wider than u64 must overflow to None, not panic.
+        let interval = Interval::try_new(
+            ScalarValue::Decimal128(Some(-(10_i128.pow(37))), 38, 0),
+            ScalarValue::Decimal128(Some(10_i128.pow(37)), 38, 0),
+        )?;
+        assert_eq!(interval.cardinality(), None);
+
+        let interval = Interval::make_unbounded(&DataType::Decimal128(38, 0))?;
+        assert_eq!(interval.cardinality(), None);
 
         Ok(())
     }

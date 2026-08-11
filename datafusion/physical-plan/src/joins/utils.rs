@@ -2419,6 +2419,41 @@ mod tests {
     }
 
     #[test]
+    fn test_inner_join_cardinality_decimal_keys_range_narrower_than_rows() -> Result<()>
+    {
+        // Decimal(38,0) join keys (how NUMBER(38,0) keys arrive from
+        // Iceberg/Snowflake): when the key range is narrower than the row
+        // count, the range must cap the distinct estimate. Without decimal
+        // range cardinality this degenerates to distinct ≈ rows and the
+        // estimate collapses to min(L, R) = 150 instead of 600.
+        let key_stats = |min: i128, max: i128| {
+            vec![ColumnStatistics {
+                distinct_count: Absent,
+                min_value: Inexact(ScalarValue::Decimal128(Some(min), 38, 0)),
+                max_value: Inexact(ScalarValue::Decimal128(Some(max), 38, 0)),
+                ..Default::default()
+            }]
+        };
+
+        assert_eq!(
+            estimate_inner_join_cardinality(
+                Statistics {
+                    num_rows: Inexact(150),
+                    total_byte_size: Absent,
+                    column_statistics: key_stats(1, 150),
+                },
+                Statistics {
+                    num_rows: Inexact(600),
+                    total_byte_size: Absent,
+                    column_statistics: key_stats(1, 150),
+                },
+            ),
+            Some(Inexact((150 * 600) / 150))
+        );
+        Ok(())
+    }
+
+    #[test]
     fn test_join_cardinality() -> Result<()> {
         // Left table (rows=1000)
         //   a: min=0, max=100, distinct=100
