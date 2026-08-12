@@ -621,7 +621,19 @@ fn estimate_inner_join_cardinality(
             // Seems like there are a few implementations of this algorithm that implement
             // exponential decay for the selectivity (like Hive's Optiq Optimizer). Needs
             // further exploration.
-            join_selectivity = max_distinct;
+            //
+            // For composite keys, keep the MOST selective pair (largest distinct
+            // count): every additional equality can only shrink the output, so
+            // letting whichever pair happens to come last overwrite the
+            // selectivity turns e.g. a (suppkey, nationkey) join into a
+            // rows/25 estimate the moment the 25-value nationkey pair is
+            // listed after the million-value suppkey pair.
+            if join_selectivity
+                .get_value()
+                .is_none_or(|cur| max_distinct.get_value() > Some(cur))
+            {
+                join_selectivity = max_distinct;
+            }
         }
     }
 
@@ -2414,6 +2426,37 @@ mod tests {
                 },
             ),
             Some(Inexact(100))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_inner_join_cardinality_composite_key_keeps_most_selective_pair() -> Result<()>
+    {
+        // (suppkey ~1M distinct, nationkey 25 distinct) composite equi-join:
+        // the low-cardinality trailing pair must not overwrite the selective
+        // one — every extra equality only shrinks the output, and dividing by
+        // 25 instead of 1M inflates a TPC-H Q5-shaped estimate to |L|·|R|/25.
+        let key_stats = || {
+            vec![
+                create_column_stats(Inexact(1), Inexact(1_000_000), Absent, Absent),
+                create_column_stats(Inexact(0), Inexact(24), Absent, Absent),
+            ]
+        };
+        assert_eq!(
+            estimate_inner_join_cardinality(
+                Statistics {
+                    num_rows: Inexact(1_000_000),
+                    total_byte_size: Absent,
+                    column_statistics: key_stats(),
+                },
+                Statistics {
+                    num_rows: Inexact(30_000_000),
+                    total_byte_size: Absent,
+                    column_statistics: key_stats(),
+                },
+            ),
+            Some(Inexact((1_000_000_usize * 30_000_000) / 1_000_000))
         );
         Ok(())
     }
