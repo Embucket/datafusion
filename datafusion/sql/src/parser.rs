@@ -945,7 +945,11 @@ impl<'a> DFParser<'a> {
         {
             self.parse_create_external_table(true, false)
         } else {
-            Ok(Statement::Statement(Box::from(self.parser.parse_create()?)))
+            // Let the configured dialect see the complete CREATE statement. Dialects such as
+            // Snowflake extend CREATE with object types (for example ICEBERG TABLE) that are not
+            // handled by sqlparser's generic `parse_create` entry point.
+            self.parser.prev_token();
+            self.parse_and_handle_statement()
         }
     }
 
@@ -1854,6 +1858,25 @@ mod tests {
         if let Statement::CopyTo(_) = &statements[0] {
             panic!("Expected non COPY TO statement, but was successful: {statements:?}");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn delegate_create_iceberg_table_to_snowflake_dialect() -> Result<(), DataFusionError>
+    {
+        let sql = "CREATE ICEBERG TABLE t (id INT) BASE_LOCATION = 't'";
+        let dialect = SnowflakeDialect;
+        let statements = DFParser::parse_sql_with_dialect(sql, &dialect)?;
+
+        assert_eq!(statements.len(), 1);
+        let Statement::Statement(statement) = &statements[0] else {
+            panic!("expected a sqlparser statement, got {:?}", statements[0]);
+        };
+        let sqlparser::ast::Statement::CreateTable(table) = statement.as_ref() else {
+            panic!("expected CREATE TABLE, got {statement:?}");
+        };
+        assert!(table.iceberg);
+        assert_eq!(table.base_location.as_deref(), Some("t"));
         Ok(())
     }
 
