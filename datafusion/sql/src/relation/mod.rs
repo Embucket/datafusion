@@ -21,15 +21,20 @@ use crate::planner::{ContextProvider, PlannerContext, SqlToRel};
 
 use datafusion_common::tree_node::{Transformed, TreeNode};
 use datafusion_common::{
-    DFSchema, Diagnostic, Result, Span, Spans, TableReference, not_impl_err, plan_err,
+    Column, DFSchema, Diagnostic, Result, ScalarValue, Span, Spans, TableReference,
+    not_impl_err, plan_err,
 };
 use datafusion_expr::builder::subquery_alias;
+use datafusion_expr::expr::{AggregateFunction, Alias, BinaryExpr, Case, Cast};
 use datafusion_expr::planner::{
     PlannedRelation, RelationPlannerContext, RelationPlanning,
 };
-use datafusion_expr::{Expr, LogicalPlan, LogicalPlanBuilder, expr::Unnest};
+use datafusion_expr::type_coercion::binary::comparison_coercion;
+use datafusion_expr::{Expr, LogicalPlan, LogicalPlanBuilder, Operator, expr::Unnest};
 use datafusion_expr::{Subquery, SubqueryAlias};
-use sqlparser::ast::{FunctionArg, FunctionArgExpr, Spanned, TableFactor};
+use sqlparser::ast::{
+    FunctionArg, FunctionArgExpr, NullInclusion, PivotValueSource, Spanned, TableFactor,
+};
 
 mod join;
 
@@ -158,17 +163,26 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     let args = func_args
                         .args
                         .into_iter()
-                        .map(|arg| {
-                            if let FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) = arg
-                            {
-                                self.sql_expr_to_logical_expr(
+                        .map(|arg| match arg {
+                            FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => self
+                                .sql_expr_to_logical_expr(
                                     expr,
                                     &DFSchema::empty(),
                                     planner_context,
                                 )
-                            } else {
-                                plan_err!("Unsupported function argument type: {}", arg)
-                            }
+                                .map(|expr| (expr, None)),
+                            FunctionArg::Named {
+                                name,
+                                arg: FunctionArgExpr::Expr(expr),
+                                ..
+                            } => self
+                                .sql_expr_to_logical_expr(
+                                    expr,
+                                    &DFSchema::empty(),
+                                    planner_context,
+                                )
+                                .map(|expr| (expr, Some(name.to_string()))),
+                            _ => plan_err!("Unsupported function argument type: {arg}"),
                         })
                         .collect::<Result<Vec<_>>>()?;
                     let provider = self
@@ -276,22 +290,189 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 let func_args = args
                     .into_iter()
                     .map(|arg| match arg {
-                        FunctionArg::Unnamed(FunctionArgExpr::Expr(expr))
-                        | FunctionArg::Named {
+                        FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => self
+                            .sql_expr_to_logical_expr(expr, &schema, planner_context)
+                            .map(|expr| (expr, None)),
+                        FunctionArg::Named {
+                            name,
                             arg: FunctionArgExpr::Expr(expr),
                             ..
-                        } => {
-                            self.sql_expr_to_logical_expr(expr, &schema, planner_context)
-                        }
+                        } => self
+                            .sql_expr_to_logical_expr(expr, &schema, planner_context)
+                            .map(|expr| (expr, Some(name.to_string()))),
                         _ => plan_err!("Unsupported function argument: {arg:?}"),
                     })
-                    .collect::<Result<Vec<Expr>>>()?;
+                    .collect::<Result<Vec<_>>>()?;
                 let provider = self
                     .context_provider
                     .get_table_function_source(tbl_func_ref.table(), func_args)?;
                 let plan =
                     LogicalPlanBuilder::scan(tbl_func_ref.table(), provider, None)?
                         .build()?;
+                (plan, alias)
+            }
+            TableFactor::Pivot {
+                table,
+                aggregate_functions,
+                value_column,
+                value_source,
+                default_on_null,
+                alias,
+            } => {
+                let input_plan = self.create_relation(*table, planner_context)?;
+                if aggregate_functions.len() != 1 {
+                    return plan_err!("PIVOT requires exactly one aggregate function");
+                }
+
+                let aggregate_expr = self.sql_expr_to_logical_expr(
+                    aggregate_functions[0].expr.clone(),
+                    input_plan.schema(),
+                    planner_context,
+                )?;
+                let pivot_ident = value_column.last().ok_or_else(|| {
+                    datafusion_common::plan_datafusion_err!(
+                        "PIVOT value column is required"
+                    )
+                })?;
+                let column_name = match pivot_ident {
+                    sqlparser::ast::Expr::Identifier(ident) => {
+                        self.ident_normalizer.normalize(ident.clone())
+                    }
+                    sqlparser::ast::Expr::CompoundIdentifier(idents) => {
+                        self.ident_normalizer.normalize(
+                            idents
+                                .last()
+                                .ok_or_else(|| {
+                                    datafusion_common::plan_datafusion_err!(
+                                        "PIVOT value column is required"
+                                    )
+                                })?
+                                .clone(),
+                        )
+                    }
+                    other => {
+                        return plan_err!("Unsupported PIVOT value column: {other}");
+                    }
+                };
+                let pivot_column = Column::new(None::<&str>, column_name);
+                let default_on_null_expr = default_on_null
+                    .map(|expr| {
+                        self.sql_expr_to_logical_expr(
+                            expr,
+                            input_plan.schema(),
+                            planner_context,
+                        )
+                    })
+                    .transpose()?;
+
+                let PivotValueSource::List(values) = value_source else {
+                    return plan_err!(
+                        "PIVOT ANY and subquery values must be resolved before planning"
+                    );
+                };
+                let pivot_values = values
+                    .into_iter()
+                    .map(|value| {
+                        match self.sql_expr_to_logical_expr(
+                            value.expr,
+                            input_plan.schema(),
+                            planner_context,
+                        )? {
+                            Expr::Literal(value, _) => Ok(value),
+                            _ => plan_err!("PIVOT values must be literals"),
+                        }
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let plan = transform_pivot_to_aggregate(
+                    input_plan,
+                    &aggregate_expr,
+                    &pivot_column,
+                    &pivot_values,
+                    default_on_null_expr.as_ref(),
+                )?;
+                (plan, alias)
+            }
+            TableFactor::Unpivot {
+                table,
+                null_inclusion,
+                value,
+                name,
+                columns,
+                alias,
+            } => {
+                let base_plan = self.create_relation(*table, planner_context)?;
+                let base_schema = base_plan.schema();
+                let value_column = value.to_string();
+                let name_column = name.value;
+                let mut unpivot_column_indices = Vec::new();
+                let mut unpivot_column_names = Vec::new();
+                let mut common_type = None;
+
+                for column_ident in columns {
+                    let column_name = column_ident.expr.to_string();
+                    let Some(index) =
+                        base_schema.index_of_column_by_name(None, &column_name)
+                    else {
+                        return plan_err!("Column '{column_name}' not found in input");
+                    };
+                    let field_type = base_schema.field(index).data_type();
+                    if let Some(current_type) = &common_type {
+                        if comparison_coercion(current_type, field_type).is_none() {
+                            return plan_err!(
+                                "The type of column '{}' conflicts with the type of other columns in the UNPIVOT list.",
+                                column_name.to_uppercase()
+                            );
+                        }
+                    } else {
+                        common_type = Some(field_type.clone());
+                    }
+                    unpivot_column_indices.push(index);
+                    unpivot_column_names.push(column_name);
+                }
+
+                if unpivot_column_names.is_empty() {
+                    return plan_err!("UNPIVOT requires at least one column to unpivot");
+                }
+                let non_pivot_exprs = base_schema
+                    .fields()
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| !unpivot_column_indices.contains(index))
+                    .map(|(_, field)| Expr::Column(Column::from_name(field.name())))
+                    .collect::<Vec<_>>();
+                let mut union_inputs = Vec::with_capacity(unpivot_column_names.len());
+
+                for column_name in unpivot_column_names {
+                    let mut projection_exprs = non_pivot_exprs.clone();
+                    projection_exprs.push(
+                        Expr::Literal(
+                            ScalarValue::Utf8(Some(column_name.to_uppercase())),
+                            None,
+                        )
+                        .alias(name_column.clone()),
+                    );
+                    projection_exprs.push(
+                        Expr::Column(Column::from_name(&column_name))
+                            .alias(value_column.clone()),
+                    );
+                    let mut builder = LogicalPlanBuilder::from(base_plan.clone())
+                        .project(projection_exprs)?;
+                    if matches!(null_inclusion, None | Some(NullInclusion::ExcludeNulls))
+                    {
+                        builder = builder.filter(Expr::IsNotNull(Box::new(
+                            Expr::Column(Column::from_name(&value_column)),
+                        )))?;
+                    }
+                    union_inputs.push(builder.build()?);
+                }
+
+                let first = union_inputs.remove(0);
+                let plan = union_inputs
+                    .into_iter()
+                    .try_fold(LogicalPlanBuilder::from(first), |builder, input| {
+                        builder.union(input)
+                    })?
+                    .build()?;
                 (plan, alias)
             }
             // @todo Support TableFactory::TableFunction?
@@ -362,6 +543,101 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             })),
         }
     }
+}
+
+fn transform_pivot_to_aggregate(
+    input: LogicalPlan,
+    aggregate_expr: &Expr,
+    pivot_column: &Column,
+    pivot_values: &[ScalarValue],
+    default_on_null_expr: Option<&Expr>,
+) -> Result<LogicalPlan> {
+    let input_schema = input.schema();
+    let group_by = input_schema
+        .columns()
+        .into_iter()
+        .filter(|column| {
+            column.name != pivot_column.name
+                && !aggregate_expr
+                    .column_refs()
+                    .iter()
+                    .any(|aggregate_column| aggregate_column.name == column.name)
+        })
+        .map(Expr::Column)
+        .collect::<Vec<_>>();
+    let pivot_index = input_schema.index_of_column(pivot_column).map_err(|_| {
+        datafusion_common::plan_datafusion_err!(
+            "Pivot column '{pivot_column}' does not exist in input schema"
+        )
+    })?;
+    let pivot_type = input_schema.field(pivot_index).data_type().clone();
+    let aggregates = pivot_values
+        .iter()
+        .map(|value| {
+            let filter = Expr::BinaryExpr(BinaryExpr::new(
+                Box::new(Expr::Column(pivot_column.clone())),
+                Operator::IsNotDistinctFrom,
+                Box::new(Expr::Cast(Cast::new(
+                    Box::new(Expr::Literal(value.clone(), None)),
+                    pivot_type.clone(),
+                ))),
+            ));
+            let Expr::AggregateFunction(aggregate) = aggregate_expr else {
+                return plan_err!("PIVOT expression must be an aggregate function");
+            };
+            let mut params = aggregate.params.clone();
+            params.filter = Some(Box::new(filter));
+            let name = value.to_string().trim_matches('\'').to_string();
+            Ok(Expr::Alias(Alias {
+                expr: Box::new(Expr::AggregateFunction(AggregateFunction {
+                    func: Arc::clone(&aggregate.func),
+                    params,
+                })),
+                relation: None,
+                name,
+                metadata: None,
+            }))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let aggregate_plan = LogicalPlanBuilder::from(input)
+        .aggregate(group_by, aggregates)?
+        .build()?;
+
+    let Some(default_expr) = default_on_null_expr else {
+        return Ok(aggregate_plan);
+    };
+    let pivot_names = pivot_values
+        .iter()
+        .map(|value| value.to_string().trim_matches('\'').to_string())
+        .collect::<Vec<_>>();
+    let projection = aggregate_plan
+        .schema()
+        .fields()
+        .iter()
+        .map(|field| {
+            let column = Expr::Column(Column::from_name(field.name()));
+            if pivot_names.iter().any(|name| name == field.name()) {
+                Expr::Alias(Alias {
+                    expr: Box::new(Expr::Case(Case {
+                        expr: None,
+                        when_then_expr: vec![(
+                            Box::new(Expr::IsNull(Box::new(column.clone()))),
+                            Box::new(default_expr.clone()),
+                        )],
+                        else_expr: Some(Box::new(column)),
+                    })),
+                    relation: None,
+                    name: field.name().clone(),
+                    metadata: None,
+                })
+            } else {
+                column
+            }
+        })
+        .collect::<Vec<_>>();
+    LogicalPlanBuilder::from(aggregate_plan)
+        .project(projection)?
+        .build()
 }
 
 fn optimize_subquery_sort(

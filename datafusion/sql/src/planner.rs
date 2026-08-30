@@ -664,10 +664,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
             })
     }
 
-    pub(crate) fn convert_data_type_to_field(
-        &self,
-        sql_type: &SQLDataType,
-    ) -> Result<FieldRef> {
+    pub fn convert_data_type_to_field(&self, sql_type: &SQLDataType) -> Result<FieldRef> {
         // First check if any of the registered type_planner can handle this type
         if let Some(type_planner) = self.context_provider.get_type_planner()
             && let Some(data_type) = type_planner.plan_type_field(sql_type)?

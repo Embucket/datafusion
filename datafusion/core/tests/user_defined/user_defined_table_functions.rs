@@ -243,6 +243,31 @@ async fn test_udtf_type_coercion() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn test_udtf_named_arguments_are_preserved() -> Result<()> {
+    use datafusion::datasource::MemTable;
+
+    #[derive(Debug)]
+    struct NamedArgsTableFunc;
+
+    impl TableFunctionImpl for NamedArgsTableFunc {
+        fn call_with_args(
+            &self,
+            args: TableFunctionArgs,
+        ) -> Result<Arc<dyn TableProvider>> {
+            assert_eq!(args.names(), Some([Some("value".to_string())].as_slice()));
+            assert_eq!(args.exprs().len(), 1);
+            let schema = Arc::new(arrow::datatypes::Schema::empty());
+            Ok(Arc::new(MemTable::try_new(schema, vec![vec![]])?))
+        }
+    }
+
+    let ctx = SessionContext::new();
+    ctx.register_udtf("named_args", Arc::new(NamedArgsTableFunc));
+    ctx.sql("SELECT * FROM named_args(value => 1)").await?;
+    Ok(())
+}
+
 fn read_csv_batches(csv_path: impl AsRef<Path>) -> Result<(SchemaRef, Vec<RecordBatch>)> {
     let mut file = File::open(csv_path)?;
     let (schema, _) = Format::default()

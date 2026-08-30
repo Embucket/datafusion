@@ -352,7 +352,8 @@ impl Session for SessionState {
 }
 
 impl SessionState {
-    pub(crate) fn resolve_table_ref(
+    /// Resolve a table reference using this session's default catalog and schema.
+    pub fn resolve_table_ref(
         &self,
         table_ref: impl Into<TableReference>,
     ) -> ResolvedTableReference {
@@ -574,7 +575,8 @@ impl SessionState {
     }
 
     #[cfg(feature = "sql")]
-    fn get_parser_options(&self) -> ParserOptions {
+    /// Return SQL planner options derived from this session's configuration.
+    pub fn get_parser_options(&self) -> ParserOptions {
         let sql_parser_options = &self.config.options().sql_parser;
 
         ParserOptions {
@@ -1957,9 +1959,11 @@ impl From<SessionState> for SessionStateBuilder {
 /// This is used so the SQL planner can access the state of the session without
 /// having a direct dependency on the [`SessionState`] struct (and core crate)
 #[cfg(feature = "sql")]
-struct SessionContextProvider<'a> {
-    state: &'a SessionState,
-    tables: HashMap<ResolvedTableReference, Arc<dyn TableSource>>,
+pub struct SessionContextProvider<'a> {
+    /// Session state exposed to the SQL planner.
+    pub state: &'a SessionState,
+    /// Resolved table sources collected for the statement being planned.
+    pub tables: HashMap<ResolvedTableReference, Arc<dyn TableSource>>,
 }
 
 #[cfg(feature = "sql")]
@@ -1994,7 +1998,7 @@ impl ContextProvider for SessionContextProvider<'_> {
     fn get_table_function_source(
         &self,
         name: &str,
-        args: Vec<Expr>,
+        args: Vec<(Expr, Option<String>)>,
     ) -> datafusion_common::Result<Arc<dyn TableSource>> {
         use datafusion_catalog::TableFunctionArgs;
 
@@ -2014,14 +2018,17 @@ impl ContextProvider for SessionContextProvider<'_> {
         let schema = DFSchema::empty();
         let args = args
             .into_iter()
-            .map(|arg| {
+            .map(|(arg, name)| {
                 simplifier
                     .coerce(arg, &schema)
                     .and_then(|e| simplifier.simplify(e))
+                    .map(|expr| (expr, name))
             })
             .collect::<datafusion_common::Result<Vec<_>>>()?;
-        let provider = tbl_func
-            .create_table_provider_with_args(TableFunctionArgs::new(&args, self.state))?;
+        let (exprs, names): (Vec<_>, Vec<_>) = args.into_iter().unzip();
+        let provider = tbl_func.create_table_provider_with_args(
+            TableFunctionArgs::new_with_names(&exprs, &names, self.state),
+        )?;
 
         Ok(provider_as_source(provider))
     }

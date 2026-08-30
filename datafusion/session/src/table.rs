@@ -576,6 +576,8 @@ pub trait TableProviderFactory: Debug + Sync + Send {
 pub struct TableFunctionArgs<'e, 's> {
     /// Call arguments.
     exprs: &'e [Expr],
+    /// Optional argument names, aligned with [`Self::exprs`].
+    names: Option<&'e [Option<String>]>,
     /// Session within which the function is called.
     session: &'s dyn Session,
 }
@@ -583,12 +585,35 @@ pub struct TableFunctionArgs<'e, 's> {
 impl<'e, 's> TableFunctionArgs<'e, 's> {
     /// Make a new [`TableFunctionArgs`].
     pub fn new(exprs: &'e [Expr], session: &'s dyn Session) -> Self {
-        Self { exprs, session }
+        Self {
+            exprs,
+            names: None,
+            session,
+        }
+    }
+
+    /// Make table function arguments that preserve SQL named arguments.
+    pub fn new_with_names(
+        exprs: &'e [Expr],
+        names: &'e [Option<String>],
+        session: &'s dyn Session,
+    ) -> Self {
+        debug_assert_eq!(exprs.len(), names.len());
+        Self {
+            exprs,
+            names: Some(names),
+            session,
+        }
     }
 
     /// Get expressions passed as the called function arguments.
     pub fn exprs(&self) -> &'e [Expr] {
         self.exprs
+    }
+
+    /// Get argument names aligned with [`Self::exprs`], when supplied by SQL.
+    pub fn names(&self) -> Option<&'e [Option<String>]> {
+        self.names
     }
 
     /// Get a session where the table function is called.

@@ -77,7 +77,7 @@ fn ident_to_string(ident: &Ident) -> String {
     normalize_ident(ident.to_owned())
 }
 
-fn object_name_to_string(object_name: &ObjectName) -> String {
+pub fn object_name_to_string(object_name: &ObjectName) -> String {
     object_name
         .0
         .iter()
