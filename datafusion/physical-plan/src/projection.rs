@@ -744,9 +744,10 @@ pub fn try_embed_projection<Exec: EmbeddedProjection + 'static>(
         });
     }
     // Old projection may contain some alias or expression such as `a + 1` and `CAST('true' AS BOOLEAN)`, but our projection_exprs in hash join just contain column, so we need to create the new projection to keep the original projection.
-    let new_projection = Arc::new(ProjectionExec::try_new(
+    let new_projection = Arc::new(ProjectionExec::try_new_with_schema_metadata(
         new_projection_exprs,
         Arc::clone(&new_execution_plan) as _,
+        projection.schema().as_ref(),
     )?);
     if is_projection_removable(&new_projection) {
         // Residual is identity — embedding fully absorbed the projection.
@@ -872,8 +873,11 @@ pub fn try_pushdown_through_join_with_column_indices(
     }
     let mut left_proj: Vec<(Column, String)> = Vec::new();
     let mut right_proj: Vec<(Column, String)> = Vec::new();
+    let mut left_fields = Vec::new();
+    let mut right_fields = Vec::new();
+    let projection_schema = projection.schema();
     let mut seen_right = false;
-    for (col, alias) in &projection_as_columns {
+    for (projection_index, (col, alias)) in projection_as_columns.iter().enumerate() {
         let Some(origin) = column_indices.get(col.index()) else {
             return plan_err!(
                 "Projection column {} is outside the {}-entry column index mapping",
@@ -889,10 +893,14 @@ pub fn try_pushdown_through_join_with_column_indices(
                     return Ok(None);
                 }
                 left_proj.push((Column::new(col.name(), origin.index), alias.clone()));
+                left_fields
+                    .push(Arc::clone(&projection_schema.fields()[projection_index]));
             }
             JoinSide::Right => {
                 seen_right = true;
                 right_proj.push((Column::new(col.name(), origin.index), alias.clone()));
+                right_fields
+                    .push(Arc::clone(&projection_schema.fields()[projection_index]));
             }
             // Synthetic column (e.g. mark): belongs to neither child.
             // Phase 2 declines; Phase 3 keeps it at the join output instead.
@@ -922,8 +930,16 @@ pub fn try_pushdown_through_join_with_column_indices(
         return Ok(None);
     };
 
-    let (new_left, new_right) =
-        new_join_children_from_groups(&left_proj, &right_proj, join_left, join_right)?;
+    let left_schema = Schema::new(left_fields);
+    let right_schema = Schema::new(right_fields);
+    let (new_left, new_right) = new_join_children_from_groups(
+        &left_proj,
+        &right_proj,
+        &left_schema,
+        &right_schema,
+        join_left,
+        join_right,
+    )?;
 
     Ok(Some(JoinData {
         projected_left_child: new_left,
@@ -968,6 +984,7 @@ fn is_projection_removable(projection: &ProjectionExec) -> bool {
         };
         col.name() == proj_expr.alias && col.index() == idx
     }) && exprs.len() == projection.input().schema().fields().len()
+        && projection.schema() == projection.input().schema()
 }
 
 /// Given the expression set of a projection, checks if the projection causes
@@ -1006,8 +1023,12 @@ pub fn make_with_child(
     projection: &ProjectionExec,
     child: &Arc<dyn ExecutionPlan>,
 ) -> Result<Arc<dyn ExecutionPlan>> {
-    ProjectionExec::try_new(projection.expr().to_vec(), Arc::clone(child))
-        .map(|e| Arc::new(e) as _)
+    ProjectionExec::try_new_with_schema_metadata(
+        projection.expr().to_vec(),
+        Arc::clone(child),
+        projection.schema().as_ref(),
+    )
+    .map(|e| Arc::new(e) as _)
 }
 
 /// Returns `true` if all the expressions in the argument are `Column`s.
@@ -1072,12 +1093,16 @@ pub fn physical_to_column_exprs(
 /// of the original children of the join.
 pub fn new_join_children(
     projection_as_columns: &[(Column, String)],
+    projection_schema: &Schema,
     far_right_left_col_ind: i32,
     far_left_right_col_ind: i32,
     left_child: &Arc<dyn ExecutionPlan>,
     right_child: &Arc<dyn ExecutionPlan>,
 ) -> Result<(ProjectionExec, ProjectionExec)> {
-    let new_left = ProjectionExec::try_new(
+    let left_schema = Schema::new(
+        projection_schema.fields()[0..=far_right_left_col_ind as usize].to_vec(),
+    );
+    let new_left = ProjectionExec::try_new_with_schema_metadata(
         projection_as_columns[0..=far_right_left_col_ind as _]
             .iter()
             .map(|(col, alias)| ProjectionExpr {
@@ -1085,9 +1110,13 @@ pub fn new_join_children(
                 alias: alias.clone(),
             }),
         Arc::clone(left_child),
+        &left_schema,
     )?;
     let left_size = left_child.schema().fields().len() as i32;
-    let new_right = ProjectionExec::try_new(
+    let right_schema = Schema::new(
+        projection_schema.fields()[far_left_right_col_ind as usize..].to_vec(),
+    );
+    let new_right = ProjectionExec::try_new_with_schema_metadata(
         projection_as_columns[far_left_right_col_ind as _..]
             .iter()
             .map(|(col, alias)| {
@@ -1102,6 +1131,7 @@ pub fn new_join_children(
                 }
             }),
         Arc::clone(right_child),
+        &right_schema,
     )?;
 
     Ok((new_left, new_right))
@@ -1116,22 +1146,26 @@ pub fn new_join_children(
 fn new_join_children_from_groups(
     left_proj: &[(Column, String)],
     right_proj: &[(Column, String)],
+    left_schema: &Schema,
+    right_schema: &Schema,
     left_child: &Arc<dyn ExecutionPlan>,
     right_child: &Arc<dyn ExecutionPlan>,
 ) -> Result<(ProjectionExec, ProjectionExec)> {
-    let build = |cols: &[(Column, String)], child: &Arc<dyn ExecutionPlan>| {
-        ProjectionExec::try_new(
-            cols.iter().map(|(col, alias)| ProjectionExpr {
-                expr: Arc::new(Column::new(col.name(), col.index())) as _,
-                alias: alias.clone(),
-            }),
-            Arc::clone(child),
-        )
-    };
+    let build =
+        |cols: &[(Column, String)], schema: &Schema, child: &Arc<dyn ExecutionPlan>| {
+            ProjectionExec::try_new_with_schema_metadata(
+                cols.iter().map(|(col, alias)| ProjectionExpr {
+                    expr: Arc::new(Column::new(col.name(), col.index())) as _,
+                    alias: alias.clone(),
+                }),
+                Arc::clone(child),
+                schema,
+            )
+        };
 
     Ok((
-        build(left_proj, left_child)?,
-        build(right_proj, right_child)?,
+        build(left_proj, left_schema, left_child)?,
+        build(right_proj, right_schema, right_child)?,
     ))
 }
 
@@ -1313,8 +1347,32 @@ fn try_collapse_projection_chain(
     }
 
     // To unify 3 or more sequential projections:
-    let unified: Arc<dyn ExecutionPlan> =
-        Arc::new(ProjectionExec::try_new(current_exprs, current_input)?);
+    let unified_projection = ProjectionExec::try_new(current_exprs, current_input)?;
+    let metadata_fields = unified_projection
+        .schema()
+        .fields()
+        .iter()
+        .zip(outer.expr())
+        .zip(outer.schema().fields())
+        .map(|((unified_field, outer_expr), outer_field)| {
+            if outer_expr.expr.is::<Column>() {
+                unified_field
+                    .as_ref()
+                    .clone()
+                    .with_metadata(outer_field.metadata().clone())
+            } else {
+                unified_field.as_ref().clone()
+            }
+        })
+        .collect::<Vec<_>>();
+    let metadata_schema =
+        Schema::new_with_metadata(metadata_fields, outer.schema().metadata().clone());
+    let unified_projection = ProjectionExec::try_new_with_schema_metadata(
+        unified_projection.expr().to_vec(),
+        Arc::clone(unified_projection.input()),
+        &metadata_schema,
+    )?;
+    let unified: Arc<dyn ExecutionPlan> = Arc::new(unified_projection);
     remove_unnecessary_projections(unified).data().map(Some)
 }
 
@@ -1441,6 +1499,7 @@ mod tests {
     use crate::statistics::{StatisticsArgs, StatisticsContext};
     use crate::test;
     use crate::test::exec::StatisticsExec;
+    use crate::union::UnionExec;
 
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion_common::ScalarValue;
@@ -1488,6 +1547,165 @@ mod tests {
             schema_metadata,
         ));
         assert_eq!(projection.schema(), expected_schema);
+        Ok(())
+    }
+
+    #[test]
+    fn test_projection_pushdown_preserves_output_metadata() -> Result<()> {
+        let input_schema = Arc::new(Schema::new(vec![
+            Field::new("input", DataType::Int32, false).with_metadata(HashMap::from([(
+                "source".to_string(),
+                "input".to_string(),
+            )])),
+            Field::new("unused", DataType::Int32, false),
+        ]));
+        let input: Arc<dyn ExecutionPlan> = UnionExec::try_new(vec![
+            Arc::new(EmptyExec::new(Arc::clone(&input_schema))),
+            Arc::new(EmptyExec::new(input_schema)),
+        ])?;
+        let projected_schema =
+            Schema::new(vec![Field::new("input", DataType::Int32, false)]);
+        let projection = ProjectionExec::try_new_with_schema_metadata(
+            [ProjectionExpr {
+                expr: Arc::new(Column::new("input", 0)),
+                alias: "input".to_string(),
+            }],
+            input,
+            &projected_schema,
+        )?;
+
+        assert!(!is_projection_removable(&projection));
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(projection);
+        let optimized = remove_unnecessary_projections(Arc::clone(&plan))?;
+        assert!(optimized.transformed);
+        assert_eq!(optimized.data.schema(), plan.schema());
+        Ok(())
+    }
+
+    #[test]
+    fn test_projection_chain_does_not_restore_stripped_column_metadata() -> Result<()> {
+        let source_metadata =
+            HashMap::from([("PARQUET:field_id".to_string(), "6".to_string())]);
+        let input_schema = Arc::new(Schema::new(vec![
+            Field::new("sales", DataType::Int64, true).with_metadata(source_metadata),
+        ]));
+        let input: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(input_schema));
+        let inner: Arc<dyn ExecutionPlan> = Arc::new(ProjectionExec::try_new(
+            [ProjectionExpr {
+                expr: Arc::new(Column::new("sales", 0)),
+                alias: "inner_sales".to_string(),
+            }],
+            input,
+        )?);
+        let projected_schema =
+            Schema::new(vec![Field::new("sales", DataType::Int64, true)]);
+        let outer = ProjectionExec::try_new_with_schema_metadata(
+            [ProjectionExpr {
+                expr: Arc::new(Column::new("inner_sales", 0)),
+                alias: "sales".to_string(),
+            }],
+            inner,
+            &projected_schema,
+        )?;
+
+        let Some(collapsed) = try_collapse_projection_chain(&outer)? else {
+            return internal_err!("projection chain should collapse");
+        };
+        assert_eq!(collapsed.schema(), outer.schema());
+        assert!(collapsed.schema().field(0).metadata().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn test_join_projection_pushdown_preserves_output_metadata() -> Result<()> {
+        let source_metadata =
+            HashMap::from([("source".to_string(), "iceberg".to_string())]);
+        let left_schema = Arc::new(Schema::new(vec![
+            Field::new("left_keep", DataType::Int32, false)
+                .with_metadata(source_metadata.clone()),
+            Field::new("left_unused", DataType::Int32, false),
+        ]));
+        let right_schema = Arc::new(Schema::new(vec![
+            Field::new("right_keep", DataType::Int32, false)
+                .with_metadata(source_metadata.clone()),
+            Field::new("right_unused", DataType::Int32, false),
+        ]));
+        let left: Arc<dyn ExecutionPlan> =
+            Arc::new(EmptyExec::new(Arc::clone(&left_schema)));
+        let right: Arc<dyn ExecutionPlan> =
+            Arc::new(EmptyExec::new(Arc::clone(&right_schema)));
+        let join_schema = Arc::new(Schema::new(vec![
+            left_schema.field(0).clone(),
+            left_schema.field(1).clone(),
+            right_schema.field(0).clone(),
+            right_schema.field(1).clone(),
+        ]));
+        let join: Arc<dyn ExecutionPlan> =
+            Arc::new(EmptyExec::new(Arc::clone(&join_schema)));
+        let projected_schema = Schema::new(vec![
+            Field::new("left_keep", DataType::Int32, false),
+            Field::new("right_keep", DataType::Int32, false),
+        ]);
+        let projection = ProjectionExec::try_new_with_schema_metadata(
+            [
+                ProjectionExpr {
+                    expr: Arc::new(Column::new("left_keep", 0)),
+                    alias: "left_keep".to_string(),
+                },
+                ProjectionExpr {
+                    expr: Arc::new(Column::new("right_keep", 2)),
+                    alias: "right_keep".to_string(),
+                },
+            ],
+            join,
+            &projected_schema,
+        )?;
+        let column_indices = [
+            ColumnIndex {
+                index: 0,
+                side: JoinSide::Left,
+            },
+            ColumnIndex {
+                index: 1,
+                side: JoinSide::Left,
+            },
+            ColumnIndex {
+                index: 0,
+                side: JoinSide::Right,
+            },
+            ColumnIndex {
+                index: 1,
+                side: JoinSide::Right,
+            },
+        ];
+
+        let pushed = try_pushdown_through_join_with_column_indices(
+            &projection,
+            &left,
+            &right,
+            &[],
+            &join_schema,
+            None,
+            &column_indices,
+        )?
+        .expect("projection should be pushed through the join");
+
+        assert!(
+            pushed
+                .projected_left_child
+                .schema()
+                .field(0)
+                .metadata()
+                .is_empty()
+        );
+        assert!(
+            pushed
+                .projected_right_child
+                .schema()
+                .field(0)
+                .metadata()
+                .is_empty()
+        );
         Ok(())
     }
 
