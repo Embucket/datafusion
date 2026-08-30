@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod decimal_div;
 mod kernels;
 
 use crate::PhysicalExpr;
@@ -631,6 +632,14 @@ impl PhysicalExpr for BinaryExpr {
             Operator::Minus => return apply(&lhs, &rhs, sub_wrapping),
             Operator::Multiply if self.fail_on_overflow => return apply(&lhs, &rhs, mul),
             Operator::Multiply => return apply(&lhs, &rhs, mul_wrapping),
+            Operator::Divide
+                if decimal_div::is_decimal_division(
+                    &left_data_type,
+                    &right_data_type,
+                ) =>
+            {
+                return apply(&lhs, &rhs, decimal_div::div_half_away_from_zero);
+            }
             Operator::Divide => return apply(&lhs, &rhs, div),
             Operator::Modulo => return apply(&lhs, &rhs, rem),
 

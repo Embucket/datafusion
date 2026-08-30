@@ -156,7 +156,26 @@ impl<T: DecimalType> DecimalAverager<T> {
     #[inline(always)]
     pub fn avg(&self, sum: T::Native, count: T::Native) -> Result<T::Native> {
         if let Ok(value) = sum.mul_checked(self.target_mul.div_wrapping(self.sum_mul)) {
-            let new_value = value.div_wrapping(count);
+            let mut new_value = value.div_wrapping(count);
+
+            // Snowflake rounds decimal AVG half away from zero. Correct the
+            // quotient using the remainder without overflowing `2 * rem`.
+            let remainder = value.mod_wrapping(count);
+            if !remainder.is_zero() {
+                let negative = remainder.is_lt(T::Native::ZERO);
+                let absolute_remainder = if negative {
+                    remainder.neg_wrapping()
+                } else {
+                    remainder
+                };
+                if absolute_remainder.is_ge(count.sub_wrapping(absolute_remainder)) {
+                    new_value = if negative {
+                        new_value.sub_wrapping(T::Native::ONE)
+                    } else {
+                        new_value.add_wrapping(T::Native::ONE)
+                    };
+                }
+            }
 
             let validate = T::validate_decimal_precision(
                 new_value,
@@ -262,5 +281,21 @@ impl<T: ArrowPrimitiveType> GenericDistinctBuffer<T> {
         let num_elements = self.values.len();
         let fixed_size = size_of_val(self) + size_of_val(&self.values);
         estimate_memory_size::<T::Native>(num_elements, fixed_size).unwrap()
+    }
+}
+
+#[cfg(test)]
+mod decimal_average_tests {
+    use super::*;
+    use arrow::datatypes::Decimal128Type;
+
+    #[test]
+    fn rounds_half_away_from_zero() {
+        let averager = DecimalAverager::<Decimal128Type>::try_new(0, 10, 4).unwrap();
+        assert_eq!(averager.avg(5, 3).unwrap(), 16667);
+        assert_eq!(averager.avg(-5, 3).unwrap(), -16667);
+        assert_eq!(averager.avg(1, 32).unwrap(), 313);
+        assert_eq!(averager.avg(-1, 32).unwrap(), -313);
+        assert_eq!(averager.avg(6, 3).unwrap(), 20000);
     }
 }
