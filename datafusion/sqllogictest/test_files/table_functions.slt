@@ -620,12 +620,16 @@ LIMIT 10;
 1
 1
 
-# Test that unsupported function argument types are properly reported
-# rather than being silently dropped (which previously caused a misleading
-# "requires 1 to 3 arguments" error instead)
+# Named table-function arguments are preserved by the SQL planner.
 
-statement error DataFusion error: Error during planning: Unsupported function argument type: start => 1
+query I
 SELECT * FROM generate_series(start => 1, stop => 5)
+----
+1
+2
+3
+4
+5
 
 statement error DataFusion error: Error during planning: Unsupported function argument type: \*
 SELECT * FROM generate_series(*)

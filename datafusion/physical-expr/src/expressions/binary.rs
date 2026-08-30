@@ -4798,7 +4798,7 @@ mod tests {
             Field::new("b", DataType::Decimal128(10, 2), true),
         ]));
         let expect = Arc::new(create_decimal_array(
-            &[Some(1000000), None, Some(1008196), Some(1000000)],
+            &[Some(1000000), None, Some(1008197), Some(1000000)],
             16,
             4,
         )) as ArrayRef;

@@ -33,7 +33,7 @@
 //!   and per-partition write buffers; held until the spill join completes.
 //! - `HashJoinSpillPartition[p.k]`: per partition-pair; covers the loaded
 //!   build batches plus the hash table built from them (moved into the
-//!   pair's [`JoinLeftData`]); dropped when the pair finishes.
+//!   pair's in-memory join state); dropped when the pair finishes.
 //!
 //! The scatter hash uses seeds distinct from both `RepartitionExec`'s
 //! `(0,0,0,0)` routing seeds and the join hash map's `HASH_JOIN_SEED`
