@@ -19,15 +19,11 @@
 
 use arrow::array::types::{IntervalDayTime, IntervalMonthDayNano};
 use arrow::array::*;
-#[cfg(not(feature = "force_hash_collisions"))]
 use arrow::compute::take;
 use arrow::datatypes::*;
-#[cfg(not(feature = "force_hash_collisions"))]
 use arrow::{downcast_dictionary_array, downcast_primitive_array};
 use foldhash::fast::FixedState;
-#[cfg(not(feature = "force_hash_collisions"))]
 use itertools::Itertools;
-#[cfg(not(feature = "force_hash_collisions"))]
 use std::collections::HashMap;
 use std::hash::{BuildHasher, Hash, Hasher};
 
@@ -80,7 +76,6 @@ impl HashState for foldhash::quality::FixedState {
     }
 }
 
-#[cfg(not(feature = "force_hash_collisions"))]
 use crate::cast::{
     as_binary_view_array, as_boolean_array, as_fixed_size_list_array,
     as_generic_binary_array, as_large_list_array, as_large_list_view_array,
@@ -207,7 +202,6 @@ where
     build_hasher::with_hashes_with_hasher(arrays, hash_builder, callback)
 }
 
-#[cfg(not(feature = "force_hash_collisions"))]
 fn hash_null<S: HashState>(
     random_state: &S,
     hashes_buffer: &'_ mut [u64],
@@ -275,7 +269,6 @@ macro_rules! hash_float_value {
 }
 hash_float_value!((half::f16, u16), (f32, u32), (f64, u64));
 
-#[cfg(not(feature = "force_hash_collisions"))]
 trait ChildHashing {
     fn create_hashes<I, T>(&self, arrays: I, hashes_buffer: &mut [u64]) -> Result<()>
     where
@@ -283,26 +276,23 @@ trait ChildHashing {
         T: AsDynArray;
 }
 
-#[cfg(not(feature = "force_hash_collisions"))]
 struct HashStateChildHashing<'a, S> {
     hash_state: &'a S,
 }
 
-#[cfg(not(feature = "force_hash_collisions"))]
 impl<S: HashState> ChildHashing for HashStateChildHashing<'_, S> {
     fn create_hashes<I, T>(&self, arrays: I, hashes_buffer: &mut [u64]) -> Result<()>
     where
         I: IntoIterator<Item = T>,
         T: AsDynArray,
     {
-        create_hashes(arrays, self.hash_state, hashes_buffer).map(|_| ())
+        create_hashes_for_partitioning(arrays, self.hash_state, hashes_buffer).map(|_| ())
     }
 }
 
 /// Builds hash values of PrimitiveArray and writes them into `hashes_buffer`
 /// If `rehash==true` this folds the existing hash into the hasher state
 /// and hashes only the new value (avoiding a separate combine step).
-#[cfg(not(feature = "force_hash_collisions"))]
 fn hash_array_primitive<T>(
     array: &PrimitiveArray<T>,
     random_state: &impl HashState,
@@ -347,7 +337,6 @@ fn hash_array_primitive<T>(
 /// Hashes one array into the `hashes_buffer`
 /// If `rehash==true` this combines the previous hash value in the buffer
 /// with the new hash using `combine_hashes`
-#[cfg(not(feature = "force_hash_collisions"))]
 fn hash_array<T>(
     array: &T,
     random_state: &impl HashState,
@@ -396,7 +385,6 @@ fn hash_array<T>(
 /// HAS_NULLS: do we have to check null in the inner loop
 /// HAS_BUFFERS: if true, array has external buffers; if false, all strings are inlined/ less then 12 bytes
 /// REHASH: if true, combining with existing hash, otherwise initializing
-#[cfg(not(feature = "force_hash_collisions"))]
 #[inline(never)]
 fn hash_string_view_array_inner<
     T: ByteViewType,
@@ -457,7 +445,6 @@ fn hash_string_view_array_inner<
 /// Builds hash values for array views and writes them into `hashes_buffer`
 /// If `rehash==true` this combines the previous hash value in the buffer
 /// with the new hash using `combine_hashes`
-#[cfg(not(feature = "force_hash_collisions"))]
 fn hash_generic_byte_view_array<T: ByteViewType>(
     array: &GenericByteViewArray<T>,
     random_state: &impl HashState,
@@ -523,7 +510,6 @@ fn hash_generic_byte_view_array<T: ByteViewType>(
 /// - `HAS_NULL_KEYS`: Whether to check for null dictionary keys
 /// - `HAS_NULL_VALUES`: Whether to check for null dictionary values
 /// - `MULTI_COL`: Whether to combine with existing hash (true) or initialize (false)
-#[cfg(not(feature = "force_hash_collisions"))]
 #[inline(never)]
 fn hash_dictionary_scatter<
     K: ArrowDictionaryKeyType,
@@ -563,7 +549,6 @@ fn hash_dictionary_scatter<
     }
 }
 
-#[cfg(not(feature = "force_hash_collisions"))]
 fn dispatch_dictionary_scatter<K: ArrowDictionaryKeyType>(
     array: &DictionaryArray<K>,
     dict_hashes: &[u64],
@@ -618,7 +603,6 @@ fn dispatch_dictionary_scatter<K: ArrowDictionaryKeyType>(
 }
 
 /// Hash the values in a dictionary array.
-#[cfg(not(feature = "force_hash_collisions"))]
 fn hash_dictionary<K: ArrowDictionaryKeyType>(
     array: &DictionaryArray<K>,
     random_state: &impl HashState,
@@ -630,7 +614,7 @@ fn hash_dictionary<K: ArrowDictionaryKeyType>(
     // redundant hashing for large dictionary elements (e.g. strings)
     let dict_values = array.values();
     let mut dict_hashes = vec![0; dict_values.len()];
-    create_hashes([dict_values], random_state, &mut dict_hashes)?;
+    create_hashes_for_partitioning([dict_values], random_state, &mut dict_hashes)?;
     dispatch_dictionary_scatter(array, &dict_hashes, hashes_buffer, multi_col);
     Ok(())
 }
@@ -649,7 +633,6 @@ fn hash_dictionary_with_child_hashing<K: ArrowDictionaryKeyType>(
     Ok(())
 }
 
-#[cfg(not(feature = "force_hash_collisions"))]
 fn hash_struct_array(
     array: &StructArray,
     child_hashing: &impl ChildHashing,
@@ -678,8 +661,6 @@ fn hash_struct_array(
     Ok(())
 }
 
-// only adding this `cfg` b/c this function is only used with this `cfg`
-#[cfg(not(feature = "force_hash_collisions"))]
 fn hash_map_array(
     array: &MapArray,
     child_hashing: &impl ChildHashing,
@@ -730,7 +711,6 @@ fn hash_map_array(
     Ok(())
 }
 
-#[cfg(not(feature = "force_hash_collisions"))]
 fn hash_list_array<OffsetSize>(
     array: &GenericListArray<OffsetSize>,
     child_hashing: &impl ChildHashing,
@@ -780,7 +760,6 @@ where
     Ok(())
 }
 
-#[cfg(not(feature = "force_hash_collisions"))]
 fn hash_list_view_array<OffsetSize>(
     array: &GenericListViewArray<OffsetSize>,
     child_hashing: &impl ChildHashing,
@@ -819,7 +798,6 @@ where
     Ok(())
 }
 
-#[cfg(not(feature = "force_hash_collisions"))]
 fn hash_union_array(
     array: &UnionArray,
     child_hashing: &impl ChildHashing,
@@ -850,7 +828,6 @@ fn hash_union_array(
 /// For sparse unions with 3+ types, the optimized take/scatter approach in
 /// `hash_sparse_union_array` is more efficient, but for 1-2 types or dense unions,
 /// this simpler approach is preferred.
-#[cfg(not(feature = "force_hash_collisions"))]
 fn hash_union_array_default(
     array: &UnionArray,
     union_fields: &UnionFields,
@@ -891,7 +868,6 @@ fn hash_union_array_default(
 ///
 /// For 1-2 types, the overhead of take/scatter outweighs the benefit, so we use
 /// the default approach of hashing all children (same as dense unions).
-#[cfg(not(feature = "force_hash_collisions"))]
 fn hash_sparse_union_array(
     array: &UnionArray,
     union_fields: &UnionFields,
@@ -947,7 +923,6 @@ fn hash_sparse_union_array(
     Ok(())
 }
 
-#[cfg(not(feature = "force_hash_collisions"))]
 fn hash_fixed_list_array(
     array: &FixedSizeListArray,
     child_hashing: &impl ChildHashing,
@@ -982,7 +957,6 @@ fn hash_fixed_list_array(
 
 /// Inner hash function for RunArray
 #[inline(never)]
-#[cfg(not(feature = "force_hash_collisions"))]
 fn hash_run_array_inner<
     R: RunEndIndexType,
     C: ChildHashing + ?Sized,
@@ -1051,7 +1025,6 @@ fn hash_run_array_inner<
     Ok(())
 }
 
-#[cfg(not(feature = "force_hash_collisions"))]
 fn hash_run_array<R: RunEndIndexType>(
     array: &RunArray<R>,
     child_hashing: &impl ChildHashing,
@@ -1080,8 +1053,7 @@ fn hash_run_array<R: RunEndIndexType>(
 
 /// Internal helper function that hashes a single array and either initializes or combines
 /// the hash values in the buffer.
-#[cfg(not(feature = "force_hash_collisions"))]
-fn hash_single_array(
+fn hash_single_array_for_partitioning(
     array: &dyn Array,
     random_state: &impl HashState,
     hashes_buffer: &mut [u64],
@@ -1181,6 +1153,16 @@ fn hash_single_array(
     Ok(())
 }
 
+#[cfg(not(feature = "force_hash_collisions"))]
+fn hash_single_array(
+    array: &dyn Array,
+    random_state: &impl HashState,
+    hashes_buffer: &mut [u64],
+    rehash: bool,
+) -> Result<()> {
+    hash_single_array_for_partitioning(array, random_state, hashes_buffer, rehash)
+}
+
 /// Test version of `hash_single_array` that forces all hashes to collide to zero.
 #[cfg(feature = "force_hash_collisions")]
 fn hash_single_array(
@@ -1253,6 +1235,31 @@ where
     Ok(hashes_buffer)
 }
 
+/// Creates hashes for partition routing even when collision-forcing tests are enabled.
+///
+/// The `force_hash_collisions` feature intentionally collapses hashes used by hash
+/// tables. Partition routing must remain independent so a grace hash join can split
+/// the input into bounded partitions before exercising those colliding hash tables.
+pub fn create_hashes_for_partitioning<'a, I, T>(
+    arrays: I,
+    random_state: &impl HashState,
+    hashes_buffer: &'a mut [u64],
+) -> Result<&'a mut [u64]>
+where
+    I: IntoIterator<Item = T>,
+    T: AsDynArray,
+{
+    for (i, array) in arrays.into_iter().enumerate() {
+        hash_single_array_for_partitioning(
+            array.as_dyn_array(),
+            random_state,
+            hashes_buffer,
+            i >= 1,
+        )?;
+    }
+    Ok(hashes_buffer)
+}
+
 /// Creates hash values for every row using a caller-provided hash builder.
 ///
 /// The number of rows to hash is determined by `hashes_buffer.len()`.
@@ -1306,6 +1313,23 @@ mod tests {
                 self.0 = self.0.wrapping_mul(37).wrapping_add(u64::from(*byte));
             }
         }
+    }
+
+    #[cfg(feature = "force_hash_collisions")]
+    #[test]
+    fn partition_hashes_are_not_forced_to_collide() -> Result<()> {
+        let array: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 1]));
+        let random_state = RandomState::with_seed(0);
+
+        let mut collision_hashes = vec![0; array.len()];
+        create_hashes([&array], &random_state, &mut collision_hashes)?;
+        assert_eq!(collision_hashes, vec![0; array.len()]);
+
+        let mut partition_hashes = vec![0; array.len()];
+        create_hashes_for_partitioning([&array], &random_state, &mut partition_hashes)?;
+        assert_eq!(partition_hashes[0], partition_hashes[2]);
+        assert_ne!(partition_hashes[0], partition_hashes[1]);
+        Ok(())
     }
 
     #[test]

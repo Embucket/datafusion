@@ -33,7 +33,7 @@
 //!   and per-partition write buffers; held until the spill join completes.
 //! - `HashJoinSpillPartition[p.k]`: per partition-pair; covers the loaded
 //!   build batches plus the hash table built from them (moved into the
-//!   pair's [`JoinLeftData`]); dropped when the pair finishes.
+//!   pair's in-memory join state); dropped when the pair finishes.
 //!
 //! The scatter hash uses seeds distinct from both `RepartitionExec`'s
 //! `(0,0,0,0)` routing seeds and the join hash map's `HASH_JOIN_SEED`
@@ -45,7 +45,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::task::{Context, Poll};
 
-use crate::hash_utils::create_hashes;
+use crate::hash_utils::create_hashes_for_partitioning;
 use crate::joins::PartitionMode;
 use crate::joins::SharedBitmapBuilder;
 use crate::joins::hash_join::exec::{
@@ -429,7 +429,11 @@ impl SideScatter {
         let keys = evaluate_expressions_to_arrays(&self.on_exprs, batch)?;
         self.hashes_buffer.clear();
         self.hashes_buffer.resize(num_rows, 0);
-        create_hashes(&keys, &self.random_state, &mut self.hashes_buffer)?;
+        create_hashes_for_partitioning(
+            &keys,
+            &self.random_state,
+            &mut self.hashes_buffer,
+        )?;
 
         let partition_count = self.writers.len() as u64;
         let mut indices: Vec<Vec<u32>> = vec![Vec::new(); self.writers.len()];
@@ -1711,6 +1715,7 @@ fn shared_build_loader(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hash_utils::create_hashes;
     use crate::joins::HashJoinExec;
     use crate::joins::PartitionMode;
     use crate::metrics::SpillMetrics;

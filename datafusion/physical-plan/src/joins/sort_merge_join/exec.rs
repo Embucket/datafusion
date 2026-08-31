@@ -662,6 +662,7 @@ impl ExecutionPlan for SortMergeJoinExec {
 
         let (new_left, new_right) = new_join_children(
             &projection_as_columns,
+            projection.schema().as_ref(),
             far_right_left_col_ind,
             far_left_right_col_ind,
             self.children()[0],

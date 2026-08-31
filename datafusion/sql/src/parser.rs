@@ -925,28 +925,57 @@ impl<'a> DFParser<'a> {
     /// Parse a SQL `CREATE` statement handling `CREATE EXTERNAL TABLE`
     pub fn parse_create(&mut self) -> Result<Statement, DataFusionError> {
         // TODO: Change sql parser to take in `or_replace: bool` inside parse_create()
-        if self
-            .parser
-            .parse_keywords(&[Keyword::OR, Keyword::REPLACE, Keyword::EXTERNAL])
+        if self.external_is_followed_by_table(2)
+            && self.parser.parse_keywords(&[
+                Keyword::OR,
+                Keyword::REPLACE,
+                Keyword::EXTERNAL,
+            ])
         {
             self.parse_create_external_table(false, true)
-        } else if self.parser.parse_keywords(&[
-            Keyword::OR,
-            Keyword::REPLACE,
-            Keyword::UNBOUNDED,
-            Keyword::EXTERNAL,
-        ]) {
+        } else if self.external_is_followed_by_table(3)
+            && self.parser.parse_keywords(&[
+                Keyword::OR,
+                Keyword::REPLACE,
+                Keyword::UNBOUNDED,
+                Keyword::EXTERNAL,
+            ])
+        {
             self.parse_create_external_table(true, true)
-        } else if self.parser.parse_keyword(Keyword::EXTERNAL) {
+        } else if self.external_is_followed_by_table(0)
+            && self.parser.parse_keyword(Keyword::EXTERNAL)
+        {
             self.parse_create_external_table(false, false)
-        } else if self
-            .parser
-            .parse_keywords(&[Keyword::UNBOUNDED, Keyword::EXTERNAL])
+        } else if self.external_is_followed_by_table(1)
+            && self
+                .parser
+                .parse_keywords(&[Keyword::UNBOUNDED, Keyword::EXTERNAL])
         {
             self.parse_create_external_table(true, false)
         } else {
-            Ok(Statement::Statement(Box::from(self.parser.parse_create()?)))
+            // Let the configured dialect see the complete CREATE statement. Dialects such as
+            // Snowflake extend CREATE with object types (for example ICEBERG TABLE) that are not
+            // handled by sqlparser's generic `parse_create` entry point.
+            self.parser.prev_token();
+            self.parse_and_handle_statement()
         }
+    }
+
+    fn external_is_followed_by_table(&self, external_offset: usize) -> bool {
+        let next_keyword = match self.parser.peek_nth_token(external_offset + 1).token {
+            Token::Word(word) => word.keyword,
+            _ => return false,
+        };
+        if next_keyword == Keyword::TABLE {
+            return true;
+        }
+        if !matches!(next_keyword, Keyword::TEMP | Keyword::TEMPORARY) {
+            return false;
+        }
+        matches!(
+            self.parser.peek_nth_token(external_offset + 2).token,
+            Token::Word(word) if word.keyword == Keyword::TABLE
+        )
     }
 
     fn parse_partitions(&mut self) -> Result<Vec<String>, DataFusionError> {
@@ -1388,6 +1417,13 @@ mod tests {
         let display = None;
         let expected = Statement::CreateExternalTable(CreateExternalTable {
             columns: vec![make_column_def("c1", DataType::Int(display))],
+            ..make_create_external_table("foo.csv")
+        });
+        expect_parse_ok(sql, expected)?;
+
+        let sql = "CREATE EXTERNAL TEMPORARY TABLE t STORED AS CSV LOCATION 'foo.csv'";
+        let expected = Statement::CreateExternalTable(CreateExternalTable {
+            temporary: true,
             ..make_create_external_table("foo.csv")
         });
         expect_parse_ok(sql, expected)?;
@@ -1854,6 +1890,50 @@ mod tests {
         if let Statement::CopyTo(_) = &statements[0] {
             panic!("Expected non COPY TO statement, but was successful: {statements:?}");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn delegate_create_iceberg_table_to_snowflake_dialect() -> Result<(), DataFusionError>
+    {
+        let sql = "CREATE ICEBERG TABLE t (id INT) BASE_LOCATION = 't'";
+        let dialect = SnowflakeDialect;
+        let statements = DFParser::parse_sql_with_dialect(sql, &dialect)?;
+
+        assert_eq!(statements.len(), 1);
+        let Statement::Statement(statement) = &statements[0] else {
+            panic!("expected a sqlparser statement, got {:?}", statements[0]);
+        };
+        let sqlparser::ast::Statement::CreateTable(table) = statement.as_ref() else {
+            panic!("expected CREATE TABLE, got {statement:?}");
+        };
+        assert!(table.iceberg);
+        assert_eq!(table.base_location.as_deref(), Some("t"));
+        Ok(())
+    }
+
+    #[test]
+    fn delegate_create_stage_to_snowflake_dialect() -> Result<(), DataFusionError> {
+        let sql =
+            "CREATE OR REPLACE STAGE stage URL='s3://data.csv' FILE_FORMAT=(TYPE=csv)";
+        let dialect = SnowflakeDialect;
+        let statements = DFParser::parse_sql_with_dialect(sql, &dialect)?;
+
+        assert_eq!(statements.len(), 1);
+        let Statement::Statement(statement) = &statements[0] else {
+            panic!("expected a sqlparser statement, got {:?}", statements[0]);
+        };
+        assert_eq!(statement.to_string(), sql);
+        Ok(())
+    }
+
+    #[test]
+    fn parse_standalone_begin_with_snowflake_dialect() -> Result<(), DataFusionError> {
+        let dialect = SnowflakeDialect;
+        let statements = DFParser::parse_sql_with_dialect("BEGIN", &dialect)?;
+
+        assert_eq!(statements.len(), 1);
+        assert!(matches!(statements[0], Statement::Statement(_)));
         Ok(())
     }
 
