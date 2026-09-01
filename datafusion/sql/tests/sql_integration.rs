@@ -2224,6 +2224,27 @@ fn scalar_expr_planner_receives_wildcard_options() {
 }
 
 #[test]
+fn scalar_expr_planner_applies_wildcard_ilike() {
+    let state = mock_session_state().with_expr_planner(Arc::new(ScalarWildcardPlanner));
+    let plan = logical_plan_from_state(
+        "SELECT concat(* ILIKE '%name') FROM person AS p",
+        &GenericDialect {},
+        ParserOptions::default(),
+        state,
+    )
+    .unwrap();
+
+    assert_snapshot!(
+        plan,
+        @r"
+    Projection: concat(p.first_name, p.last_name)
+      SubqueryAlias: p
+        TableScan: person
+    "
+    );
+}
+
+#[test]
 fn select_approx_median() {
     let sql = "SELECT approx_median(age) FROM person";
     let plan = logical_plan(sql).unwrap();
