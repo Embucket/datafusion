@@ -449,19 +449,48 @@ pub fn expand_wildcard(
     wildcard_options: Option<&WildcardOptions>,
 ) -> Result<Vec<Expr>> {
     let mut columns_to_skip = exclude_using_columns(plan)?;
+    columns_to_skip.extend(excluded_columns_from_schema(
+        schema,
+        wildcard_options,
+        None,
+    )?);
+    Ok(get_exprs_except_skipped(schema, &columns_to_skip))
+}
+
+/// Resolves an unqualified wildcard using only the input schema.
+///
+/// Unlike [`expand_wildcard`], this helper cannot account for duplicate columns introduced by a
+/// join with a `USING` clause. It is intended for schema-aware expression planners that receive a
+/// wildcard as a function argument.
+pub fn expand_wildcard_from_schema(
+    schema: &DFSchema,
+    wildcard_options: Option<&WildcardOptions>,
+) -> Result<Vec<Expr>> {
+    let columns_to_skip = excluded_columns_from_schema(schema, wildcard_options, None)?;
+    Ok(get_exprs_except_skipped(schema, &columns_to_skip))
+}
+
+fn excluded_columns_from_schema(
+    schema: &DFSchema,
+    wildcard_options: Option<&WildcardOptions>,
+    qualifier: Option<&TableReference>,
+) -> Result<HashSet<Column>> {
     let excluded_columns = if let Some(WildcardOptions {
         exclude: opt_exclude,
         except: opt_except,
         ..
     }) = wildcard_options
     {
-        get_excluded_columns(opt_exclude.as_ref(), opt_except.as_ref(), schema, None)?
+        get_excluded_columns(
+            opt_exclude.as_ref(),
+            opt_except.as_ref(),
+            schema,
+            qualifier,
+        )?
     } else {
         vec![]
     };
-    // Add each excluded `Column` to columns_to_skip
-    columns_to_skip.extend(excluded_columns);
-    Ok(get_exprs_except_skipped(schema, &columns_to_skip))
+    Ok(excluded_columns.into_iter().collect())
 }
 
 /// Resolves an `Expr::Wildcard` to a collection of qualified `Expr::Column`'s.

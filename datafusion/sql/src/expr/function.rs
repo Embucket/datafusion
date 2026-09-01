@@ -30,7 +30,7 @@ use datafusion_expr::{
         self, HigherOrderFunction, Lambda, NullTreatment, ScalarFunction, Unnest,
         WildcardOptions, WindowFunction,
     },
-    planner::{PlannerResult, RawAggregateExpr, RawWindowExpr},
+    planner::{PlannerResult, RawAggregateExpr, RawScalarExpr, RawWindowExpr},
     type_coercion::functions::value_fields_with_higher_order_udf,
 };
 use sqlparser::ast::{
@@ -348,7 +348,19 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             };
 
             // After resolution, all arguments are positional
-            let inner = ScalarFunction::new_udf(fm, resolved_args);
+            let mut scalar_expr = RawScalarExpr {
+                func: fm,
+                args: resolved_args,
+            };
+            for planner in self.context_provider.get_expr_planners().iter() {
+                match planner.plan_scalar_with_schema(scalar_expr, schema)? {
+                    PlannerResult::Planned(expr) => return Ok(expr),
+                    PlannerResult::Original(expr) => scalar_expr = expr,
+                }
+            }
+
+            let RawScalarExpr { func, args } = scalar_expr;
+            let inner = ScalarFunction::new_udf(func, args);
 
             if name.eq_ignore_ascii_case(inner.name()) {
                 return Ok(Expr::ScalarFunction(inner));
@@ -1060,6 +1072,27 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 let expr = Expr::Wildcard {
                     qualifier: None,
                     options: Box::new(WildcardOptions::default()),
+                };
+                Ok((expr, None))
+            }
+            FunctionArg::Unnamed(FunctionArgExpr::WildcardWithOptions(options)) => {
+                if options.opt_alias.is_some() {
+                    return not_impl_err!("wildcard function argument with AS alias");
+                }
+                if options.opt_replace.is_some() {
+                    return not_impl_err!("wildcard function argument with REPLACE");
+                }
+
+                #[expect(deprecated)]
+                let expr = Expr::Wildcard {
+                    qualifier: None,
+                    options: Box::new(WildcardOptions {
+                        ilike: options.opt_ilike,
+                        exclude: options.opt_exclude,
+                        except: options.opt_except,
+                        replace: None,
+                        rename: options.opt_rename,
+                    }),
                 };
                 Ok((expr, None))
             }

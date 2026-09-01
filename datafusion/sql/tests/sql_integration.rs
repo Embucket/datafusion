@@ -44,7 +44,8 @@ use datafusion_sql::{
 };
 
 use crate::common::{
-    CustomExprPlanner, CustomTypePlanner, MockSessionState, QualifiedWildcardCountPlanner,
+    CustomExprPlanner, CustomTypePlanner, MockSessionState,
+    QualifiedWildcardCountPlanner, ScalarWildcardPlanner,
 };
 use datafusion_functions::core::planner::CoreFunctionPlanner;
 use datafusion_functions_aggregate::{
@@ -2176,6 +2177,48 @@ fn aggregate_expr_planner_can_resolve_qualified_wildcard_from_schema() {
       Aggregate: groupBy=[[]], aggr=[[count(p.id, p.first_name, p.last_name, p.age, p.state, p.salary, p.birth_date, p.😀)]]
         SubqueryAlias: p
           TableScan: person
+    "
+    );
+}
+
+#[test]
+fn scalar_expr_planner_can_resolve_wildcard_from_schema() {
+    let state = mock_session_state().with_expr_planner(Arc::new(ScalarWildcardPlanner));
+    let plan = logical_plan_from_state(
+        "SELECT concat(*) FROM person AS p",
+        &GenericDialect {},
+        ParserOptions::default(),
+        state,
+    )
+    .unwrap();
+
+    assert_snapshot!(
+        plan,
+        @r"
+    Projection: concat(p.first_name, p.last_name, p.state)
+      SubqueryAlias: p
+        TableScan: person
+    "
+    );
+}
+
+#[test]
+fn scalar_expr_planner_receives_wildcard_options() {
+    let state = mock_session_state().with_expr_planner(Arc::new(ScalarWildcardPlanner));
+    let plan = logical_plan_from_state(
+        "SELECT concat(* EXCLUDE first_name) FROM person AS p",
+        &GenericDialect {},
+        ParserOptions::default(),
+        state,
+    )
+    .unwrap();
+
+    assert_snapshot!(
+        plan,
+        @r"
+    Projection: concat(p.last_name, p.state)
+      SubqueryAlias: p
+        TableScan: person
     "
     );
 }
