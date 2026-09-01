@@ -195,6 +195,21 @@ fn parse_decimals_9() {
 }
 
 #[test]
+fn parse_decimals_trim_insignificant_trailing_zeros() {
+    let sql = "SELECT 10.00, 10.10, 0.00100, 100.0001, 1.2300e2";
+    let options =
+        parse_decimals_parser_options().with_trim_decimal_literal_trailing_zeros(true);
+    let plan = logical_plan_with_options(sql, options).unwrap();
+    assert_snapshot!(
+        plan,
+        @r"
+    Projection: Decimal128(10,2,0), Decimal128(10.1,3,1), Decimal128(0.001,4,3), Decimal128(100.0001,7,4), Decimal128(123,3,0)
+      EmptyRelation: rows=1
+    "
+    );
+}
+
+#[test]
 fn parse_ident_normalization_1() {
     let sql = "SELECT CHARACTER_LENGTH('str')";
     let parser_option = ident_normalization_parser_options_no_ident_normalization();
@@ -4066,6 +4081,7 @@ impl ScalarUDFImpl for DummyUDF {
 fn parse_decimals_parser_options() -> ParserOptions {
     ParserOptions {
         parse_float_as_decimal: true,
+        trim_decimal_literal_trailing_zeros: false,
         enable_ident_normalization: false,
         support_varchar_with_length: false,
         map_string_types_to_utf8view: true,
@@ -4078,6 +4094,7 @@ fn parse_decimals_parser_options() -> ParserOptions {
 fn ident_normalization_parser_options_no_ident_normalization() -> ParserOptions {
     ParserOptions {
         parse_float_as_decimal: true,
+        trim_decimal_literal_trailing_zeros: false,
         enable_ident_normalization: false,
         support_varchar_with_length: false,
         map_string_types_to_utf8view: true,
@@ -4090,6 +4107,7 @@ fn ident_normalization_parser_options_no_ident_normalization() -> ParserOptions 
 fn ident_normalization_parser_options_ident_normalization() -> ParserOptions {
     ParserOptions {
         parse_float_as_decimal: true,
+        trim_decimal_literal_trailing_zeros: false,
         enable_ident_normalization: true,
         support_varchar_with_length: false,
         map_string_types_to_utf8view: true,

@@ -23,7 +23,7 @@ use arrow::datatypes::{
     DECIMAL128_MAX_PRECISION, DECIMAL256_MAX_PRECISION, FieldRef, i256,
 };
 use bigdecimal::num_bigint::BigInt;
-use bigdecimal::{BigDecimal, Signed, ToPrimitive};
+use bigdecimal::{BigDecimal, Signed, ToPrimitive, Zero};
 use datafusion_common::{
     DFSchema, DataFusionError, Result, ScalarValue, internal_datafusion_err,
     not_impl_err, plan_err,
@@ -108,7 +108,11 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         }
 
         if self.options.parse_float_as_decimal {
-            parse_decimal(unsigned_number, negative)
+            parse_decimal(
+                unsigned_number,
+                negative,
+                self.options.trim_decimal_literal_trailing_zeros,
+            )
         } else {
             signed_number.parse::<f64>().map(lit).map_err(|_| {
                 DataFusionError::from(ParserError(format!(
@@ -375,7 +379,11 @@ fn bigint_to_i256(v: &BigInt) -> Option<i256> {
     }
 }
 
-fn parse_decimal(unsigned_number: &str, negative: bool) -> Result<Expr> {
+fn parse_decimal(
+    unsigned_number: &str,
+    negative: bool,
+    trim_trailing_zeros: bool,
+) -> Result<Expr> {
     let mut dec = BigDecimal::from_str(unsigned_number).map_err(|e| {
         DataFusionError::from(ParserError(format!(
             "Cannot parse {unsigned_number} as BigDecimal: {e}"
@@ -384,9 +392,14 @@ fn parse_decimal(unsigned_number: &str, negative: bool) -> Result<Expr> {
     if negative {
         dec = dec.neg();
     }
-
-    let digits = dec.digits();
-    let (int_val, scale) = dec.into_bigint_and_exponent();
+    let (mut int_val, mut scale) = dec.into_bigint_and_exponent();
+    if trim_trailing_zeros {
+        while scale > 0 && (&int_val % 10_u8).is_zero() {
+            int_val /= 10_u8;
+            scale -= 1;
+        }
+    }
+    let digits = BigDecimal::new(int_val.clone(), scale).digits();
     if scale < i8::MIN as i64 {
         return not_impl_err!(
             "Decimal scale {} exceeds the minimum supported scale: {}",
@@ -394,7 +407,12 @@ fn parse_decimal(unsigned_number: &str, negative: bool) -> Result<Expr> {
             i8::MIN
         );
     }
-    let precision = if scale > 0 {
+    let precision = if trim_trailing_zeros && scale > 0 {
+        // Exact numeric types include the zero before the decimal point in their
+        // precision. This makes `0.00100` normalize to DECIMAL(4, 3), matching
+        // engines such as Snowflake.
+        std::cmp::max(digits, scale.unsigned_abs() + 1)
+    } else if scale > 0 {
         // arrow-rs requires the precision to include the positive scale.
         // See <https://github.com/apache/arrow-rs/blob/123045cc766d42d1eb06ee8bb3f09e39ea995ddc/arrow-array/src/types.rs#L1230>
         std::cmp::max(digits, scale.unsigned_abs())
@@ -509,28 +527,48 @@ mod tests {
             ),
         ];
         for (input, expect) in cases {
-            let output = parse_decimal(input, true).unwrap();
+            let output = parse_decimal(input, true, false).unwrap();
             assert_eq!(
                 output,
                 Expr::Literal(expect.arithmetic_negate().unwrap(), None)
             );
 
-            let output = parse_decimal(input, false).unwrap();
+            let output = parse_decimal(input, false, false).unwrap();
             assert_eq!(output, Expr::Literal(expect, None));
         }
 
         // scale < i8::MIN
         assert_eq!(
-            parse_decimal("1e129", false).unwrap_err().strip_backtrace(),
+            parse_decimal("1e129", false, false)
+                .unwrap_err()
+                .strip_backtrace(),
             "This feature is not implemented: Decimal scale -129 exceeds the minimum supported scale: -128"
         );
 
         // Unsupported precision
         assert_eq!(
-            parse_decimal(&"1".repeat(77), false)
+            parse_decimal(&"1".repeat(77), false, false)
                 .unwrap_err()
                 .strip_backtrace(),
             "This feature is not implemented: Decimal precision 77 exceeds the maximum supported precision: 76"
         );
+    }
+
+    #[test]
+    fn test_parse_decimal_trims_insignificant_trailing_zeros() {
+        let cases = [
+            ("10.00", ScalarValue::Decimal128(Some(10), 2, 0)),
+            ("10.10", ScalarValue::Decimal128(Some(101), 3, 1)),
+            ("0.00100", ScalarValue::Decimal128(Some(1), 4, 3)),
+            ("100.0001", ScalarValue::Decimal128(Some(1_000_001), 7, 4)),
+            ("1.2300e2", ScalarValue::Decimal128(Some(123), 3, 0)),
+        ];
+
+        for (input, expected) in cases {
+            assert_eq!(
+                parse_decimal(input, false, true).unwrap(),
+                Expr::Literal(expected, None)
+            );
+        }
     }
 }

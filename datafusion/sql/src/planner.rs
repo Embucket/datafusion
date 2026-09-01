@@ -45,6 +45,8 @@ use sqlparser::ast::{DataType as SQLDataType, Ident, ObjectName, TableAlias};
 pub struct ParserOptions {
     /// Whether to parse float as decimal.
     pub parse_float_as_decimal: bool,
+    /// Whether to remove insignificant trailing zeros from decimal literals.
+    pub trim_decimal_literal_trailing_zeros: bool,
     /// Whether to normalize identifiers.
     pub enable_ident_normalization: bool,
     /// Whether to support varchar with length.
@@ -73,6 +75,7 @@ impl ParserOptions {
     pub fn new() -> Self {
         Self {
             parse_float_as_decimal: false,
+            trim_decimal_literal_trailing_zeros: false,
             enable_ident_normalization: true,
             support_varchar_with_length: true,
             map_string_types_to_utf8view: true,
@@ -95,6 +98,12 @@ impl ParserOptions {
     /// ```
     pub fn with_parse_float_as_decimal(mut self, value: bool) -> Self {
         self.parse_float_as_decimal = value;
+        self
+    }
+
+    /// Sets the `trim_decimal_literal_trailing_zeros` option.
+    pub fn with_trim_decimal_literal_trailing_zeros(mut self, value: bool) -> Self {
+        self.trim_decimal_literal_trailing_zeros = value;
         self
     }
 
@@ -153,6 +162,8 @@ impl From<&SqlParserOptions> for ParserOptions {
     fn from(options: &SqlParserOptions) -> Self {
         Self {
             parse_float_as_decimal: options.parse_float_as_decimal,
+            trim_decimal_literal_trailing_zeros: options
+                .trim_decimal_literal_trailing_zeros,
             enable_ident_normalization: options.enable_ident_normalization,
             support_varchar_with_length: options.support_varchar_with_length,
             map_string_types_to_utf8view: options.map_string_types_to_utf8view,
