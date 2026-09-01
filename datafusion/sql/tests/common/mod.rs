@@ -25,8 +25,10 @@ use arrow::datatypes::*;
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::datatype::DataTypeExt;
 use datafusion_common::file_options::file_type::FileType;
-use datafusion_common::{DFSchema, GetExt, Result, TableReference, plan_err};
-use datafusion_expr::planner::{ExprPlanner, PlannerResult, TypePlanner};
+use datafusion_common::{Column, DFSchema, GetExt, Result, TableReference, plan_err};
+use datafusion_expr::planner::{
+    ExprPlanner, PlannerResult, RawAggregateExpr, TypePlanner,
+};
 use datafusion_expr::{
     AggregateUDF, Expr, HigherOrderUDF, ScalarUDF, TableSource, WindowUDF,
 };
@@ -413,5 +415,36 @@ impl ExprPlanner for CustomExprPlanner {
         _schema: &DFSchema,
     ) -> Result<PlannerResult<Vec<Expr>>> {
         Ok(PlannerResult::Planned(make_array(exprs)))
+    }
+}
+
+#[derive(Debug)]
+pub struct QualifiedWildcardCountPlanner;
+
+impl ExprPlanner for QualifiedWildcardCountPlanner {
+    fn plan_aggregate_with_schema(
+        &self,
+        mut expr: RawAggregateExpr,
+        schema: &DFSchema,
+    ) -> Result<PlannerResult<RawAggregateExpr>> {
+        #[expect(deprecated)]
+        let Some(Expr::Wildcard {
+            qualifier: Some(qualifier),
+            ..
+        }) = expr.args.first()
+        else {
+            return Ok(PlannerResult::Original(expr));
+        };
+
+        if expr.func.name() != "count" || expr.args.len() != 1 {
+            return Ok(PlannerResult::Original(expr));
+        }
+
+        expr.args = schema
+            .fields_indices_with_qualified(qualifier)
+            .into_iter()
+            .map(|index| Expr::Column(Column::from(schema.qualified_field(index))))
+            .collect();
+        Ok(PlannerResult::Original(expr))
     }
 }

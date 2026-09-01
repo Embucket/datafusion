@@ -273,6 +273,19 @@ pub trait ExprPlanner: Debug + Send + Sync {
         Ok(PlannerResult::Original(expr))
     }
 
+    /// Plans aggregate functions with access to the input schema.
+    ///
+    /// The default implementation delegates to [`Self::plan_aggregate`] so existing planners do
+    /// not need to change. Planners that need to resolve schema-dependent arguments, such as a
+    /// qualified wildcard, can override this method instead.
+    fn plan_aggregate_with_schema(
+        &self,
+        expr: RawAggregateExpr,
+        _schema: &DFSchema,
+    ) -> Result<PlannerResult<RawAggregateExpr>> {
+        self.plan_aggregate(expr)
+    }
+
     /// Plans window functions, such as `COUNT(<expr>)`
     ///
     /// Returns original expression arguments if not possible

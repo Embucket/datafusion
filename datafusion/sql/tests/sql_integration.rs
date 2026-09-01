@@ -43,7 +43,9 @@ use datafusion_sql::{
     planner::{NullOrdering, ParserOptions, PlannerContext, SqlToRel},
 };
 
-use crate::common::{CustomExprPlanner, CustomTypePlanner, MockSessionState};
+use crate::common::{
+    CustomExprPlanner, CustomTypePlanner, MockSessionState, QualifiedWildcardCountPlanner,
+};
 use datafusion_functions::core::planner::CoreFunctionPlanner;
 use datafusion_functions_aggregate::{
     approx_median::approx_median_udaf,
@@ -2151,6 +2153,29 @@ fn select_count_column() {
     Projection: count(person.id)
       Aggregate: groupBy=[[]], aggr=[[count(person.id)]]
         TableScan: person
+    "
+    );
+}
+
+#[test]
+fn aggregate_expr_planner_can_resolve_qualified_wildcard_from_schema() {
+    let state =
+        mock_session_state().with_expr_planner(Arc::new(QualifiedWildcardCountPlanner));
+    let plan = logical_plan_from_state(
+        "SELECT count(p.*) FROM person AS p",
+        &GenericDialect {},
+        ParserOptions::default(),
+        state,
+    )
+    .unwrap();
+
+    assert_snapshot!(
+        plan,
+        @r"
+    Projection: count(p.id,p.first_name,p.last_name,p.age,p.state,p.salary,p.birth_date,p.😀)
+      Aggregate: groupBy=[[]], aggr=[[count(p.id, p.first_name, p.last_name, p.age, p.state, p.salary, p.birth_date, p.😀)]]
+        SubqueryAlias: p
+          TableScan: person
     "
     );
 }

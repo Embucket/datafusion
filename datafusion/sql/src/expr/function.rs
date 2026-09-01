@@ -839,7 +839,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     null_treatment,
                 };
                 for planner in self.context_provider.get_expr_planners().iter() {
-                    match planner.plan_aggregate(aggregate_expr)? {
+                    match planner.plan_aggregate_with_schema(aggregate_expr, schema)? {
                         PlannerResult::Planned(expr) => return Ok(expr),
                         PlannerResult::Original(expr) => aggregate_expr = expr,
                     }
