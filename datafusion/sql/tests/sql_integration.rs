@@ -61,6 +61,7 @@ use insta::{allow_duplicates, assert_snapshot};
 use rstest::rstest;
 use sqlparser::dialect::{
     DatabricksDialect, Dialect, GenericDialect, HiveDialect, MySqlDialect,
+    SnowflakeDialect,
 };
 use sqlparser::parser::Parser;
 
@@ -2229,6 +2230,27 @@ fn scalar_expr_planner_applies_wildcard_ilike() {
     let plan = logical_plan_from_state(
         "SELECT concat(* ILIKE '%name') FROM person AS p",
         &GenericDialect {},
+        ParserOptions::default(),
+        state,
+    )
+    .unwrap();
+
+    assert_snapshot!(
+        plan,
+        @r"
+    Projection: concat(p.first_name, p.last_name)
+      SubqueryAlias: p
+        TableScan: person
+    "
+    );
+}
+
+#[test]
+fn scalar_expr_planner_applies_qualified_wildcard_options() {
+    let state = mock_session_state().with_expr_planner(Arc::new(ScalarWildcardPlanner));
+    let plan = logical_plan_from_state(
+        "SELECT concat((p.* ILIKE '%name')) FROM person AS p",
+        &SnowflakeDialect {},
         ParserOptions::default(),
         state,
     )
