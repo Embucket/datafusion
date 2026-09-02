@@ -108,17 +108,21 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         }
 
         if self.options.parse_float_as_decimal {
-            parse_decimal(
+            let decimal = parse_decimal(
                 unsigned_number,
                 negative,
                 self.options.trim_decimal_literal_trailing_zeros,
-            )
+            );
+            match decimal {
+                Err(DataFusionError::NotImplemented(_))
+                    if unsigned_number.contains(['.', 'e', 'E']) =>
+                {
+                    parse_float(&signed_number)
+                }
+                result => result,
+            }
         } else {
-            signed_number.parse::<f64>().map(lit).map_err(|_| {
-                DataFusionError::from(ParserError(format!(
-                    "Cannot parse {signed_number} as f64"
-                )))
-            })
+            parse_float(&signed_number)
         }
     }
 
@@ -377,6 +381,12 @@ fn bigint_to_i256(v: &BigInt) -> Option<i256> {
         Ordering::Equal => Some(i256::from_le_bytes(v_bytes.try_into().unwrap())),
         Ordering::Greater => None,
     }
+}
+
+fn parse_float(signed_number: &str) -> Result<Expr> {
+    signed_number.parse::<f64>().map(lit).map_err(|_| {
+        DataFusionError::from(ParserError(format!("Cannot parse {signed_number} as f64")))
+    })
 }
 
 fn parse_decimal(
