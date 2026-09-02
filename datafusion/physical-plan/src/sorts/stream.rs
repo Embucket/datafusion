@@ -21,7 +21,7 @@ use crate::{PhysicalExpr, PhysicalSortExpr};
 use arrow::array::{Array, UInt32Array};
 use arrow::compute::take_record_batch;
 use arrow::datatypes::Schema;
-use arrow::record_batch::RecordBatch;
+use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use arrow::row::{RowConverter, Rows, SortField};
 use arrow_ord::sort::lexsort_to_indices;
 use datafusion_common::{Result, internal_datafusion_err};
@@ -365,9 +365,12 @@ impl Iterator for IncrementalSortIterator {
 
                 // Perform the take to produce the next batch
                 let new_batch_indices = indices.slice(self.cursor, batch_size);
-                let new_batch = match take_record_batch(&self.batch, &new_batch_indices) {
+                let new_batch = match take_record_batch_preserving_row_count(
+                    &self.batch,
+                    &new_batch_indices,
+                ) {
                     Ok(batch) => batch,
-                    Err(e) => return Some(Err(e.into())),
+                    Err(e) => return Some(Err(e)),
                 };
 
                 self.cursor += batch_size;
@@ -393,6 +396,22 @@ impl Iterator for IncrementalSortIterator {
     }
 }
 
+fn take_record_batch_preserving_row_count(
+    batch: &RecordBatch,
+    indices: &UInt32Array,
+) -> Result<RecordBatch> {
+    if batch.num_columns() == 0 {
+        let options = RecordBatchOptions::new().with_row_count(Some(indices.len()));
+        Ok(RecordBatch::try_new_with_options(
+            batch.schema(),
+            vec![],
+            &options,
+        )?)
+    } else {
+        Ok(take_record_batch(batch, indices)?)
+    }
+}
+
 impl FusedIterator for IncrementalSortIterator {}
 
 #[cfg(test)]
@@ -406,6 +425,22 @@ mod tests {
     use datafusion_physical_expr::expressions::col;
     use futures::Stream;
     use std::pin::Pin;
+
+    #[test]
+    fn take_zero_column_batch_preserves_selected_row_count() -> Result<()> {
+        let schema = Arc::new(Schema::empty());
+        let options = RecordBatchOptions::new().with_row_count(Some(3));
+        let batch = RecordBatch::try_new_with_options(schema, vec![], &options)?;
+
+        let taken = take_record_batch_preserving_row_count(
+            &batch,
+            &UInt32Array::from(vec![2, 0]),
+        )?;
+
+        assert_eq!(taken.num_columns(), 0);
+        assert_eq!(taken.num_rows(), 2);
+        Ok(())
+    }
 
     /// Verifies that `take_record_batch` in `IncrementalSortIterator` actually
     /// copies the data into a new allocation rather than returning a zero-copy
