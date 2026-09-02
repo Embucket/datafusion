@@ -737,6 +737,15 @@ fn plan_insert_no_target_columns() {
     );
 }
 
+#[test]
+fn plan_insert_select_expression_from_values() {
+    let sql = "INSERT INTO array (\"left\") \
+               SELECT make_array(column1) FROM (VALUES (1), (2))";
+    let plan = logical_plan_with_dialect(sql, &GenericDialect {}).unwrap();
+
+    assert_contains!(plan.display_indent().to_string(), "make_array(column1)");
+}
+
 #[rstest]
 #[case::duplicate_columns(
     "INSERT INTO test_decimal (id, price, price) VALUES (1, 2, 3), (4, 5, 6)",
