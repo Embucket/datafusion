@@ -26,6 +26,33 @@ use datafusion_sql::unparser::plan_to_sql;
 use super::*;
 
 #[tokio::test]
+async fn natural_full_join_wildcard_coalesces_join_key() -> Result<()> {
+    let ctx = SessionContext::new();
+    let dataframe = ctx
+        .sql(
+            "WITH d1(id, name) AS (VALUES (1, 'a'), (2, 'b'), (4, 'c')),
+                  d2(id, value) AS (VALUES (1, 'xx'), (2, 'yy'), (5, 'zz'))
+             SELECT * FROM d1 NATURAL FULL OUTER JOIN d2 ORDER BY id",
+        )
+        .await?;
+
+    assert_batches_eq!(
+        [
+            "+----+------+-------+",
+            "| id | name | value |",
+            "+----+------+-------+",
+            "| 1  | a    | xx    |",
+            "| 2  | b    | yy    |",
+            "| 4  | c    |       |",
+            "| 5  |      | zz    |",
+            "+----+------+-------+",
+        ],
+        &dataframe.collect().await?
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn join_change_in_planner() -> Result<()> {
     let config = SessionConfig::new().with_target_partitions(8);
     let ctx = SessionContext::new_with_config(config);

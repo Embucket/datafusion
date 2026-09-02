@@ -24,7 +24,8 @@ use std::sync::Arc;
 use crate::expr::{Alias, Sort, WildcardOptions, WindowFunctionParams};
 use crate::expr_rewriter::strip_outer_reference;
 use crate::{
-    BinaryExpr, Expr, ExprSchemable, Filter, GroupingSet, LogicalPlan, Operator, and,
+    BinaryExpr, Expr, ExprSchemable, Filter, GroupingSet, JoinConstraint, JoinType,
+    LogicalPlan, Operator, and, when,
 };
 use datafusion_expr_common::signature::{Signature, TypeSignature};
 
@@ -442,6 +443,63 @@ fn exclude_using_columns(plan: &LogicalPlan) -> Result<HashSet<Column>> {
     Ok(excluded)
 }
 
+/// Adjusts an unqualified wildcard over a top-level `USING` join so the
+/// retained join key has the value required by SQL outer-join semantics.
+fn using_join_wildcard_replacements(
+    plan: &LogicalPlan,
+    columns_to_skip: &mut HashSet<Column>,
+) -> Result<HashMap<Column, Expr>> {
+    let LogicalPlan::Join(join) = plan else {
+        return Ok(HashMap::new());
+    };
+    if join.join_constraint != JoinConstraint::Using {
+        return Ok(HashMap::new());
+    }
+    if !matches!(
+        join.join_type,
+        JoinType::Inner | JoinType::Left | JoinType::Right | JoinType::Full
+    ) {
+        return Ok(HashMap::new());
+    }
+
+    let mut replacements = HashMap::new();
+    for (left_expr, right_expr) in &join.on {
+        let Some(left) = left_expr.get_as_join_column() else {
+            return internal_err!(
+                "Invalid USING join key. Expected column, found {left_expr:?}"
+            );
+        };
+        let Some(right) = right_expr.get_as_join_column() else {
+            return internal_err!(
+                "Invalid USING join key. Expected column, found {right_expr:?}"
+            );
+        };
+
+        // Keep the left key in its original schema position and remove the
+        // duplicate right key. RIGHT and FULL joins replace its value below.
+        columns_to_skip.remove(left);
+        columns_to_skip.insert(right.clone());
+
+        let left_column = Expr::Column(left.clone());
+        let right_column = Expr::Column(right.clone());
+        let replacement = match join.join_type {
+            JoinType::Right => Some(right_column),
+            JoinType::Full => Some(
+                when(left_column.clone().is_not_null(), left_column)
+                    .otherwise(right_column)?,
+            ),
+            _ => None,
+        };
+        if let Some(replacement) = replacement {
+            replacements.insert(
+                left.clone(),
+                replacement.alias_qualified(left.relation.clone(), left.name.clone()),
+            );
+        }
+    }
+    Ok(replacements)
+}
+
 /// Resolves an `Expr::Wildcard` to a collection of `Expr::Column`'s.
 pub fn expand_wildcard(
     schema: &DFSchema,
@@ -449,12 +507,22 @@ pub fn expand_wildcard(
     wildcard_options: Option<&WildcardOptions>,
 ) -> Result<Vec<Expr>> {
     let mut columns_to_skip = exclude_using_columns(plan)?;
+    let replacements = using_join_wildcard_replacements(plan, &mut columns_to_skip)?;
     columns_to_skip.extend(excluded_columns_from_schema(
         schema,
         wildcard_options,
         None,
     )?);
-    Ok(get_exprs_except_skipped(schema, &columns_to_skip))
+    Ok(get_exprs_except_skipped(schema, &columns_to_skip)
+        .into_iter()
+        .map(|expr| match expr {
+            Expr::Column(column) => replacements
+                .get(&column)
+                .cloned()
+                .unwrap_or(Expr::Column(column)),
+            expr => expr,
+        })
+        .collect())
 }
 
 /// Resolves an unqualified wildcard using only the input schema.
