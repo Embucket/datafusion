@@ -5622,6 +5622,30 @@ fn test_using_join_wildcard_schema() {
         ]
     );
 
+    // RIGHT and FULL joins must retain values from the non-null side of the
+    // merged USING column while preserving the wildcard schema.
+    let sql = "WITH t1 AS (SELECT 1 AS id, 'a' AS value1),
+        t2 AS (SELECT 2 AS id, 'x' AS value2)
+        SELECT * FROM t1 RIGHT JOIN t2 USING (id)";
+    let plan = logical_plan(sql).unwrap();
+    assert!(
+        plan.display_indent()
+            .to_string()
+            .contains("Projection: t2.id AS id, t1.value1, t2.value2"),
+        "{plan}"
+    );
+
+    let sql = "WITH t1 AS (SELECT 1 AS id, 'a' AS value1),
+        t2 AS (SELECT 2 AS id, 'x' AS value2)
+        SELECT * FROM t1 FULL OUTER JOIN t2 USING (id)";
+    let plan = logical_plan(sql).unwrap();
+    assert!(
+        plan.display_indent().to_string().contains(
+            "Projection: CASE WHEN t1.id IS NOT NULL THEN t1.id ELSE t2.id END AS id, t1.value1, t2.value2"
+        ),
+        "{plan}"
+    );
+
     // Multiple joins
     let sql = "WITH t1 AS (SELECT 1 AS a, 1 AS b),
         t2 AS (SELECT 1 AS a, 2 AS c),
