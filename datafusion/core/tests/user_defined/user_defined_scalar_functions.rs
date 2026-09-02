@@ -609,6 +609,24 @@ async fn volatile_scalar_udf_with_params() -> Result<()> {
         ];
         assert_batches_eq!(expected, &result);
 
+        let result = plan_and_collect(
+            &ctx,
+            "SELECT * FROM (SELECT add_index_to_string('test') AS str FROM t) \
+             ORDER BY add_index_to_string('test') LIMIT 2 OFFSET 5",
+        )
+        .await?;
+        assert_batches_eq!(
+            [
+                "+---------+",
+                "| str     |",
+                "+---------+",
+                "| 6) test |",
+                "| 7) test |",
+                "+---------+",
+            ],
+            &result
+        );
+
         let result =
             plan_and_collect(&ctx, "select add_index_to_string('test_value') as str") // with fixed function parameters
                 .await?;
