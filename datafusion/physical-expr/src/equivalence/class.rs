@@ -29,7 +29,9 @@ use crate::{PhysicalExpr, PhysicalExprRef, PhysicalSortExpr, PhysicalSortRequire
 
 use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion_common::{JoinType, Result, ScalarValue};
-use datafusion_physical_expr_common::physical_expr::format_physical_expr_list;
+use datafusion_physical_expr_common::physical_expr::{
+    format_physical_expr_list, is_volatile,
+};
 
 use indexmap::{IndexMap, IndexSet};
 
@@ -747,6 +749,9 @@ impl EquivalenceGroup {
         &self,
         expr: &Arc<dyn PhysicalExpr>,
     ) -> Option<AcrossPartitions> {
+        if is_volatile(expr) {
+            return None;
+        }
         if let Some(lit) = expr.downcast_ref::<Literal>() {
             return Some(AcrossPartitions::Uniform(Some(lit.value().clone())));
         }
@@ -924,9 +929,36 @@ mod tests {
     use super::*;
     use crate::equivalence::tests::create_test_params;
     use crate::expressions::{BinaryExpr, Column, binary, col, lit};
+    use crate::scalar_function::ScalarFunctionExpr;
+    use crate::utils::tests::TestScalarUDF;
     use arrow::datatypes::{DataType, Field, Schema};
 
-    use datafusion_expr::Operator;
+    use datafusion_common::config::ConfigOptions;
+    use datafusion_expr::{Operator, ScalarUDF, Signature, Volatility};
+
+    #[test]
+    fn volatile_expression_with_constant_arguments_is_not_constant() -> Result<()> {
+        let function = Arc::new(ScalarUDF::new_from_impl(TestScalarUDF {
+            signature: Signature::uniform(
+                1,
+                vec![DataType::Float64],
+                Volatility::Volatile,
+            ),
+        }));
+        let expression = Arc::new(ScalarFunctionExpr::try_new(
+            function,
+            vec![lit(1.0_f64)],
+            &Schema::empty(),
+            Arc::new(ConfigOptions::new()),
+        )?) as Arc<dyn PhysicalExpr>;
+
+        assert!(
+            EquivalenceGroup::default()
+                .is_expr_constant(&expression)
+                .is_none()
+        );
+        Ok(())
+    }
 
     #[test]
     fn test_bridge_groups() -> Result<()> {
