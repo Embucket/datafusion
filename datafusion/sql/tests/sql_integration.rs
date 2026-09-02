@@ -26,7 +26,9 @@ use std::vec;
 
 use arrow::datatypes::{TimeUnit::Nanosecond, *};
 use common::MockContextProvider;
-use datafusion_common::{DFSchema, DataFusionError, Result, assert_contains};
+use datafusion_common::{
+    DFSchema, DataFusionError, Result, ScalarValue, assert_contains,
+};
 use datafusion_expr::{
     ColumnarValue, CreateIndex, DdlStatement, Expr, HigherOrderFunctionArgs,
     HigherOrderReturnFieldArgs, HigherOrderSignature, HigherOrderUDF, HigherOrderUDFImpl,
@@ -191,6 +193,36 @@ fn parse_decimals_9() {
     Projection: Decimal128(18446744073709551616,20,0)
       EmptyRelation: rows=1
     "
+    );
+}
+
+#[test]
+fn parse_decimal_out_of_range_float_falls_back_to_float64() {
+    let sql = "SELECT 1.7976931348623157e+308, 2.2250738585072014e-308";
+    let options = parse_decimals_parser_options();
+    let plan = logical_plan_with_options(sql, options).unwrap();
+    let LogicalPlan::Projection(projection) = plan else {
+        panic!("expected a projection")
+    };
+    let values = projection
+        .expr
+        .iter()
+        .map(|expr| match expr {
+            Expr::Literal(ScalarValue::Float64(Some(value)), _) => value.to_bits(),
+            _ => panic!("expected Float64 literals, got {expr}"),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(values, [f64::MAX.to_bits(), f64::MIN_POSITIVE.to_bits()]);
+}
+
+#[test]
+fn parse_decimal_out_of_range_integer_remains_an_error() {
+    let sql = format!("SELECT {}", "1".repeat(77));
+    let options = parse_decimals_parser_options();
+    let error = logical_plan_with_options(&sql, options).unwrap_err();
+    assert_contains!(
+        error.to_string(),
+        "Decimal precision 77 exceeds the maximum supported precision: 76"
     );
 }
 
