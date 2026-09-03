@@ -43,6 +43,11 @@ struct SqlToRelRelationContext<'a, 'b, S: ContextProvider> {
     planner_context: &'a mut PlannerContext,
 }
 
+struct ResolvedPivotValue {
+    value: ScalarValue,
+    name: String,
+}
+
 // Implement RelationPlannerContext
 impl<'a, 'b, S: ContextProvider> RelationPlannerContext
     for SqlToRelRelationContext<'a, 'b, S>
@@ -373,12 +378,18 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 let pivot_values = values
                     .into_iter()
                     .map(|value| {
+                        let name = value.alias.map_or_else(
+                            || value.expr.to_string(),
+                            |alias| self.ident_normalizer.normalize(alias),
+                        );
                         match self.sql_expr_to_logical_expr(
                             value.expr,
                             input_plan.schema(),
                             planner_context,
                         )? {
-                            Expr::Literal(value, _) => Ok(value),
+                            Expr::Literal(value, _) => {
+                                Ok(ResolvedPivotValue { value, name })
+                            }
                             _ => plan_err!("PIVOT values must be literals"),
                         }
                     })
@@ -549,7 +560,7 @@ fn transform_pivot_to_aggregate(
     input: LogicalPlan,
     aggregate_expr: &Expr,
     pivot_column: &Column,
-    pivot_values: &[ScalarValue],
+    pivot_values: &[ResolvedPivotValue],
     default_on_null_expr: Option<&Expr>,
 ) -> Result<LogicalPlan> {
     let input_schema = input.schema();
@@ -573,12 +584,12 @@ fn transform_pivot_to_aggregate(
     let pivot_type = input_schema.field(pivot_index).data_type().clone();
     let aggregates = pivot_values
         .iter()
-        .map(|value| {
+        .map(|pivot_value| {
             let filter = Expr::BinaryExpr(BinaryExpr::new(
                 Box::new(Expr::Column(pivot_column.clone())),
                 Operator::IsNotDistinctFrom,
                 Box::new(Expr::Cast(Cast::new(
-                    Box::new(Expr::Literal(value.clone(), None)),
+                    Box::new(Expr::Literal(pivot_value.value.clone(), None)),
                     pivot_type.clone(),
                 ))),
             ));
@@ -587,14 +598,13 @@ fn transform_pivot_to_aggregate(
             };
             let mut params = aggregate.params.clone();
             params.filter = Some(Box::new(filter));
-            let name = value.to_string().trim_matches('\'').to_string();
             Ok(Expr::Alias(Alias {
                 expr: Box::new(Expr::AggregateFunction(AggregateFunction {
                     func: Arc::clone(&aggregate.func),
                     params,
                 })),
                 relation: None,
-                name,
+                name: pivot_value.name.clone(),
                 metadata: None,
             }))
         })
@@ -608,7 +618,7 @@ fn transform_pivot_to_aggregate(
     };
     let pivot_names = pivot_values
         .iter()
-        .map(|value| value.to_string().trim_matches('\'').to_string())
+        .map(|value| value.name.clone())
         .collect::<Vec<_>>();
     let projection = aggregate_plan
         .schema()

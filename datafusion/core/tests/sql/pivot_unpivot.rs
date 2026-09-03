@@ -33,12 +33,12 @@ async fn pivot_list_is_lowered_to_filtered_aggregates() -> Result<()> {
         .await?;
 
     insta::assert_snapshot!(batches_to_string(&batches), @r"
-    +----+----+----+
-    | id | a  | b  |
-    +----+----+----+
-    | 1  | 10 | 20 |
-    | 2  | 7  |    |
-    +----+----+----+
+    +----+-----+-----+
+    | id | 'a' | 'b' |
+    +----+-----+-----+
+    | 1  | 10  | 20  |
+    | 2  | 7   |     |
+    +----+-----+-----+
     ");
     Ok(())
 }

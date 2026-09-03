@@ -71,6 +71,25 @@ mod cases;
 mod common;
 
 #[test]
+fn pivot_uses_literal_text_or_explicit_alias_for_column_names() {
+    let plan = logical_plan_with_dialect(
+        "SELECT * FROM quarterly_sales \
+         PIVOT(SUM(amount) FOR quarter IN (\
+           '2023_Q1', '2023_Q2' AS q2, '2023_Q3' AS \"Mixed Case\"))",
+        &SnowflakeDialect {},
+    )
+    .unwrap();
+
+    let field_names = plan
+        .schema()
+        .fields()
+        .iter()
+        .map(|field| field.name().as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(field_names, vec!["empid", "'2023_Q1'", "q2", "Mixed Case"]);
+}
+
+#[test]
 fn parse_decimals_1() {
     let sql = "SELECT 1";
     let options = parse_decimals_parser_options();
