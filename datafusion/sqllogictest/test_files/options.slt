@@ -251,12 +251,17 @@ select -1e-38, arrow_typeof(-1e-38),
 ----
 -0.00000000000000000000000000000000000001 Decimal128(38, 38) -0.000000000000000000000000000000000000001 Decimal256(39, 39)
 
-# unsupported precision
-query error Decimal precision 77 exceeds the maximum supported precision: 76
-select -1e-77;
+# Decimal literals outside the Decimal256 precision/scale range fall back to Float64
+query RT
+select -1e-77, arrow_typeof(-1e-77);
+----
+0 Float64
 
-query error Decimal precision 79 exceeds the maximum supported precision: 76
-select 1.000000000000000000000000000000000000000000000000000000000000000000000000000001;
+query RT
+select 1.000000000000000000000000000000000000000000000000000000000000000000000000000001,
+    arrow_typeof(1.000000000000000000000000000000000000000000000000000000000000000000000000000001);
+----
+1 Float64
 
 # negative scales
 query TR
@@ -269,8 +274,10 @@ select arrow_typeof(1e128)
 ----
 Decimal128(1, -128)
 
-query error Decimal scale \-129 exceeds the minimum supported scale: \-128
-select 1e129
+query RT
+select 1e129, arrow_typeof(1e129)
+----
+1000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000 Float64
 
 # simple arithmetic
 query RTRT

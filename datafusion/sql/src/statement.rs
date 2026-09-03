@@ -2828,6 +2828,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         let table_name = self.object_name_to_table_reference(table_name)?;
         let table_source = self.context_provider.get_table_source(table_name.clone())?;
         let table_schema = DFSchema::try_from(table_source.schema())?;
+        let source_is_values = matches!(source.body.as_ref(), SetExpr::Values(_));
 
         let columns: Vec<Ident> = columns
             .into_iter()
@@ -2927,9 +2928,11 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         // Projection
         let mut planner_context =
             PlannerContext::new().with_prepare_param_data_types(prepare_param_data_types);
-        planner_context.set_table_schema(Some(DFSchemaRef::new(
-            DFSchema::from_unqualified_fields(fields.clone(), Default::default())?,
-        )));
+        if source_is_values {
+            planner_context.set_table_schema(Some(DFSchemaRef::new(
+                DFSchema::from_unqualified_fields(fields.clone(), Default::default())?,
+            )));
+        }
         let source = self.query_to_plan(*source, &mut planner_context)?;
         if fields.len() != source.schema().fields().len() {
             plan_err!("Column count doesn't match insert query!")?;

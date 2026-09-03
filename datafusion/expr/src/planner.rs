@@ -154,6 +154,17 @@ pub trait ContextProvider {
 ///
 /// [Extending SQL in DataFusion: from ->> to TABLESAMPLE blog]: https://datafusion.apache.org/blog/2026/01/12/extending-sql
 pub trait ExprPlanner: Debug + Send + Sync {
+    /// Plans scalar functions, such as `CONCAT(<expr>, ...)`, with access to the input schema.
+    ///
+    /// Returns the original scalar function if planning is not possible.
+    fn plan_scalar_with_schema(
+        &self,
+        expr: RawScalarExpr,
+        _schema: &DFSchema,
+    ) -> Result<PlannerResult<RawScalarExpr>> {
+        Ok(PlannerResult::Original(expr))
+    }
+
     /// Plan the binary operation between two expressions, returns original
     /// BinaryExpr if not possible
     fn plan_binary_op(
@@ -273,6 +284,19 @@ pub trait ExprPlanner: Debug + Send + Sync {
         Ok(PlannerResult::Original(expr))
     }
 
+    /// Plans aggregate functions with access to the input schema.
+    ///
+    /// The default implementation delegates to [`Self::plan_aggregate`] so existing planners do
+    /// not need to change. Planners that need to resolve schema-dependent arguments, such as a
+    /// qualified wildcard, can override this method instead.
+    fn plan_aggregate_with_schema(
+        &self,
+        expr: RawAggregateExpr,
+        _schema: &DFSchema,
+    ) -> Result<PlannerResult<RawAggregateExpr>> {
+        self.plan_aggregate(expr)
+    }
+
     /// Plans window functions, such as `COUNT(<expr>)`
     ///
     /// Returns original expression arguments if not possible
@@ -328,6 +352,13 @@ pub struct RawAggregateExpr {
     pub filter: Option<Box<Expr>>,
     pub order_by: Vec<SortExpr>,
     pub null_treatment: Option<NullTreatment>,
+}
+
+/// This structure is used by scalar function expression planners.
+#[derive(Debug, Clone)]
+pub struct RawScalarExpr {
+    pub func: Arc<ScalarUDF>,
+    pub args: Vec<Expr>,
 }
 
 /// This structure is used by `WindowFunctionPlanner` to plan operators with

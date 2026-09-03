@@ -30,14 +30,34 @@ use datafusion_expr::{
         self, HigherOrderFunction, Lambda, NullTreatment, ScalarFunction, Unnest,
         WildcardOptions, WindowFunction,
     },
-    planner::{PlannerResult, RawAggregateExpr, RawWindowExpr},
+    planner::{PlannerResult, RawAggregateExpr, RawScalarExpr, RawWindowExpr},
     type_coercion::functions::value_fields_with_higher_order_udf,
 };
 use sqlparser::ast::{
     DuplicateTreatment, Expr as SQLExpr, Function as SQLFunction, FunctionArg,
     FunctionArgExpr, FunctionArgumentClause, FunctionArgumentList, FunctionArguments,
-    LambdaFunction, ObjectName, OrderByExpr, Spanned, WindowType,
+    LambdaFunction, ObjectName, OrderByExpr, Spanned, WildcardAdditionalOptions,
+    WindowType,
 };
+
+fn function_wildcard_options(
+    options: WildcardAdditionalOptions,
+) -> Result<Box<WildcardOptions>> {
+    if options.opt_alias.is_some() {
+        return not_impl_err!("wildcard function argument with AS alias");
+    }
+    if options.opt_replace.is_some() {
+        return not_impl_err!("wildcard function argument with REPLACE");
+    }
+
+    Ok(Box::new(WildcardOptions {
+        ilike: options.opt_ilike,
+        exclude: options.opt_exclude,
+        except: options.opt_except,
+        replace: None,
+        rename: options.opt_rename,
+    }))
+}
 
 /// Suggest a valid function based on an invalid input function name
 ///
@@ -348,7 +368,19 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             };
 
             // After resolution, all arguments are positional
-            let inner = ScalarFunction::new_udf(fm, resolved_args);
+            let mut scalar_expr = RawScalarExpr {
+                func: fm,
+                args: resolved_args,
+            };
+            for planner in self.context_provider.get_expr_planners().iter() {
+                match planner.plan_scalar_with_schema(scalar_expr, schema)? {
+                    PlannerResult::Planned(expr) => return Ok(expr),
+                    PlannerResult::Original(expr) => scalar_expr = expr,
+                }
+            }
+
+            let RawScalarExpr { func, args } = scalar_expr;
+            let inner = ScalarFunction::new_udf(func, args);
 
             if name.eq_ignore_ascii_case(inner.name()) {
                 return Ok(Expr::ScalarFunction(inner));
@@ -839,7 +871,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     null_treatment,
                 };
                 for planner in self.context_provider.get_expr_planners().iter() {
-                    match planner.plan_aggregate(aggregate_expr)? {
+                    match planner.plan_aggregate_with_schema(aggregate_expr, schema)? {
                         PlannerResult::Planned(expr) => return Ok(expr),
                         PlannerResult::Original(expr) => aggregate_expr = expr,
                     }
@@ -1063,6 +1095,14 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 };
                 Ok((expr, None))
             }
+            FunctionArg::Unnamed(FunctionArgExpr::WildcardWithOptions(options)) => {
+                #[expect(deprecated)]
+                let expr = Expr::Wildcard {
+                    qualifier: None,
+                    options: function_wildcard_options(options)?,
+                };
+                Ok((expr, None))
+            }
             FunctionArg::Unnamed(FunctionArgExpr::QualifiedWildcard(object_name)) => {
                 let qualifier = self.object_name_to_table_reference(object_name)?;
                 // Sanity check on qualifier with schema
@@ -1075,6 +1115,22 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 let expr = Expr::Wildcard {
                     qualifier: qualifier.into(),
                     options: Box::new(WildcardOptions::default()),
+                };
+                Ok((expr, None))
+            }
+            FunctionArg::Unnamed(FunctionArgExpr::QualifiedWildcardWithOptions(
+                object_name,
+                options,
+            )) => {
+                let qualifier = self.object_name_to_table_reference(object_name)?;
+                if schema.fields_indices_with_qualified(&qualifier).is_empty() {
+                    return plan_err!("Invalid qualifier {qualifier}");
+                }
+
+                #[expect(deprecated)]
+                let expr = Expr::Wildcard {
+                    qualifier: qualifier.into(),
+                    options: function_wildcard_options(options)?,
                 };
                 Ok((expr, None))
             }

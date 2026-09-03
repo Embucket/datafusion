@@ -26,7 +26,9 @@ use std::vec;
 
 use arrow::datatypes::{TimeUnit::Nanosecond, *};
 use common::MockContextProvider;
-use datafusion_common::{DFSchema, DataFusionError, Result, assert_contains};
+use datafusion_common::{
+    DFSchema, DataFusionError, Result, ScalarValue, assert_contains,
+};
 use datafusion_expr::{
     ColumnarValue, CreateIndex, DdlStatement, Expr, HigherOrderFunctionArgs,
     HigherOrderReturnFieldArgs, HigherOrderSignature, HigherOrderUDF, HigherOrderUDFImpl,
@@ -43,7 +45,10 @@ use datafusion_sql::{
     planner::{NullOrdering, ParserOptions, PlannerContext, SqlToRel},
 };
 
-use crate::common::{CustomExprPlanner, CustomTypePlanner, MockSessionState};
+use crate::common::{
+    CustomExprPlanner, CustomTypePlanner, MockSessionState,
+    QualifiedWildcardCountPlanner, ScalarWildcardPlanner,
+};
 use datafusion_functions::core::planner::CoreFunctionPlanner;
 use datafusion_functions_aggregate::{
     approx_median::approx_median_udaf,
@@ -58,11 +63,31 @@ use insta::{allow_duplicates, assert_snapshot};
 use rstest::rstest;
 use sqlparser::dialect::{
     DatabricksDialect, Dialect, GenericDialect, HiveDialect, MySqlDialect,
+    SnowflakeDialect,
 };
 use sqlparser::parser::Parser;
 
 mod cases;
 mod common;
+
+#[test]
+fn pivot_uses_literal_text_or_explicit_alias_for_column_names() {
+    let plan = logical_plan_with_dialect(
+        "SELECT * FROM quarterly_sales \
+         PIVOT(SUM(amount) FOR quarter IN (\
+           '2023_Q1', '2023_Q2' AS q2, '2023_Q3' AS \"Mixed Case\"))",
+        &SnowflakeDialect {},
+    )
+    .unwrap();
+
+    let field_names = plan
+        .schema()
+        .fields()
+        .iter()
+        .map(|field| field.name().as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(field_names, vec!["empid", "'2023_Q1'", "q2", "Mixed Case"]);
+}
 
 #[test]
 fn parse_decimals_1() {
@@ -185,6 +210,51 @@ fn parse_decimals_9() {
         plan,
         @r"
     Projection: Decimal128(18446744073709551616,20,0)
+      EmptyRelation: rows=1
+    "
+    );
+}
+
+#[test]
+fn parse_decimal_out_of_range_float_falls_back_to_float64() {
+    let sql = "SELECT 1.7976931348623157e+308, 2.2250738585072014e-308";
+    let options = parse_decimals_parser_options();
+    let plan = logical_plan_with_options(sql, options).unwrap();
+    let LogicalPlan::Projection(projection) = plan else {
+        panic!("expected a projection")
+    };
+    let values = projection
+        .expr
+        .iter()
+        .map(|expr| match expr {
+            Expr::Literal(ScalarValue::Float64(Some(value)), _) => value.to_bits(),
+            _ => panic!("expected Float64 literals, got {expr}"),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(values, [f64::MAX.to_bits(), f64::MIN_POSITIVE.to_bits()]);
+}
+
+#[test]
+fn parse_decimal_out_of_range_integer_remains_an_error() {
+    let sql = format!("SELECT {}", "1".repeat(77));
+    let options = parse_decimals_parser_options();
+    let error = logical_plan_with_options(&sql, options).unwrap_err();
+    assert_contains!(
+        error.to_string(),
+        "Decimal precision 77 exceeds the maximum supported precision: 76"
+    );
+}
+
+#[test]
+fn parse_decimals_trim_insignificant_trailing_zeros() {
+    let sql = "SELECT 10.00, 10.10, 0.00100, 100.0001, 1.2300e2";
+    let options =
+        parse_decimals_parser_options().with_trim_decimal_literal_trailing_zeros(true);
+    let plan = logical_plan_with_options(sql, options).unwrap();
+    assert_snapshot!(
+        plan,
+        @r"
+    Projection: Decimal128(10,2,0), Decimal128(10.1,3,1), Decimal128(0.001,4,3), Decimal128(100.0001,7,4), Decimal128(123,3,0)
       EmptyRelation: rows=1
     "
     );
@@ -716,6 +786,15 @@ fn plan_insert_no_target_columns() {
         Values: (CAST(Int64(1) AS Int32), CAST(Int64(2) AS Decimal128(10, 2))), (CAST(Int64(3) AS Int32), CAST(Int64(4) AS Decimal128(10, 2)))
     "
     );
+}
+
+#[test]
+fn plan_insert_select_expression_from_values() {
+    let sql = "INSERT INTO array (\"left\") \
+               SELECT make_array(column1) FROM (VALUES (1), (2))";
+    let plan = logical_plan_with_dialect(sql, &GenericDialect {}).unwrap();
+
+    assert_contains!(plan.display_indent().to_string(), "make_array(column1)");
 }
 
 #[rstest]
@@ -2150,6 +2229,113 @@ fn select_count_column() {
         @r"
     Projection: count(person.id)
       Aggregate: groupBy=[[]], aggr=[[count(person.id)]]
+        TableScan: person
+    "
+    );
+}
+
+#[test]
+fn aggregate_expr_planner_can_resolve_qualified_wildcard_from_schema() {
+    let state =
+        mock_session_state().with_expr_planner(Arc::new(QualifiedWildcardCountPlanner));
+    let plan = logical_plan_from_state(
+        "SELECT count(p.*) FROM person AS p",
+        &GenericDialect {},
+        ParserOptions::default(),
+        state,
+    )
+    .unwrap();
+
+    assert_snapshot!(
+        plan,
+        @r"
+    Projection: count(p.id,p.first_name,p.last_name,p.age,p.state,p.salary,p.birth_date,p.😀)
+      Aggregate: groupBy=[[]], aggr=[[count(p.id, p.first_name, p.last_name, p.age, p.state, p.salary, p.birth_date, p.😀)]]
+        SubqueryAlias: p
+          TableScan: person
+    "
+    );
+}
+
+#[test]
+fn scalar_expr_planner_can_resolve_wildcard_from_schema() {
+    let state = mock_session_state().with_expr_planner(Arc::new(ScalarWildcardPlanner));
+    let plan = logical_plan_from_state(
+        "SELECT concat(*) FROM person AS p",
+        &GenericDialect {},
+        ParserOptions::default(),
+        state,
+    )
+    .unwrap();
+
+    assert_snapshot!(
+        plan,
+        @r"
+    Projection: concat(p.first_name, p.last_name, p.state)
+      SubqueryAlias: p
+        TableScan: person
+    "
+    );
+}
+
+#[test]
+fn scalar_expr_planner_receives_wildcard_options() {
+    let state = mock_session_state().with_expr_planner(Arc::new(ScalarWildcardPlanner));
+    let plan = logical_plan_from_state(
+        "SELECT concat(* EXCLUDE first_name) FROM person AS p",
+        &GenericDialect {},
+        ParserOptions::default(),
+        state,
+    )
+    .unwrap();
+
+    assert_snapshot!(
+        plan,
+        @r"
+    Projection: concat(p.last_name, p.state)
+      SubqueryAlias: p
+        TableScan: person
+    "
+    );
+}
+
+#[test]
+fn scalar_expr_planner_applies_wildcard_ilike() {
+    let state = mock_session_state().with_expr_planner(Arc::new(ScalarWildcardPlanner));
+    let plan = logical_plan_from_state(
+        "SELECT concat(* ILIKE '%name') FROM person AS p",
+        &GenericDialect {},
+        ParserOptions::default(),
+        state,
+    )
+    .unwrap();
+
+    assert_snapshot!(
+        plan,
+        @r"
+    Projection: concat(p.first_name, p.last_name)
+      SubqueryAlias: p
+        TableScan: person
+    "
+    );
+}
+
+#[test]
+fn scalar_expr_planner_applies_qualified_wildcard_options() {
+    let state = mock_session_state().with_expr_planner(Arc::new(ScalarWildcardPlanner));
+    let plan = logical_plan_from_state(
+        "SELECT concat((p.* ILIKE '%name')) FROM person AS p",
+        &SnowflakeDialect {},
+        ParserOptions::default(),
+        state,
+    )
+    .unwrap();
+
+    assert_snapshot!(
+        plan,
+        @r"
+    Projection: concat(p.first_name, p.last_name)
+      SubqueryAlias: p
         TableScan: person
     "
     );
@@ -3955,6 +4141,7 @@ impl ScalarUDFImpl for DummyUDF {
 fn parse_decimals_parser_options() -> ParserOptions {
     ParserOptions {
         parse_float_as_decimal: true,
+        trim_decimal_literal_trailing_zeros: false,
         enable_ident_normalization: false,
         support_varchar_with_length: false,
         map_string_types_to_utf8view: true,
@@ -3967,6 +4154,7 @@ fn parse_decimals_parser_options() -> ParserOptions {
 fn ident_normalization_parser_options_no_ident_normalization() -> ParserOptions {
     ParserOptions {
         parse_float_as_decimal: true,
+        trim_decimal_literal_trailing_zeros: false,
         enable_ident_normalization: false,
         support_varchar_with_length: false,
         map_string_types_to_utf8view: true,
@@ -3979,6 +4167,7 @@ fn ident_normalization_parser_options_no_ident_normalization() -> ParserOptions 
 fn ident_normalization_parser_options_ident_normalization() -> ParserOptions {
     ParserOptions {
         parse_float_as_decimal: true,
+        trim_decimal_literal_trailing_zeros: false,
         enable_ident_normalization: true,
         support_varchar_with_length: false,
         map_string_types_to_utf8view: true,
@@ -5491,6 +5680,30 @@ fn test_using_join_wildcard_schema() {
             "t1.value1".to_string(),
             "t2.value2".to_string()
         ]
+    );
+
+    // RIGHT and FULL joins must retain values from the non-null side of the
+    // merged USING column while preserving the wildcard schema.
+    let sql = "WITH t1 AS (SELECT 1 AS id, 'a' AS value1),
+        t2 AS (SELECT 2 AS id, 'x' AS value2)
+        SELECT * FROM t1 RIGHT JOIN t2 USING (id)";
+    let plan = logical_plan(sql).unwrap();
+    assert!(
+        plan.display_indent()
+            .to_string()
+            .contains("Projection: t2.id AS id, t1.value1, t2.value2"),
+        "{plan}"
+    );
+
+    let sql = "WITH t1 AS (SELECT 1 AS id, 'a' AS value1),
+        t2 AS (SELECT 2 AS id, 'x' AS value2)
+        SELECT * FROM t1 FULL OUTER JOIN t2 USING (id)";
+    let plan = logical_plan(sql).unwrap();
+    assert!(
+        plan.display_indent().to_string().contains(
+            "Projection: CASE WHEN t1.id IS NOT NULL THEN t1.id ELSE t2.id END AS id, t1.value1, t2.value2"
+        ),
+        "{plan}"
     );
 
     // Multiple joins

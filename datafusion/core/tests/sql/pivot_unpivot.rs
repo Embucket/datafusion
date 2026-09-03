@@ -33,12 +33,48 @@ async fn pivot_list_is_lowered_to_filtered_aggregates() -> Result<()> {
         .await?;
 
     insta::assert_snapshot!(batches_to_string(&batches), @r"
-    +----+----+----+
-    | id | a  | b  |
-    +----+----+----+
-    | 1  | 10 | 20 |
-    | 2  | 7  |    |
-    +----+----+----+
+    +----+-----+-----+
+    | id | 'a' | 'b' |
+    +----+-----+-----+
+    | 1  | 10  | 20  |
+    | 2  | 7   |     |
+    +----+-----+-----+
+    ");
+    Ok(())
+}
+
+#[tokio::test]
+async fn chained_pivots_apply_explicit_column_aliases() -> Result<()> {
+    let batches = SessionContext::new()
+        .sql(
+            "SELECT SUM(q1_sales) AS q1_sales,
+                    SUM(q2_sales) AS q2_sales,
+                    MAX(q1_discount) AS q1_discount,
+                    MAX(q2_discount) AS q2_discount
+             FROM (
+                 SELECT amount,
+                        quarter AS sales_quarter,
+                        quarter AS discount_quarter,
+                        discount
+                 FROM (VALUES
+                     (100, 'Q1', 10),
+                     (200, 'Q2', 20)
+                 ) sales(amount, quarter, discount)
+             )
+             PIVOT(SUM(amount) FOR sales_quarter IN ('Q1', 'Q2'))
+             PIVOT(MAX(discount) FOR discount_quarter IN ('Q1', 'Q2'))
+             AS p(q1_sales, q2_sales, q1_discount, q2_discount)",
+        )
+        .await?
+        .collect()
+        .await?;
+
+    insta::assert_snapshot!(batches_to_string(&batches), @r"
+    +----------+----------+-------------+-------------+
+    | q1_sales | q2_sales | q1_discount | q2_discount |
+    +----------+----------+-------------+-------------+
+    | 100      | 200      | 10          | 20          |
+    +----------+----------+-------------+-------------+
     ");
     Ok(())
 }

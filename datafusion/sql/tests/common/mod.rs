@@ -25,10 +25,13 @@ use arrow::datatypes::*;
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::datatype::DataTypeExt;
 use datafusion_common::file_options::file_type::FileType;
-use datafusion_common::{DFSchema, GetExt, Result, TableReference, plan_err};
-use datafusion_expr::planner::{ExprPlanner, PlannerResult, TypePlanner};
+use datafusion_common::{Column, DFSchema, GetExt, Result, TableReference, plan_err};
+use datafusion_expr::planner::{
+    ExprPlanner, PlannerResult, RawAggregateExpr, RawScalarExpr, TypePlanner,
+};
+use datafusion_expr::utils::expand_wildcard_from_schema;
 use datafusion_expr::{
-    AggregateUDF, Expr, HigherOrderUDF, ScalarUDF, TableSource, WindowUDF,
+    AggregateUDF, Expr, ExprSchemable, HigherOrderUDF, ScalarUDF, TableSource, WindowUDF,
 };
 use datafusion_functions_nested::expr_fn::make_array;
 use datafusion_sql::planner::ContextProvider;
@@ -137,6 +140,11 @@ impl ContextProvider for MockContextProvider {
             "test_decimal" => Ok(Schema::new(vec![
                 Field::new("id", DataType::Int32, false),
                 Field::new("price", DataType::Decimal128(10, 2), false),
+            ])),
+            "quarterly_sales" => Ok(Schema::new(vec![
+                Field::new("empid", DataType::Int32, false),
+                Field::new("amount", DataType::Int32, false),
+                Field::new("quarter", DataType::Utf8, false),
             ])),
             "person" => Ok(Schema::new(vec![
                 Field::new("id", DataType::UInt32, false),
@@ -413,5 +421,61 @@ impl ExprPlanner for CustomExprPlanner {
         _schema: &DFSchema,
     ) -> Result<PlannerResult<Vec<Expr>>> {
         Ok(PlannerResult::Planned(make_array(exprs)))
+    }
+}
+
+#[derive(Debug)]
+pub struct QualifiedWildcardCountPlanner;
+
+impl ExprPlanner for QualifiedWildcardCountPlanner {
+    fn plan_aggregate_with_schema(
+        &self,
+        mut expr: RawAggregateExpr,
+        schema: &DFSchema,
+    ) -> Result<PlannerResult<RawAggregateExpr>> {
+        #[expect(deprecated)]
+        let Some(Expr::Wildcard {
+            qualifier: Some(qualifier),
+            ..
+        }) = expr.args.first()
+        else {
+            return Ok(PlannerResult::Original(expr));
+        };
+
+        if expr.func.name() != "count" || expr.args.len() != 1 {
+            return Ok(PlannerResult::Original(expr));
+        }
+
+        expr.args = schema
+            .fields_indices_with_qualified(qualifier)
+            .into_iter()
+            .map(|index| Expr::Column(Column::from(schema.qualified_field(index))))
+            .collect();
+        Ok(PlannerResult::Original(expr))
+    }
+}
+
+#[derive(Debug)]
+pub struct ScalarWildcardPlanner;
+
+impl ExprPlanner for ScalarWildcardPlanner {
+    fn plan_scalar_with_schema(
+        &self,
+        mut expr: RawScalarExpr,
+        schema: &DFSchema,
+    ) -> Result<PlannerResult<RawScalarExpr>> {
+        #[expect(deprecated)]
+        let [Expr::Wildcard { options, .. }] = expr.args.as_slice() else {
+            return Ok(PlannerResult::Original(expr));
+        };
+        if expr.func.name() != "concat" {
+            return Ok(PlannerResult::Original(expr));
+        }
+
+        expr.args = expand_wildcard_from_schema(schema, Some(options))?
+            .into_iter()
+            .filter(|expr| expr.get_type(schema).is_ok_and(|ty| ty == DataType::Utf8))
+            .collect();
+        Ok(PlannerResult::Original(expr))
     }
 }

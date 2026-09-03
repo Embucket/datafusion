@@ -271,6 +271,10 @@ config_namespace! {
         /// When set to true, SQL parser will parse float as decimal type
         pub parse_float_as_decimal: bool, default = false
 
+        /// When set to true, insignificant trailing zeros are removed from decimal literals.
+        /// For example, `10.00` is planned as `DECIMAL(2, 0)` instead of `DECIMAL(4, 2)`.
+        pub trim_decimal_literal_trailing_zeros: bool, default = false
+
         /// When set to true, SQL parser will normalize ident (convert ident to lowercase when not quoted)
         pub enable_ident_normalization: bool, default = true
 

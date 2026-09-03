@@ -365,6 +365,7 @@ datafusion.sql_parser.map_string_types_to_utf8view true
 datafusion.sql_parser.parse_float_as_decimal false
 datafusion.sql_parser.recursion_limit 50
 datafusion.sql_parser.support_varchar_with_length true
+datafusion.sql_parser.trim_decimal_literal_trailing_zeros false
 
 # show all variables with verbose
 query TTT rowsort
@@ -529,6 +530,7 @@ datafusion.sql_parser.map_string_types_to_utf8view true If true, string types (V
 datafusion.sql_parser.parse_float_as_decimal false When set to true, SQL parser will parse float as decimal type
 datafusion.sql_parser.recursion_limit 50 Specifies the recursion depth limit when parsing complex SQL Queries
 datafusion.sql_parser.support_varchar_with_length true If true, permit lengths for `VARCHAR` such as `VARCHAR(20)`, but ignore the length. If false, error if a `VARCHAR` with a length is specified. The Arrow type system does not have a notion of maximum string length and thus DataFusion can not enforce such limits.
+datafusion.sql_parser.trim_decimal_literal_trailing_zeros false When set to true, insignificant trailing zeros are removed from decimal literals. For example, `10.00` is planned as `DECIMAL(2, 0)` instead of `DECIMAL(4, 2)`.
 
 # show_variable_in_config_options
 query TT

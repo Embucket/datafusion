@@ -581,6 +581,8 @@ impl SessionState {
 
         ParserOptions {
             parse_float_as_decimal: sql_parser_options.parse_float_as_decimal,
+            trim_decimal_literal_trailing_zeros: sql_parser_options
+                .trim_decimal_literal_trailing_zeros,
             enable_ident_normalization: sql_parser_options.enable_ident_normalization,
             enable_options_value_normalization: sql_parser_options
                 .enable_options_value_normalization,

@@ -24,7 +24,8 @@ use std::sync::Arc;
 use crate::expr::{Alias, Sort, WildcardOptions, WindowFunctionParams};
 use crate::expr_rewriter::strip_outer_reference;
 use crate::{
-    BinaryExpr, Expr, ExprSchemable, Filter, GroupingSet, LogicalPlan, Operator, and,
+    BinaryExpr, Expr, ExprSchemable, Filter, GroupingSet, JoinConstraint, JoinType,
+    LogicalPlan, Operator, and, when,
 };
 use datafusion_expr_common::signature::{Signature, TypeSignature};
 
@@ -442,6 +443,63 @@ fn exclude_using_columns(plan: &LogicalPlan) -> Result<HashSet<Column>> {
     Ok(excluded)
 }
 
+/// Adjusts an unqualified wildcard over a top-level `USING` join so the
+/// retained join key has the value required by SQL outer-join semantics.
+fn using_join_wildcard_replacements(
+    plan: &LogicalPlan,
+    columns_to_skip: &mut HashSet<Column>,
+) -> Result<HashMap<Column, Expr>> {
+    let LogicalPlan::Join(join) = plan else {
+        return Ok(HashMap::new());
+    };
+    if join.join_constraint != JoinConstraint::Using {
+        return Ok(HashMap::new());
+    }
+    if !matches!(
+        join.join_type,
+        JoinType::Inner | JoinType::Left | JoinType::Right | JoinType::Full
+    ) {
+        return Ok(HashMap::new());
+    }
+
+    let mut replacements = HashMap::new();
+    for (left_expr, right_expr) in &join.on {
+        let Some(left) = left_expr.get_as_join_column() else {
+            return internal_err!(
+                "Invalid USING join key. Expected column, found {left_expr:?}"
+            );
+        };
+        let Some(right) = right_expr.get_as_join_column() else {
+            return internal_err!(
+                "Invalid USING join key. Expected column, found {right_expr:?}"
+            );
+        };
+
+        // Keep the left key in its original schema position and remove the
+        // duplicate right key. RIGHT and FULL joins replace its value below.
+        columns_to_skip.remove(left);
+        columns_to_skip.insert(right.clone());
+
+        let left_column = Expr::Column(left.clone());
+        let right_column = Expr::Column(right.clone());
+        let replacement = match join.join_type {
+            JoinType::Right => Some(right_column),
+            JoinType::Full => Some(
+                when(left_column.clone().is_not_null(), left_column)
+                    .otherwise(right_column)?,
+            ),
+            _ => None,
+        };
+        if let Some(replacement) = replacement {
+            replacements.insert(
+                left.clone(),
+                replacement.alias_qualified(left.relation.clone(), left.name.clone()),
+            );
+        }
+    }
+    Ok(replacements)
+}
+
 /// Resolves an `Expr::Wildcard` to a collection of `Expr::Column`'s.
 pub fn expand_wildcard(
     schema: &DFSchema,
@@ -449,19 +507,90 @@ pub fn expand_wildcard(
     wildcard_options: Option<&WildcardOptions>,
 ) -> Result<Vec<Expr>> {
     let mut columns_to_skip = exclude_using_columns(plan)?;
+    let replacements = using_join_wildcard_replacements(plan, &mut columns_to_skip)?;
+    columns_to_skip.extend(excluded_columns_from_schema(
+        schema,
+        wildcard_options,
+        None,
+    )?);
+    Ok(get_exprs_except_skipped(schema, &columns_to_skip)
+        .into_iter()
+        .map(|expr| match expr {
+            Expr::Column(column) => replacements
+                .get(&column)
+                .cloned()
+                .unwrap_or(Expr::Column(column)),
+            expr => expr,
+        })
+        .collect())
+}
+
+/// Resolves an unqualified wildcard using only the input schema.
+///
+/// Unlike [`expand_wildcard`], this helper cannot account for duplicate columns introduced by a
+/// join with a `USING` clause. It is intended for schema-aware expression planners that receive a
+/// wildcard as a function argument.
+pub fn expand_wildcard_from_schema(
+    schema: &DFSchema,
+    wildcard_options: Option<&WildcardOptions>,
+) -> Result<Vec<Expr>> {
+    let columns_to_skip = excluded_columns_from_schema(schema, wildcard_options, None)?;
+    Ok(get_exprs_except_skipped(schema, &columns_to_skip))
+}
+
+fn excluded_columns_from_schema(
+    schema: &DFSchema,
+    wildcard_options: Option<&WildcardOptions>,
+    qualifier: Option<&TableReference>,
+) -> Result<HashSet<Column>> {
     let excluded_columns = if let Some(WildcardOptions {
         exclude: opt_exclude,
         except: opt_except,
         ..
     }) = wildcard_options
     {
-        get_excluded_columns(opt_exclude.as_ref(), opt_except.as_ref(), schema, None)?
+        get_excluded_columns(
+            opt_exclude.as_ref(),
+            opt_except.as_ref(),
+            schema,
+            qualifier,
+        )?
     } else {
         vec![]
     };
-    // Add each excluded `Column` to columns_to_skip
-    columns_to_skip.extend(excluded_columns);
-    Ok(get_exprs_except_skipped(schema, &columns_to_skip))
+    let mut excluded_columns = excluded_columns.into_iter().collect::<HashSet<_>>();
+    if let Some(ilike) = wildcard_options.and_then(|options| options.ilike.as_ref()) {
+        excluded_columns.extend(
+            schema
+                .columns()
+                .into_iter()
+                .filter(|column| !matches_ilike(&column.name, &ilike.pattern)),
+        );
+    }
+    Ok(excluded_columns)
+}
+
+fn matches_ilike(value: &str, pattern: &str) -> bool {
+    let value = value.to_lowercase().chars().collect::<Vec<_>>();
+    let pattern = pattern.to_lowercase().chars().collect::<Vec<_>>();
+    let mut previous = vec![false; value.len() + 1];
+    previous[0] = true;
+
+    for pattern_char in pattern {
+        let mut current = vec![false; value.len() + 1];
+        if pattern_char == '%' {
+            current[0] = previous[0];
+        }
+        for (index, value_char) in value.iter().enumerate() {
+            current[index + 1] = match pattern_char {
+                '%' => previous[index + 1] || current[index],
+                '_' => previous[index],
+                literal => previous[index] && literal == *value_char,
+            };
+        }
+        previous = current;
+    }
+    previous[value.len()]
 }
 
 /// Resolves an `Expr::Wildcard` to a collection of qualified `Expr::Column`'s.
