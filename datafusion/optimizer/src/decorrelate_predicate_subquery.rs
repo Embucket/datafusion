@@ -80,7 +80,7 @@ impl OptimizerRule for DecorrelatePredicateSubquery {
             for expr in projection.expr {
                 let original_name = expr.schema_name().to_string();
                 let (new_input, mut rewritten_expr) =
-                    rewrite_inner_subqueries(cur_input, expr, config)?;
+                    rewrite_inner_subqueries(cur_input, expr, config, true)?;
                 if has_subquery(&rewritten_expr) {
                     return Ok(Transformed::no(LogicalPlan::Projection(
                         original_projection,
@@ -135,7 +135,7 @@ impl OptimizerRule for DecorrelatePredicateSubquery {
                 // The subquery expression is embedded within another expression
                 SubqueryPredicate::Embedded(expr) => {
                     let (plan, expr_without_subqueries) =
-                        rewrite_inner_subqueries(cur_input, expr, config)?;
+                        rewrite_inner_subqueries(cur_input, expr, config, false)?;
                     cur_input = plan;
                     other_exprs.push(expr_without_subqueries);
                 }
@@ -170,6 +170,7 @@ fn rewrite_inner_subqueries(
     outer: LogicalPlan,
     expr: Expr,
     config: &dyn OptimizerConfig,
+    materialize_in_value: bool,
 ) -> Result<(LogicalPlan, Expr)> {
     let mut cur_input = outer;
     let alias = config.alias_generator();
@@ -189,26 +190,38 @@ fn rewrite_inner_subqueries(
             expr,
             subquery: Subquery { subquery, .. },
             negated,
-        }) => match in_subquery_mark_join(
-            &cur_input,
-            &subquery,
-            *expr.clone(),
-            negated,
-            alias,
-        )? {
-            Some((plan, exists_expr)) => {
-                cur_input = plan;
-                Ok(Transformed::yes(exists_expr))
+        }) => {
+            let rewritten = if materialize_in_value {
+                in_subquery_value_mark_join(
+                    &cur_input,
+                    &subquery,
+                    *expr.clone(),
+                    negated,
+                    alias,
+                )?
+            } else {
+                let in_predicate = subquery
+                    .head_output_expr()?
+                    .map_or(plan_err!("single expression required."), |output_expr| {
+                        Ok(Expr::eq(*expr.clone(), output_expr))
+                    })?;
+                mark_join(&cur_input, &subquery, Some(&in_predicate), negated, alias)?
+            };
+            match rewritten {
+                Some((plan, exists_expr)) => {
+                    cur_input = plan;
+                    Ok(Transformed::yes(exists_expr))
+                }
+                None if negated => Ok(Transformed::no(not_in_subquery(*expr, subquery))),
+                None => Ok(Transformed::no(in_subquery(*expr, subquery))),
             }
-            None if negated => Ok(Transformed::no(not_in_subquery(*expr, subquery))),
-            None => Ok(Transformed::no(in_subquery(*expr, subquery))),
-        },
+        }
         _ => Ok(Transformed::no(e)),
     })?;
     Ok((cur_input, expr_without_subqueries.data))
 }
 
-fn in_subquery_mark_join(
+fn in_subquery_value_mark_join(
     left: &LogicalPlan,
     subquery: &LogicalPlan,
     expr: Expr,
