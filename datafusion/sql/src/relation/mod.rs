@@ -394,12 +394,24 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                         }
                     })
                     .collect::<Result<Vec<_>>>()?;
+                let output_aliases = alias.as_ref().and_then(|alias| {
+                    (!alias.columns.is_empty()).then(|| {
+                        alias
+                            .columns
+                            .iter()
+                            .map(|column| {
+                                self.ident_normalizer.normalize(column.name.clone())
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                });
                 let plan = transform_pivot_to_aggregate(
                     input_plan,
                     &aggregate_expr,
                     &pivot_column,
                     &pivot_values,
                     default_on_null_expr.as_ref(),
+                    output_aliases.as_deref(),
                 )?;
                 (plan, alias)
             }
@@ -562,9 +574,10 @@ fn transform_pivot_to_aggregate(
     pivot_column: &Column,
     pivot_values: &[ResolvedPivotValue],
     default_on_null_expr: Option<&Expr>,
+    output_aliases: Option<&[String]>,
 ) -> Result<LogicalPlan> {
     let input_schema = input.schema();
-    let group_by = input_schema
+    let group_by_columns = input_schema
         .columns()
         .into_iter()
         .filter(|column| {
@@ -574,7 +587,27 @@ fn transform_pivot_to_aggregate(
                     .iter()
                     .any(|aggregate_column| aggregate_column.name == column.name)
         })
-        .map(Expr::Column)
+        .collect::<Vec<_>>();
+    let group_by_len = group_by_columns.len();
+    if let Some(output_aliases) = output_aliases
+        && output_aliases.len() != group_by_len + pivot_values.len()
+    {
+        return plan_err!(
+            "Source table contains {} columns but only {} names given as column alias",
+            group_by_len + pivot_values.len(),
+            output_aliases.len()
+        );
+    }
+    let group_by = group_by_columns
+        .into_iter()
+        .enumerate()
+        .map(|(index, column)| {
+            if let Some(aliases) = output_aliases {
+                Expr::Column(column).alias(aliases[index].clone())
+            } else {
+                Expr::Column(column)
+            }
+        })
         .collect::<Vec<_>>();
     let pivot_index = input_schema.index_of_column(pivot_column).map_err(|_| {
         datafusion_common::plan_datafusion_err!(
@@ -584,7 +617,8 @@ fn transform_pivot_to_aggregate(
     let pivot_type = input_schema.field(pivot_index).data_type().clone();
     let aggregates = pivot_values
         .iter()
-        .map(|pivot_value| {
+        .enumerate()
+        .map(|(index, pivot_value)| {
             let filter = Expr::BinaryExpr(BinaryExpr::new(
                 Box::new(Expr::Column(pivot_column.clone())),
                 Operator::IsNotDistinctFrom,
@@ -598,13 +632,17 @@ fn transform_pivot_to_aggregate(
             };
             let mut params = aggregate.params.clone();
             params.filter = Some(Box::new(filter));
+            let name = output_aliases.map_or_else(
+                || pivot_value.name.clone(),
+                |aliases| aliases[group_by_len + index].clone(),
+            );
             Ok(Expr::Alias(Alias {
                 expr: Box::new(Expr::AggregateFunction(AggregateFunction {
                     func: Arc::clone(&aggregate.func),
                     params,
                 })),
                 relation: None,
-                name: pivot_value.name.clone(),
+                name,
                 metadata: None,
             }))
         })
@@ -618,7 +656,13 @@ fn transform_pivot_to_aggregate(
     };
     let pivot_names = pivot_values
         .iter()
-        .map(|value| value.name.clone())
+        .enumerate()
+        .map(|(index, value)| {
+            output_aliases.map_or_else(
+                || value.name.clone(),
+                |aliases| aliases[group_by_len + index].clone(),
+            )
+        })
         .collect::<Vec<_>>();
     let projection = aggregate_plan
         .schema()
