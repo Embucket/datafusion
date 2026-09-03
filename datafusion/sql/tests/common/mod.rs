@@ -141,6 +141,11 @@ impl ContextProvider for MockContextProvider {
                 Field::new("id", DataType::Int32, false),
                 Field::new("price", DataType::Decimal128(10, 2), false),
             ])),
+            "quarterly_sales" => Ok(Schema::new(vec![
+                Field::new("empid", DataType::Int32, false),
+                Field::new("amount", DataType::Int32, false),
+                Field::new("quarter", DataType::Utf8, false),
+            ])),
             "person" => Ok(Schema::new(vec![
                 Field::new("id", DataType::UInt32, false),
                 Field::new("first_name", DataType::Utf8, false),
