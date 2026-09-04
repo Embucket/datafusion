@@ -55,3 +55,36 @@ FROM outer_values o;
 2 false
 3 NULL
 4 false
+
+# Snowflake row-valued IN treats comparisons containing NULL as non-matches.
+query BBBBB
+WITH vals AS (
+    SELECT * FROM (VALUES (1, 2), (4, 5), (4, NULL)) AS t(a, b)
+), empty AS (
+    SELECT a, b FROM vals WHERE false
+)
+SELECT
+    (1, 2) IN (SELECT a, b FROM vals) AS exact_match,
+    (9, 9) IN (SELECT a, b FROM vals) AS no_match,
+    (4, NULL) IN (SELECT a, b FROM vals) AS null_non_match,
+    (9, NULL) IN (SELECT a, b FROM vals) AS different_with_null,
+    (9, NULL) IN (SELECT a, b FROM empty) AS empty_rhs;
+----
+true false false false false
+
+# Row-valued IN works as a top-level predicate as well as a projected value.
+query I rowsort
+WITH candidates AS (
+    SELECT * FROM (VALUES (1, 2), (4, 5), (4, NULL)) AS t(a, b)
+), probes AS (
+    SELECT * FROM (VALUES (1, 1, 2), (2, 9, 9), (3, 4, NULL)) AS t(id, a, b)
+)
+SELECT id
+FROM probes
+WHERE (a, b) IN (SELECT a, b FROM candidates);
+----
+1
+
+# Tuple arity mismatches are rejected during SQL planning.
+statement error IN subquery tuple has 2 fields but the subquery returns 3 columns
+SELECT (1, 2) IN (SELECT column1, column2, column3 FROM VALUES (1, 2, 3));
