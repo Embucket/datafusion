@@ -18,9 +18,10 @@
 name: Dev
 on:
   push:
-    branches-ignore:
-      - 'gh-readonly-queue/**'
-      - 'dependabot/**'
+    branches:
+      - main
+      - 'branch-*'
+      - 'embucket-sync-*'
   pull_request:
   merge_group:
 
