@@ -233,9 +233,26 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             exprs
                 .into_iter()
                 .map(|e| {
+                    // SQL GROUP BY gives an input column precedence over a same-named
+                    // SELECT-list alias. Resolve a bare input identifier before adding the
+                    // projected schema, which would otherwise make the two fields ambiguous.
+                    let input_column_precedence = match &e {
+                        SQLExpr::Identifier(identifier) => base_plan
+                            .schema()
+                            .qualified_field_with_unqualified_name(
+                                &self.ident_normalizer.normalize(identifier.clone()),
+                            )
+                            .is_ok(),
+                        _ => false,
+                    };
+                    let group_by_schema = if input_column_precedence {
+                        base_plan.schema().as_ref()
+                    } else {
+                        &combined_schema
+                    };
                     let group_by_expr = self.sql_expr_to_logical_expr(
                         e,
-                        &combined_schema,
+                        group_by_schema,
                         planner_context,
                     )?;
 
@@ -248,13 +265,18 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                         resolve_aliases_to_exprs(group_by_expr, &alias_map)?;
                     let group_by_expr =
                         resolve_positions_to_exprs(group_by_expr, &select_exprs)?;
-                    let group_by_expr = normalize_col(group_by_expr, &projected_plan)?;
+                    let normalization_plan = if input_column_precedence {
+                        &base_plan
+                    } else {
+                        &projected_plan
+                    };
+                    let group_by_expr = normalize_col(group_by_expr, normalization_plan)?;
                     self.validate_schema_satisfies_exprs(
                         base_plan.schema(),
                         std::slice::from_ref(&group_by_expr),
                     )?;
                     let (group_by_expr, _) =
-                        group_by_expr.infer_placeholder_types(&combined_schema)?;
+                        group_by_expr.infer_placeholder_types(group_by_schema)?;
                     Ok(group_by_expr)
                 })
                 .collect::<Result<Vec<Expr>>>()?

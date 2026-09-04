@@ -2047,6 +2047,29 @@ fn select_simple_aggregate_with_groupby_can_use_alias() {
 }
 
 #[test]
+fn group_by_input_column_takes_precedence_over_same_named_alias() {
+    let plan = logical_plan("SELECT SUM(id) AS age FROM person GROUP BY age").unwrap();
+    assert_snapshot!(
+        plan,
+        @r"
+    Projection: sum(person.id) AS age
+      Aggregate: groupBy=[[person.age]], aggr=[[sum(person.id)]]
+        TableScan: person
+    "
+    );
+}
+
+#[test]
+fn group_by_alias_conflict_reaches_non_aggregate_validation() {
+    let error = logical_plan("SELECT state AS age FROM person GROUP BY age")
+        .expect_err("state is not grouped");
+    assert_snapshot!(
+        error.strip_backtrace(),
+        @r#"Error during planning: Column in SELECT must be in GROUP BY or an aggregate function: While expanding wildcard, column "person.state" must appear in the GROUP BY clause or must be part of an aggregate function, currently only "person.age" appears in the SELECT clause satisfies this requirement"#
+    );
+}
+
+#[test]
 fn select_simple_aggregate_with_groupby_aggregate_repeated() {
     let sql = "SELECT state, MIN(age), MIN(age) FROM person GROUP BY state";
     let err = logical_plan(sql).expect_err("query should have failed");
