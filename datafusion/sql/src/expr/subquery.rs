@@ -16,9 +16,13 @@
 // under the License.
 
 use crate::planner::{ContextProvider, PlannerContext, SqlToRel};
-use datafusion_common::{DFSchema, Diagnostic, Result, Span, Spans, plan_err};
+use datafusion_common::tree_node::{Transformed, TreeNode};
+use datafusion_common::{
+    Column, DFSchema, Diagnostic, ExprSchema, Result, Span, Spans, plan_err,
+};
 use datafusion_expr::expr::{Exists, InSubquery, SetComparison, SetQuantifier};
-use datafusion_expr::{Expr, LogicalPlan, Subquery};
+use datafusion_expr::utils::conjunction;
+use datafusion_expr::{Expr, LogicalPlan, LogicalPlanBuilder, Subquery};
 use sqlparser::ast::Expr as SQLExpr;
 use sqlparser::ast::{BinaryOperator, Query, SelectItem, SetExpr};
 use std::sync::Arc;
@@ -67,6 +71,21 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         }
 
         let sub_plan = self.query_to_plan(subquery, planner_context)?;
+        let subquery_arity = sub_plan.schema().fields().len();
+        if subquery_arity > 1
+            && let SQLExpr::Tuple(values) = &expr
+        {
+            let result = self.build_tuple_in_subquery(
+                values.clone(),
+                sub_plan,
+                negated,
+                input_schema,
+                planner_context,
+                spans,
+            );
+            planner_context.pop_outer_query_schema();
+            return result;
+        }
         let outer_ref_columns = sub_plan.all_out_ref_exprs();
         planner_context.pop_outer_query_schema();
 
@@ -88,6 +107,51 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             },
             negated,
         )))
+    }
+
+    fn build_tuple_in_subquery(
+        &self,
+        values: Vec<SQLExpr>,
+        sub_plan: LogicalPlan,
+        negated: bool,
+        input_schema: &DFSchema,
+        planner_context: &mut PlannerContext,
+        spans: Spans,
+    ) -> Result<Expr> {
+        let tuple_arity = values.len();
+        let subquery_arity = sub_plan.schema().fields().len();
+        if tuple_arity != subquery_arity {
+            return plan_err!(
+                "IN subquery tuple has {tuple_arity} fields but the subquery returns {subquery_arity} columns"
+            );
+        }
+
+        let comparisons = values
+            .into_iter()
+            .enumerate()
+            .map(|(index, value)| {
+                let left = self.sql_to_expr(value, input_schema, planner_context)?;
+                let left = to_outer_reference(left, input_schema)?;
+                let right =
+                    Expr::Column(Column::from(sub_plan.schema().qualified_field(index)));
+                Ok(Expr::eq(left, right))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let predicate = conjunction(comparisons)
+            .map_or(plan_err!("IN subquery tuple cannot be empty"), Ok)?;
+        let filtered = LogicalPlanBuilder::from(sub_plan)
+            .filter(predicate)?
+            .build()?;
+        let outer_ref_columns = filtered.all_out_ref_exprs();
+
+        Ok(Expr::Exists(Exists {
+            subquery: Subquery {
+                subquery: Arc::new(filtered),
+                outer_ref_columns,
+                spans,
+            },
+            negated,
+        }))
     }
 
     pub(super) fn parse_scalar_subquery(
@@ -205,4 +269,19 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             quantifier,
         )))
     }
+}
+
+fn to_outer_reference(expr: Expr, outer_schema: &DFSchema) -> Result<Expr> {
+    expr.transform_up(|expr| match expr {
+        Expr::Column(col) => {
+            let field = outer_schema.field_from_column(&col)?;
+            Ok(Transformed::yes(Expr::OuterReferenceColumn(
+                Arc::clone(field),
+                col,
+            )))
+        }
+        Expr::OuterReferenceColumn(_, _) => Ok(Transformed::no(expr)),
+        _ => Ok(Transformed::no(expr)),
+    })
+    .map(|transformed| transformed.data)
 }
