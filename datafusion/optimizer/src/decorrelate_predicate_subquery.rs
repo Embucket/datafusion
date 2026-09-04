@@ -512,16 +512,17 @@ fn build_join(
 
         // Keep only columns that actually belong to the RIGHT child, and sort by their
         // position in the right schema for deterministic order.
-        let mut right_cols_idx_and_col: Vec<(usize, Column)> = needed
+        let mut right_col_indices: Vec<usize> = needed
             .into_iter()
-            .filter_map(|c| right_schema.index_of_column(&c).ok().map(|idx| (idx, c)))
+            .filter_map(|column| right_schema.index_of_column(&column).ok())
             .collect();
 
-        right_cols_idx_and_col.sort_by_key(|(idx, _)| *idx);
+        right_col_indices.sort_unstable();
+        right_col_indices.dedup();
 
-        let right_proj_exprs: Vec<Expr> = right_cols_idx_and_col
+        let right_proj_exprs: Vec<Expr> = right_col_indices
             .into_iter()
-            .map(|(_, c)| Expr::Column(c))
+            .map(|index| Expr::Column(Column::from(right_schema.qualified_field(index))))
             .collect();
 
         let right_projected = if !right_proj_exprs.is_empty() {

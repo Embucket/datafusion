@@ -9,6 +9,11 @@ FROM (SELECT 1) t;
 ----
 false true
 
+query B
+SELECT 'a' IN (SELECT column1 FROM VALUES ('b'), ('c'), ('d'));
+----
+false
+
 query BBBB
 WITH vals AS (SELECT * FROM (VALUES (1), (2), (NULL)) AS t(x))
 SELECT
