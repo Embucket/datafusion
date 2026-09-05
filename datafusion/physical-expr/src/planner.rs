@@ -536,7 +536,8 @@ pub fn create_physical_expr(
                         );
                     }
                     let dt = schema.field(0).data_type().clone();
-                    let nullable = schema.field(0).is_nullable();
+                    // A scalar subquery returns NULL when it produces no rows.
+                    let nullable = true;
                     Ok(Arc::new(ScalarSubqueryExpr::new(
                         dt,
                         nullable,
@@ -744,7 +745,11 @@ pub fn logical2physical(expr: &Expr, schema: &Schema) -> Arc<dyn PhysicalExpr> {
 mod tests {
     use arrow::array::{ArrayRef, BooleanArray, RecordBatch, StringArray};
     use arrow::datatypes::{DataType, Field};
-    use datafusion_expr::col;
+    use datafusion_common::HashMap;
+    use datafusion_expr::physical_planning_context::{
+        ScalarSubqueryResults, SubqueryIndex,
+    };
+    use datafusion_expr::{LogicalPlanBuilder, col, scalar_subquery};
 
     use super::*;
 
@@ -795,6 +800,36 @@ mod tests {
             &(Arc::new(BooleanArray::from(vec![true, false, false, false,])) as ArrayRef)
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_scalar_subquery_physical_expr_is_nullable() -> Result<()> {
+        let subquery_plan = LogicalPlanBuilder::empty(false)
+            .project(vec![lit(1)])?
+            .build()?;
+        assert!(!subquery_plan.schema().field(0).is_nullable());
+
+        let expr = scalar_subquery(Arc::new(subquery_plan));
+        let Expr::ScalarSubquery(subquery) = &expr else {
+            unreachable!()
+        };
+        let index = SubqueryIndex::new(0);
+        let planning_ctx = PhysicalPlanningContext::new(
+            HashMap::from([(subquery.clone(), index)]),
+            ScalarSubqueryResults::new(1),
+        );
+        let schema = Schema::empty();
+        let df_schema = DFSchema::try_from(schema.clone())?;
+
+        let physical = create_physical_expr(
+            &expr,
+            &df_schema,
+            &ExecutionProps::new(),
+            &planning_ctx,
+        )?;
+
+        assert!(physical.return_field(&schema)?.is_nullable());
         Ok(())
     }
 
