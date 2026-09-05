@@ -2015,6 +2015,24 @@ fn select_nested_window_function() {
 }
 
 #[test]
+fn select_nested_window_function_snowflake() {
+    let mut config_options = datafusion_common::config::ConfigOptions::new();
+    config_options.sql_parser.dialect = datafusion_common::config::Dialect::Snowflake;
+
+    let plan = logical_plan_with_config(
+        "SELECT sum(sum(age) OVER ()) OVER () FROM person",
+        config_options,
+    )
+    .unwrap();
+    assert_snapshot!(plan, @r"
+    Projection: sum(sum(person.age) ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+      WindowAggr: windowExpr=[[sum(sum(person.age) ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING]]
+        WindowAggr: windowExpr=[[sum(person.age) ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING]]
+          TableScan: person
+    ");
+}
+
+#[test]
 fn select_aggregate_inside_window_function() {
     // an aggregate as the argument of a window function is legal: the window
     // function is evaluated on top of the aggregate

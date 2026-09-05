@@ -22,6 +22,34 @@ use datafusion_common::{ParamValues, ScalarValue, metadata::ScalarAndMetadata};
 use insta::assert_snapshot;
 
 #[tokio::test]
+async fn snowflake_nested_window_functions_execute_in_stages() -> Result<()> {
+    let config =
+        SessionConfig::new().set_str("datafusion.sql_parser.dialect", "Snowflake");
+    let ctx = SessionContext::new_with_config(config);
+
+    let results = ctx
+        .sql(
+            "SELECT column1 AS id, \
+                    SUM(SUM(column1) OVER ()) OVER () AS nested_sum \
+             FROM VALUES (1), (2), (3) ORDER BY id",
+        )
+        .await?
+        .collect()
+        .await?;
+
+    assert_snapshot!(batches_to_sort_string(&results), @r"
+    +----+------------+
+    | id | nested_sum |
+    +----+------------+
+    | 1  | 18         |
+    | 2  | 18         |
+    | 3  | 18         |
+    +----+------------+
+    ");
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_list_query_parameters() -> Result<()> {
     let tmp_dir = TempDir::new()?;
     let partition_count = 4;
