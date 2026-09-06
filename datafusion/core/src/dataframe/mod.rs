@@ -559,6 +559,53 @@ impl DataFrame {
         })
     }
 
+    /// Transform a set of columns into name/value rows.
+    ///
+    /// Columns not listed in `columns` are preserved. Set `include_nulls` to `false` to omit
+    /// rows whose generated value is NULL.
+    ///
+    /// # Example
+    /// ```
+    /// # use arrow::array::{ArrayRef, Int32Array};
+    /// # use datafusion::error::Result;
+    /// # use datafusion::prelude::*;
+    /// # use std::sync::Arc;
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<()> {
+    /// let id: ArrayRef = Arc::new(Int32Array::from(vec![1, 2]));
+    /// let jan: ArrayRef = Arc::new(Int32Array::from(vec![100, 110]));
+    /// let feb: ArrayRef = Arc::new(Int32Array::from(vec![200, 210]));
+    /// let df = DataFrame::from_columns(vec![("id", id), ("jan", jan), ("feb", feb)])?;
+    /// let unpivoted = df.unpivot(
+    ///     "sales",
+    ///     "month",
+    ///     vec![
+    ///         (Column::from_name("jan"), None),
+    ///         (Column::from_name("feb"), None),
+    ///     ],
+    ///     false,
+    /// )?;
+    /// # let _ = unpivoted.collect().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn unpivot(
+        self,
+        value_column: impl Into<String>,
+        name_column: impl Into<String>,
+        columns: Vec<(Column, Option<String>)>,
+        include_nulls: bool,
+    ) -> Result<Self> {
+        let plan = LogicalPlanBuilder::from(self.plan)
+            .unpivot(value_column, name_column, columns, include_nulls)?
+            .build()?;
+        Ok(Self {
+            session_state: self.session_state,
+            plan,
+            projection_requires_validation: true,
+        })
+    }
+
     /// Return a DataFrame with only rows for which `predicate` evaluates to
     /// `true`.
     ///

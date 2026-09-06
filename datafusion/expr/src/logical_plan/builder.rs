@@ -1617,6 +1617,85 @@ impl LogicalPlanBuilder {
         unnest_with_options(Arc::unwrap_or_clone(self.plan), columns, options)
             .map(Self::new)
     }
+
+    /// Transform a set of columns into name/value rows.
+    ///
+    /// Columns not listed in `columns` are preserved. The generated name column contains
+    /// each input column's alias, or its normalized column name when no alias is provided.
+    /// Duplicate rows are preserved.
+    pub fn unpivot(
+        self,
+        value_column: impl Into<String>,
+        name_column: impl Into<String>,
+        columns: Vec<(Column, Option<String>)>,
+        include_nulls: bool,
+    ) -> Result<Self> {
+        if columns.is_empty() {
+            return plan_err!("UNPIVOT requires at least one input column");
+        }
+
+        let value_column = value_column.into();
+        let name_column = name_column.into();
+        if value_column == name_column {
+            return plan_err!("UNPIVOT name and value columns must have different names");
+        }
+
+        let input = self.plan;
+        let columns = columns
+            .into_iter()
+            .map(|(column, alias)| {
+                Self::normalize(&input, column).map(|column| (column, alias))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let unpivot_columns = columns
+            .iter()
+            .map(|(column, _)| column.clone())
+            .collect::<HashSet<_>>();
+        if unpivot_columns.len() != columns.len() {
+            return plan_err!("UNPIVOT input columns must be unique");
+        }
+
+        let preserved_columns = input
+            .schema()
+            .iter()
+            .filter_map(|(qualifier, field)| {
+                let column = Column::new(qualifier.cloned(), field.name());
+                (!unpivot_columns.contains(&column)).then_some(column)
+            })
+            .collect::<Vec<_>>();
+        if preserved_columns
+            .iter()
+            .any(|column| column.name == name_column || column.name == value_column)
+        {
+            return plan_err!(
+                "UNPIVOT output column conflicts with a preserved input column"
+            );
+        }
+        let preserved_exprs = preserved_columns
+            .into_iter()
+            .map(Expr::Column)
+            .collect::<Vec<_>>();
+
+        let mut inputs = columns.into_iter().map(|(column, alias)| {
+            let mut projection = preserved_exprs.clone();
+            projection.push(
+                lit(alias.unwrap_or_else(|| column.name.clone())).alias(&name_column),
+            );
+            projection.push(Expr::Column(column).alias(&value_column));
+            let mut builder = Self::from(Arc::clone(&input)).project(projection)?;
+            if !include_nulls {
+                builder = builder.filter(
+                    Expr::Column(Column::from_name(&value_column)).is_not_null(),
+                )?;
+            }
+            builder.build()
+        });
+
+        let Some(first) = inputs.next() else {
+            return plan_err!("UNPIVOT requires at least one input column");
+        };
+        inputs.try_fold(Self::from(first?), |builder, input| builder.union(input?))
+    }
 }
 
 impl From<LogicalPlan> for LogicalPlanBuilder {

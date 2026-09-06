@@ -29,7 +29,7 @@ use datafusion_expr::planner::{
 };
 use datafusion_expr::{Expr, LogicalPlan, LogicalPlanBuilder, expr::Unnest};
 use datafusion_expr::{Subquery, SubqueryAlias};
-use sqlparser::ast::{FunctionArg, FunctionArgExpr, Spanned, TableFactor};
+use sqlparser::ast::{FunctionArg, FunctionArgExpr, NullInclusion, Spanned, TableFactor};
 
 mod join;
 
@@ -302,6 +302,49 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 let plan =
                     LogicalPlanBuilder::scan(tbl_func_ref.table(), provider, None)?
                         .build()?;
+                (plan, alias)
+            }
+            TableFactor::Unpivot {
+                table,
+                value,
+                name,
+                columns,
+                null_inclusion,
+                alias,
+            } => {
+                let input = self.create_relation(*table, planner_context)?;
+                let value_column = match value {
+                    sqlparser::ast::Expr::Identifier(ident) => {
+                        self.ident_normalizer.normalize(ident)
+                    }
+                    expression => {
+                        return not_impl_err!(
+                            "UNPIVOT with multiple value columns is not supported: {expression}"
+                        );
+                    }
+                };
+                let name_column = self.ident_normalizer.normalize(name);
+                let columns = columns
+                    .into_iter()
+                    .map(|column| {
+                        let expression = self.sql_expr_to_logical_expr(
+                            column.expr,
+                            input.schema(),
+                            planner_context,
+                        )?;
+                        let Expr::Column(column_expr) = expression else {
+                            return plan_err!(
+                                "UNPIVOT input must be a column, found {expression}"
+                            );
+                        };
+                        Ok((column_expr, column.alias.map(|alias| alias.value)))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let include_nulls =
+                    matches!(null_inclusion, Some(NullInclusion::IncludeNulls));
+                let plan = LogicalPlanBuilder::from(input)
+                    .unpivot(value_column, name_column, columns, include_nulls)?
+                    .build()?;
                 (plan, alias)
             }
             // @todo Support TableFactory::TableFunction?
