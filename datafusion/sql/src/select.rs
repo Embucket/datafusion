@@ -30,6 +30,7 @@ use crate::utils::{
 };
 
 use arrow::datatypes::DataType;
+use datafusion_common::config::Dialect as SqlDialect;
 use datafusion_common::error::DataFusionErrorBuilder;
 use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion_common::{Column, DFSchema, DFSchemaRef, Result, not_impl_err, plan_err};
@@ -39,7 +40,8 @@ use datafusion_expr::builder::get_struct_unnested_columns;
 use datafusion_expr::expr::Unnest as UnnestExpr;
 use datafusion_expr::expr::{PlannedReplaceSelectItem, WildcardOptions};
 use datafusion_expr::expr_rewriter::{
-    normalize_col, normalize_col_with_schemas_and_ambiguity_check, normalize_sorts,
+    NamePreserver, normalize_col, normalize_col_with_schemas_and_ambiguity_check,
+    normalize_sorts,
 };
 use datafusion_expr::select_expr::SelectExpr;
 use datafusion_expr::utils::{
@@ -85,6 +87,71 @@ struct DistinctOnUnnestPlanResult {
 struct RewrittenUnnestExprGroups {
     plan: LogicalPlan,
     expr_groups: Vec<Vec<Expr>>,
+}
+
+fn contains_nested_window_function(expr: &Expr) -> Result<bool> {
+    let mut found = false;
+    expr.apply_children(|child| {
+        child.apply(|nested| {
+            if matches!(nested, Expr::WindowFunction(_)) {
+                found = true;
+                Ok(TreeNodeRecursion::Stop)
+            } else {
+                Ok(TreeNodeRecursion::Continue)
+            }
+        })
+    })?;
+    Ok(found)
+}
+
+fn is_snowflake_conditional_event_with_nested_rank(expr: &Expr) -> Result<bool> {
+    let Expr::WindowFunction(outer) = expr else {
+        return Ok(false);
+    };
+    if !outer
+        .fun
+        .name()
+        .eq_ignore_ascii_case("conditional_true_event")
+    {
+        return Ok(false);
+    }
+
+    let mut found_nested_rank = false;
+    let mut supported = true;
+    for argument in &outer.params.args {
+        argument.apply(|nested| {
+            if let Expr::WindowFunction(inner) = nested {
+                found_nested_rank = true;
+                supported &= matches!(
+                    inner.fun.name().to_ascii_lowercase().as_str(),
+                    "lag" | "lead"
+                ) && inner.params.partition_by == outer.params.partition_by
+                    && inner.params.order_by == outer.params.order_by;
+                Ok(TreeNodeRecursion::Jump)
+            } else {
+                Ok(TreeNodeRecursion::Continue)
+            }
+        })?;
+    }
+    Ok(found_nested_rank && supported)
+}
+
+fn find_innermost_window_exprs<'a>(
+    exprs: impl IntoIterator<Item = &'a Expr>,
+) -> Result<Vec<Expr>> {
+    let mut window_exprs = Vec::new();
+    for expr in exprs {
+        expr.apply(|nested| {
+            if matches!(nested, Expr::WindowFunction(_))
+                && !contains_nested_window_function(nested)?
+                && !window_exprs.contains(nested)
+            {
+                window_exprs.push(nested.clone());
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+    }
+    Ok(window_exprs)
 }
 
 fn flatten_expr_groups(expr_groups: Vec<Vec<Expr>>) -> Vec<Expr> {
@@ -351,7 +418,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             plan,
             select_exprs: mut select_exprs_post_aggr,
             having_expr: having_expr_post_aggr,
-            qualify_expr: qualify_expr_post_aggr,
+            qualify_expr: mut qualify_expr_post_aggr,
             order_by_exprs: mut order_by_rex,
             on_exprs: mut on_exprs_post_aggr,
         } = if !group_by_exprs.is_empty() || !aggr_exprs.is_empty() {
@@ -401,10 +468,79 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 .chain(order_by_rex.iter().map(|s| &s.expr))
                 .chain(on_exprs_post_aggr.iter()),
         );
+        let qualify_had_window_functions = !find_window_exprs(
+            select_exprs_post_aggr
+                .iter()
+                .chain(qualify_expr_post_aggr.iter()),
+        )
+        .is_empty();
+        let (has_nested_windows, all_nested_windows_supported) = window_func_exprs
+            .iter()
+            .try_fold((false, true), |state, expr| {
+                if contains_nested_window_function(expr)? {
+                    Ok::<_, datafusion_common::DataFusionError>((
+                        true,
+                        state.1 && is_snowflake_conditional_event_with_nested_rank(expr)?,
+                    ))
+                } else {
+                    Ok(state)
+                }
+            })?;
+        let plan_nested_windows = self.context_provider.options().sql_parser.dialect
+            == SqlDialect::Snowflake
+            && has_nested_windows
+            && all_nested_windows_supported;
 
         // Process window functions after aggregation as they can reference
         // aggregate functions in their body
         let plan = if window_func_exprs.is_empty() {
+            plan
+        } else if plan_nested_windows {
+            // Snowflake permits LAG/LEAD inside conditional event functions when
+            // both calls use the same window specification. Materialize the inner
+            // rank function before planning the conditional event function.
+            let mut plan = plan;
+            loop {
+                let window_level = find_innermost_window_exprs(
+                    select_exprs_post_aggr
+                        .iter()
+                        .chain(qualify_expr_post_aggr.iter())
+                        .chain(order_by_rex.iter().map(|sort| &sort.expr))
+                        .chain(on_exprs_post_aggr.iter()),
+                )?;
+                if window_level.is_empty() {
+                    break;
+                }
+
+                plan = LogicalPlanBuilder::window_plan(plan, window_level.clone())?;
+                let name_preserver = NamePreserver::new_for_projection();
+                select_exprs_post_aggr = select_exprs_post_aggr
+                    .iter()
+                    .map(|expr| {
+                        let saved_name = name_preserver.save(expr);
+                        rebase_expr(expr, &window_level, &plan)
+                            .map(|expr| saved_name.restore(expr))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                qualify_expr_post_aggr = qualify_expr_post_aggr
+                    .as_ref()
+                    .map(|expr| rebase_expr(expr, &window_level, &plan))
+                    .transpose()?;
+                order_by_rex = order_by_rex
+                    .into_iter()
+                    .map(|sort_expr| {
+                        Ok(sort_expr.with_expr(rebase_expr(
+                            &sort_expr.expr,
+                            &window_level,
+                            &plan,
+                        )?))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                on_exprs_post_aggr = on_exprs_post_aggr
+                    .iter()
+                    .map(|expr| rebase_expr(expr, &window_level, &plan))
+                    .collect::<Result<Vec<_>>>()?;
+            }
             plan
         } else {
             let plan = LogicalPlanBuilder::window_plan(plan, window_func_exprs.clone())?;
@@ -437,37 +573,52 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         // Process QUALIFY clause after window functions
         // QUALIFY filters the results of window functions, similar to how HAVING filters aggregates
         let plan = if let Some(qualify_expr) = qualify_expr_post_aggr {
-            // Validate that QUALIFY is used with window functions in SELECT or QUALIFY
-            let qualify_window_func_exprs = find_window_exprs(
-                select_exprs_post_aggr
-                    .iter()
-                    .chain(std::iter::once(&qualify_expr)),
-            );
-            if qualify_window_func_exprs.is_empty() {
-                return plan_err!(
-                    "QUALIFY clause requires window functions in the SELECT list or QUALIFY clause"
+            if plan_nested_windows {
+                if !qualify_had_window_functions {
+                    return plan_err!(
+                        "QUALIFY clause requires window functions in the SELECT list or QUALIFY clause"
+                    );
+                }
+                self.validate_schema_satisfies_exprs(
+                    plan.schema(),
+                    std::slice::from_ref(&qualify_expr),
+                )?;
+                LogicalPlanBuilder::from(plan)
+                    .filter(qualify_expr)?
+                    .build()?
+            } else {
+                // Validate that QUALIFY is used with window functions in SELECT or QUALIFY
+                let qualify_window_func_exprs = find_window_exprs(
+                    select_exprs_post_aggr
+                        .iter()
+                        .chain(std::iter::once(&qualify_expr)),
                 );
+                if qualify_window_func_exprs.is_empty() {
+                    return plan_err!(
+                        "QUALIFY clause requires window functions in the SELECT list or QUALIFY clause"
+                    );
+                }
+
+                // now attempt to resolve columns and replace with fully-qualified columns
+                let windows_projection_exprs = window_func_exprs
+                    .iter()
+                    .map(|expr| resolve_columns(expr, &plan))
+                    .collect::<Result<Vec<Expr>>>()?;
+
+                // Rewrite the qualify expression to reference columns from the window plan
+                let qualify_expr_post_window =
+                    rebase_expr(&qualify_expr, &windows_projection_exprs, &plan)?;
+
+                // Validate that the qualify expression can be resolved from the window plan schema
+                self.validate_schema_satisfies_exprs(
+                    plan.schema(),
+                    std::slice::from_ref(&qualify_expr_post_window),
+                )?;
+
+                LogicalPlanBuilder::from(plan)
+                    .filter(qualify_expr_post_window)?
+                    .build()?
             }
-
-            // now attempt to resolve columns and replace with fully-qualified columns
-            let windows_projection_exprs = window_func_exprs
-                .iter()
-                .map(|expr| resolve_columns(expr, &plan))
-                .collect::<Result<Vec<Expr>>>()?;
-
-            // Rewrite the qualify expression to reference columns from the window plan
-            let qualify_expr_post_window =
-                rebase_expr(&qualify_expr, &windows_projection_exprs, &plan)?;
-
-            // Validate that the qualify expression can be resolved from the window plan schema
-            self.validate_schema_satisfies_exprs(
-                plan.schema(),
-                std::slice::from_ref(&qualify_expr_post_window),
-            )?;
-
-            LogicalPlanBuilder::from(plan)
-                .filter(qualify_expr_post_window)?
-                .build()?
         } else {
             plan
         };
