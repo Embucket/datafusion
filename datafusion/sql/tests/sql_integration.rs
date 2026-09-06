@@ -2035,17 +2035,15 @@ fn select_nested_window_function_snowflake() {
     let mut config_options = datafusion_common::config::ConfigOptions::new();
     config_options.sql_parser.dialect = datafusion_common::config::Dialect::Snowflake;
 
-    let plan = logical_plan_with_config(
+    let err = logical_plan_with_config(
         "SELECT sum(sum(age) OVER ()) OVER () FROM person",
         config_options,
     )
-    .unwrap();
-    assert_snapshot!(plan, @r"
-    Projection: sum(sum(person.age) ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
-      WindowAggr: windowExpr=[[sum(sum(person.age) ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING]]
-        WindowAggr: windowExpr=[[sum(person.age) ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING]]
-          TableScan: person
-    ");
+    .expect_err("Snowflake rejects nested window function calls");
+    assert_snapshot!(
+        err.strip_backtrace(),
+        @"Error during planning: Window function calls cannot be nested: 'sum(person.age) ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING' is nested inside 'sum(sum(person.age) ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING'"
+    );
 }
 
 #[test]
