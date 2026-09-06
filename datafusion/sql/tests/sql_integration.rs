@@ -29,6 +29,7 @@ use common::MockContextProvider;
 use datafusion_common::{
     DFSchema, DataFusionError, Result, ScalarValue, assert_contains,
 };
+use datafusion_expr::expr_fn::create_udwf;
 use datafusion_expr::{
     ColumnarValue, CreateIndex, DdlStatement, Expr, HigherOrderFunctionArgs,
     HigherOrderReturnFieldArgs, HigherOrderSignature, HigherOrderUDF, HigherOrderUDFImpl,
@@ -58,7 +59,9 @@ use datafusion_functions_aggregate::{
     min_max::{max_udaf, min_udaf},
 };
 use datafusion_functions_nested::make_array::make_array_udf;
-use datafusion_functions_window::{rank::rank_udwf, row_number::row_number_udwf};
+use datafusion_functions_window::{
+    lead_lag::lag_udwf, rank::rank_udwf, row_number::row_number_udwf,
+};
 use insta::{allow_duplicates, assert_snapshot};
 use rstest::rstest;
 use sqlparser::dialect::{
@@ -2044,6 +2047,33 @@ fn select_nested_window_function_snowflake() {
         err.strip_backtrace(),
         @"Error during planning: Window function calls cannot be nested: 'sum(person.age) ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING' is nested inside 'sum(sum(person.age) ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING'"
     );
+}
+
+#[test]
+fn select_conditional_event_with_nested_lag_snowflake() {
+    let plan = snowflake_conditional_event_plan(
+        "SELECT conditional_true_event(\
+             lag(age) OVER (PARTITION BY state ORDER BY age) > 1\
+         ) OVER (PARTITION BY state ORDER BY age) FROM person",
+    )
+    .unwrap();
+    let formatted = plan.display_indent().to_string();
+
+    assert_eq!(formatted.matches("WindowAggr:").count(), 2);
+    assert_contains!(&formatted, "conditional_true_event");
+    assert_contains!(&formatted, "lag(person.age");
+}
+
+#[test]
+fn select_conditional_event_rejects_mismatched_nested_lag_window() {
+    let err = snowflake_conditional_event_plan(
+        "SELECT conditional_true_event(\
+             lag(age) OVER (PARTITION BY state ORDER BY age) > 1\
+         ) OVER (PARTITION BY age ORDER BY age) FROM person",
+    )
+    .expect_err("mismatched nested window specifications should fail");
+
+    assert_contains!(err.to_string(), "Window function calls cannot be nested");
 }
 
 #[test]
@@ -4097,6 +4127,23 @@ fn logical_plan_with_config_and_options(
     state.config_options = config_options;
 
     logical_plan_from_state(sql, dialect, options, state)
+}
+
+fn snowflake_conditional_event_plan(sql: &str) -> Result<LogicalPlan> {
+    let conditional_true_event = create_udwf(
+        "conditional_true_event",
+        DataType::Boolean,
+        Arc::new(DataType::Int64),
+        Volatility::Immutable,
+        Arc::new(|| unreachable!("planning tests do not execute the window function")),
+    );
+    let mut state = mock_session_state()
+        .with_window_function(lag_udwf())
+        .with_window_function(Arc::new(conditional_true_event));
+    state.config_options.sql_parser.dialect =
+        datafusion_common::config::Dialect::Snowflake;
+
+    logical_plan_from_state(sql, &GenericDialect {}, ParserOptions::default(), state)
 }
 
 fn mock_session_state() -> MockSessionState {
