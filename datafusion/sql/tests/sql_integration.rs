@@ -5218,7 +5218,7 @@ fn test_select_qualify_without_window_function() {
     let err = logical_plan(sql).unwrap_err();
     assert_eq!(
         err.strip_backtrace(),
-        "Error during planning: QUALIFY clause requires window functions in the SELECT list or QUALIFY clause"
+        "Error during planning: found QUALIFY clause but no window function."
     );
 }
 
@@ -5228,7 +5228,7 @@ fn test_select_qualify_without_window_function_but_window_in_order_by() {
     let err = logical_plan(sql).unwrap_err();
     assert_eq!(
         err.strip_backtrace(),
-        "Error during planning: QUALIFY clause requires window functions in the SELECT list or QUALIFY clause"
+        "Error during planning: found QUALIFY clause but no window function."
     );
 }
 

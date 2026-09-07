@@ -575,9 +575,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         let plan = if let Some(qualify_expr) = qualify_expr_post_aggr {
             if plan_nested_windows {
                 if !qualify_had_window_functions {
-                    return plan_err!(
-                        "QUALIFY clause requires window functions in the SELECT list or QUALIFY clause"
-                    );
+                    return plan_err!("found QUALIFY clause but no window function.");
                 }
                 self.validate_schema_satisfies_exprs(
                     plan.schema(),
@@ -594,9 +592,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                         .chain(std::iter::once(&qualify_expr)),
                 );
                 if qualify_window_func_exprs.is_empty() {
-                    return plan_err!(
-                        "QUALIFY clause requires window functions in the SELECT list or QUALIFY clause"
-                    );
+                    return plan_err!("found QUALIFY clause but no window function.");
                 }
 
                 // now attempt to resolve columns and replace with fully-qualified columns
