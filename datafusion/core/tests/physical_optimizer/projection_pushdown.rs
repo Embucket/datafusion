@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::compute::SortOptions;
@@ -526,6 +527,38 @@ fn test_memory_after_projection() -> Result<()> {
         vec![3, 4, 0]
     );
 
+    Ok(())
+}
+
+#[test]
+fn test_memory_projection_preserves_field_metadata() -> Result<()> {
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "value",
+        DataType::Int32,
+        true,
+    )]));
+    let memory = MemorySourceConfig::try_new_exec(&[], Arc::clone(&schema), None)?;
+    let projected_schema = Schema::new(vec![
+        Field::new("value", DataType::Int32, true).with_metadata(HashMap::from([(
+            "semantic_type".to_string(),
+            "example".to_string(),
+        )])),
+    ]);
+    let projection: Arc<dyn ExecutionPlan> =
+        Arc::new(ProjectionExec::try_new_with_schema_metadata(
+            vec![ProjectionExpr::new(
+                Arc::new(Column::new("value", 0)),
+                "value",
+            )],
+            memory,
+            &projected_schema,
+        )?);
+
+    let optimized =
+        ProjectionPushdown::new().optimize(projection, &ConfigOptions::new())?;
+
+    assert!(optimized.is::<ProjectionExec>());
+    assert_eq!(optimized.schema().as_ref(), &projected_schema);
     Ok(())
 }
 

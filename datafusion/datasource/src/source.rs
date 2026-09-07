@@ -531,7 +531,13 @@ impl ExecutionPlan for DataSourceExec {
             .try_swapping_with_projection(projection.projection_expr())?
         {
             Some(new_data_source) => {
-                Ok(Some(Arc::new(DataSourceExec::new(new_data_source))))
+                let new_exec = Arc::new(DataSourceExec::new(new_data_source));
+                // The data source API does not receive the projection's output metadata.
+                if projection.schema() == new_exec.schema() {
+                    Ok(Some(new_exec))
+                } else {
+                    Ok(None)
+                }
             }
             None => Ok(None),
         }
