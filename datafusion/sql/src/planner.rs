@@ -881,6 +881,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
             | SQLDataType::Map(_, _)
             | SQLDataType::Tuple(_)
             | SQLDataType::Nested(_)
+            | SQLDataType::Object(_)
             | SQLDataType::Union(_)
             | SQLDataType::Nullable(_)
             | SQLDataType::LowCardinality(_)
