@@ -19,7 +19,7 @@
 
 use crate::utils::{get_scalar_value_from_args, get_signed_integer};
 use arrow::array::UInt64Builder;
-use arrow::compute::{interleave, take};
+use arrow::compute::{cast, interleave, take};
 use arrow::datatypes::FieldRef;
 use datafusion_common::arrow::array::ArrayRef;
 use datafusion_common::arrow::datatypes::DataType;
@@ -252,9 +252,16 @@ impl WindowUDFImpl for WindowShift {
     ///
     /// For more details see: <https://github.com/apache/datafusion/issues/12717>
     fn expressions(&self, expr_args: ExpressionArgs) -> Vec<Arc<dyn PhysicalExpr>> {
-        parse_expr(expr_args.input_exprs(), expr_args.input_fields())
-            .into_iter()
-            .collect::<Vec<_>>()
+        let mut expressions =
+            parse_expr(expr_args.input_exprs(), expr_args.input_fields())
+                .into_iter()
+                .collect::<Vec<_>>();
+        if let Some(default) = expr_args.input_exprs().get(2)
+            && default.downcast_ref::<expressions::Literal>().is_none()
+        {
+            expressions.push(Arc::clone(default));
+        }
+        expressions
     }
 
     fn partition_evaluator(
@@ -357,11 +364,9 @@ fn parse_expr(
         return Ok(expr);
     }
 
-    let default_value = get_scalar_value_from_args(input_exprs, 2)?;
-    default_value.map_or(Ok(expr), |value| {
-        ScalarValue::try_from(&value.data_type())
-            .map(|v| Arc::new(expressions::Literal::new(v)) as Arc<dyn PhysicalExpr>)
-    })
+    let default_type = input_fields.get(2).unwrap_or(&NULL_FIELD).data_type();
+    ScalarValue::try_from(default_type)
+        .map(|value| Arc::new(expressions::Literal::new(value)) as Arc<dyn PhysicalExpr>)
 }
 
 static NULL_FIELD: LazyLock<FieldRef> =
@@ -393,20 +398,46 @@ fn parse_expr_field(input_fields: &[FieldRef]) -> Result<FieldRef> {
 fn parse_default_value(
     input_exprs: &[Arc<dyn PhysicalExpr>],
     input_types: &[FieldRef],
-) -> Result<ScalarValue> {
+) -> Result<WindowShiftDefault> {
     let expr_field = parse_expr_field(input_types)?;
-    let unparsed = get_scalar_value_from_args(input_exprs, 2)?;
+    let Some(default_expr) = input_exprs.get(2) else {
+        return ScalarValue::try_from(expr_field.data_type())
+            .map(WindowShiftDefault::Scalar);
+    };
+    let Some(default_literal) = default_expr.downcast_ref::<expressions::Literal>()
+    else {
+        return Ok(WindowShiftDefault::Dynamic(expr_field.data_type().clone()));
+    };
+    let value = default_literal.value();
+    let value = if value.data_type().is_null() {
+        ScalarValue::try_from(expr_field.data_type())?
+    } else {
+        value.cast_to(expr_field.data_type())?
+    };
+    Ok(WindowShiftDefault::Scalar(value))
+}
 
-    unparsed
-        .filter(|v| !v.data_type().is_null())
-        .map(|v| v.cast_to(expr_field.data_type()))
-        .unwrap_or_else(|| ScalarValue::try_from(expr_field.data_type()))
+#[derive(Debug)]
+enum WindowShiftDefault {
+    Scalar(ScalarValue),
+    Dynamic(DataType),
+}
+
+impl WindowShiftDefault {
+    fn value_at(&self, values: &[ArrayRef], index: usize) -> Result<ScalarValue> {
+        match self {
+            Self::Scalar(value) => Ok(value.clone()),
+            Self::Dynamic(data_type) => {
+                ScalarValue::try_from_array(&values[1], index)?.cast_to(data_type)
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
 struct WindowShiftEvaluator {
     shift_offset: i64,
-    default_value: ScalarValue,
+    default_value: WindowShiftDefault,
     ignore_nulls: bool,
     // VecDeque contains offset values that between non-null entries
     non_null_offsets: VecDeque<usize>,
@@ -712,7 +743,12 @@ impl PartitionEvaluator for WindowShiftEvaluator {
         if !(idx.is_none() || (self.ignore_nulls && array.is_null(idx.unwrap()))) {
             ScalarValue::try_from_array(array, idx.unwrap())
         } else {
-            Ok(self.default_value.clone())
+            let current_row = if self.is_lag() {
+                range.end - 1
+            } else {
+                range.start
+            };
+            self.default_value.value_at(values, current_row)
         }
     }
 
@@ -723,21 +759,81 @@ impl PartitionEvaluator for WindowShiftEvaluator {
     ) -> Result<ArrayRef> {
         // LEAD, LAG window functions take single column, values will have size 1
         let value = &values[0];
-        if !self.ignore_nulls {
-            shift_with_default_value(value, self.shift_offset, &self.default_value)
-        } else {
-            evaluate_all_with_ignore_null(
+        match &self.default_value {
+            WindowShiftDefault::Scalar(default_value) if !self.ignore_nulls => {
+                shift_with_default_value(value, self.shift_offset, default_value)
+            }
+            WindowShiftDefault::Scalar(default_value) => evaluate_all_with_ignore_null(
                 value,
                 self.shift_offset,
-                &self.default_value,
+                default_value,
                 self.is_lag(),
-            )
+            ),
+            WindowShiftDefault::Dynamic(data_type) => evaluate_all_with_dynamic_default(
+                value,
+                &values[1],
+                self.shift_offset,
+                self.ignore_nulls,
+                data_type,
+            ),
         }
     }
 
     fn supports_bounded_execution(&self) -> bool {
         true
     }
+}
+
+fn evaluate_all_with_dynamic_default(
+    value: &ArrayRef,
+    default: &ArrayRef,
+    offset: i64,
+    ignore_nulls: bool,
+    data_type: &DataType,
+) -> Result<ArrayRef> {
+    if offset == 0 {
+        return Ok(Arc::clone(value));
+    }
+
+    let default = if default.data_type() == data_type {
+        Arc::clone(default)
+    } else {
+        cast(default, data_type).map_err(|error| arrow_datafusion_err!(error))?
+    };
+    let shift = offset_magnitude(offset);
+    let non_null_indices = ignore_nulls.then(|| {
+        (0..value.len())
+            .filter(|index| value.is_valid(*index))
+            .collect::<Vec<_>>()
+    });
+    let mut indices = Vec::with_capacity(value.len());
+
+    for current in 0..value.len() {
+        let shifted = if let Some(non_null_indices) = &non_null_indices {
+            if offset > 0 {
+                let position = non_null_indices.partition_point(|index| *index < current);
+                position
+                    .checked_sub(shift)
+                    .map(|position| non_null_indices[position])
+            } else {
+                let position =
+                    non_null_indices.partition_point(|index| *index <= current);
+                position
+                    .checked_add(shift.saturating_sub(1))
+                    .filter(|position| *position < non_null_indices.len())
+                    .map(|position| non_null_indices[position])
+            }
+        } else {
+            (current as i64)
+                .checked_sub(offset)
+                .and_then(|index| usize::try_from(index).ok())
+                .filter(|index| *index < value.len())
+        };
+        indices.push(shifted.map_or((1, current), |index| (0, index)));
+    }
+
+    interleave(&[value.as_ref(), default.as_ref()], &indices)
+        .map_err(|error| arrow_datafusion_err!(error))
 }
 
 #[cfg(test)]
@@ -769,7 +865,7 @@ mod tests {
         // LAG(2)
         let lag_fn = WindowShiftEvaluator {
             shift_offset: 2,
-            default_value: ScalarValue::Null,
+            default_value: WindowShiftDefault::Scalar(ScalarValue::Null),
             ignore_nulls: false,
             non_null_offsets: Default::default(),
         };
@@ -779,7 +875,7 @@ mod tests {
         // LAG(2 ignore nulls)
         let lag_fn = WindowShiftEvaluator {
             shift_offset: 2,
-            default_value: ScalarValue::Null,
+            default_value: WindowShiftDefault::Scalar(ScalarValue::Null),
             ignore_nulls: true,
             // models data received [<Some>, <Some>, <Some>, NULL, <Some>, NULL, <current row>, ...]
             non_null_offsets: vec![2, 2].into(), // [1, 1, 2, 2] actually, just last 2 is used
@@ -789,7 +885,7 @@ mod tests {
         // LEAD(2)
         let lead_fn = WindowShiftEvaluator {
             shift_offset: -2,
-            default_value: ScalarValue::Null,
+            default_value: WindowShiftDefault::Scalar(ScalarValue::Null),
             ignore_nulls: false,
             non_null_offsets: Default::default(),
         };
@@ -799,7 +895,7 @@ mod tests {
         // LEAD(2 ignore nulls)
         let lead_fn = WindowShiftEvaluator {
             shift_offset: -2,
-            default_value: ScalarValue::Null,
+            default_value: WindowShiftDefault::Scalar(ScalarValue::Null),
             ignore_nulls: true,
             // models data received [..., <current row>, NULL, <Some>, NULL, <Some>, ..]
             non_null_offsets: vec![2, 2].into(),
@@ -894,6 +990,69 @@ mod tests {
             .iter()
             .collect::<Int32Array>(),
         )
+    }
+
+    #[test]
+    fn test_lead_lag_with_expression_default() -> Result<()> {
+        let expr = Arc::new(Column::new("value", 0)) as Arc<dyn PhysicalExpr>;
+        let shift_offset =
+            Arc::new(Literal::new(ScalarValue::Int32(Some(1)))) as Arc<dyn PhysicalExpr>;
+        let default = Arc::new(Column::new("default", 1)) as Arc<dyn PhysicalExpr>;
+        let input_exprs = [expr, shift_offset, default];
+        let input_fields = [DataType::Int32, DataType::Int32, DataType::Int32]
+            .into_iter()
+            .map(|data_type| Field::new("f", data_type, true).into())
+            .collect::<Vec<_>>();
+        let values = vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef,
+            Arc::new(Int32Array::from(vec![10, 20, 30])) as ArrayRef,
+        ];
+
+        for (function, expected) in [
+            (
+                WindowShift::lag(),
+                Int32Array::from(vec![Some(10), Some(1), Some(2)]),
+            ),
+            (
+                WindowShift::lead(),
+                Int32Array::from(vec![Some(2), Some(3), Some(30)]),
+            ),
+        ] {
+            let expression_args = ExpressionArgs::new(&input_exprs, &input_fields);
+            assert_eq!(function.expressions(expression_args).len(), 2);
+            let actual = function
+                .partition_evaluator(PartitionEvaluatorArgs::new(
+                    &input_exprs,
+                    &input_fields,
+                    false,
+                    false,
+                ))?
+                .evaluate_all(&values, values[0].len())?;
+            assert_eq!(expected, *as_int32_array(&actual)?);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_ignore_nulls_with_expression_default() -> Result<()> {
+        let value =
+            Arc::new(Int32Array::from(vec![Some(1), None, Some(3), None])) as ArrayRef;
+        let default = Arc::new(Int32Array::from(vec![10, 20, 30, 40])) as ArrayRef;
+
+        for (offset, expected) in [
+            (2, Int32Array::from(vec![10, 20, 30, 1])),
+            (-2, Int32Array::from(vec![10, 20, 30, 40])),
+        ] {
+            let actual = evaluate_all_with_dynamic_default(
+                &value,
+                &default,
+                offset,
+                true,
+                &DataType::Int32,
+            )?;
+            assert_eq!(expected, *as_int32_array(&actual)?);
+        }
+        Ok(())
     }
 
     #[test]

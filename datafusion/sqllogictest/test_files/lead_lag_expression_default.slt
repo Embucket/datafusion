@@ -1,0 +1,24 @@
+# lead/lag defaults are evaluated for the current row and do not need to be literals.
+
+query III
+SELECT column1,
+       lag(column2, 1, column1 * 10) OVER (ORDER BY column1),
+       lead(column2, 1, column1 * 10) OVER (ORDER BY column1)
+FROM (VALUES (1, 10), (2, 20), (3, 30))
+ORDER BY column1;
+----
+1 10 20
+2 10 30
+3 20 30
+
+query III
+SELECT column1,
+       lag(column2, 2, column1 * 10) IGNORE NULLS OVER (ORDER BY column1),
+       lead(column2, 2, column1 * 10) IGNORE NULLS OVER (ORDER BY column1)
+FROM (VALUES (1, 10), (2, NULL), (3, 30), (4, NULL))
+ORDER BY column1;
+----
+1 10 10
+2 20 20
+3 30 30
+4 10 40
