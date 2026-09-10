@@ -80,6 +80,10 @@ name = "array_min_max"
 
 [[bench]]
 harness = false
+name = "array_reduce"
+
+[[bench]]
+harness = false
 name = "arrays_zip"
 
 [[bench]]
