@@ -374,10 +374,9 @@ impl ScanState {
                 continue;
             }
 
-            // Nothing queued for the next file: claim it.
-            let Some(part_file) = self.work_source.pop_front() else {
-                return None;
-            };
+            // Nothing queued for the next file: claim it (`None` once the
+            // work source is drained: keep serving the active reader).
+            let part_file = self.work_source.pop_front()?;
             match self.morselizer.plan_file(part_file) {
                 Ok(planner) => {
                     self.metrics.files_opened.add(1);
