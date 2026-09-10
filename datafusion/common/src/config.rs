@@ -1039,6 +1039,16 @@ config_namespace! {
         /// runtime reassignment occurs.
         pub enable_file_stream_work_stealing: bool, default = true
 
+        /// When `true`, each file-scan partition starts opening its next file
+        /// (footer, page index and bloom filter I/O) while the current file is
+        /// still being scanned, keeping at most one file in flight ahead of
+        /// the active reader. This overlaps per-file open latency with data
+        /// reads, which matters for scans over many files on high-latency
+        /// object stores. The cost is holding one extra file's metadata per
+        /// partition. When `false` (the default) a partition opens the next
+        /// file only after the current one is fully consumed.
+        pub file_stream_open_ahead: bool, default = false
+
         /// Aggregation ratio (number of distinct groups / number of input rows)
         /// threshold for skipping partial aggregation. If the value is greater
         /// then partial aggregation will skip aggregation for further input

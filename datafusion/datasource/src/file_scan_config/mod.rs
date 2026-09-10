@@ -720,11 +720,18 @@ impl DataSource for FileScanConfig {
             .and_then(|state| state.downcast_ref::<SharedWorkSource>())
             .cloned();
 
+        let open_ahead = context
+            .session_config()
+            .options()
+            .execution
+            .file_stream_open_ahead;
+
         let stream = FileStreamBuilder::new(self)
             .with_partition(partition)
             .with_shared_work_source(shared_work_source)
             .with_morselizer(morselizer)
             .with_metrics(source.metrics())
+            .with_open_ahead(open_ahead)
             .build()?;
         Ok(Box::pin(cooperative(stream)))
     }

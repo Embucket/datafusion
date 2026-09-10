@@ -35,6 +35,7 @@ pub struct FileStreamBuilder<'a> {
     metrics: Option<&'a ExecutionPlanMetricsSet>,
     on_error: OnError,
     shared_work_source: Option<SharedWorkSource>,
+    open_ahead: bool,
 }
 
 impl<'a> FileStreamBuilder<'a> {
@@ -47,6 +48,7 @@ impl<'a> FileStreamBuilder<'a> {
             metrics: None,
             on_error: OnError::Fail,
             shared_work_source: None,
+            open_ahead: false,
         }
     }
 
@@ -93,6 +95,14 @@ impl<'a> FileStreamBuilder<'a> {
         self
     }
 
+    /// Configure whether the stream opens its next file while the current
+    /// file is still being scanned (see
+    /// `datafusion.execution.file_stream_open_ahead`).
+    pub fn with_open_ahead(mut self, open_ahead: bool) -> Self {
+        self.open_ahead = open_ahead;
+        self
+    }
+
     /// Build the configured [`FileStream`].
     pub fn build(self) -> Result<FileStream> {
         let Self {
@@ -102,6 +112,7 @@ impl<'a> FileStreamBuilder<'a> {
             metrics,
             on_error,
             shared_work_source,
+            open_ahead,
         } = self;
 
         let Some(partition) = partition else {
@@ -130,6 +141,7 @@ impl<'a> FileStreamBuilder<'a> {
             config.limit,
             morselizer,
             on_error,
+            open_ahead,
             file_stream_metrics,
         ));
 
