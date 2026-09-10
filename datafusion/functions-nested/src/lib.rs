@@ -49,6 +49,7 @@ pub mod array_first;
 pub mod array_has;
 pub mod array_normalize;
 pub mod array_product;
+pub mod array_reduce;
 pub mod array_scale;
 pub mod array_subtract;
 pub mod array_sum;
@@ -106,6 +107,7 @@ pub mod expr_fn {
     pub use super::array_has::array_has_any;
     pub use super::array_normalize::array_normalize;
     pub use super::array_product::array_product;
+    pub use super::array_reduce::array_reduce;
     pub use super::array_scale::array_scale;
     pub use super::array_subtract::array_subtract;
     pub use super::array_sum::array_sum;
@@ -225,6 +227,7 @@ pub fn all_default_higher_order_functions() -> Vec<Arc<HigherOrderUDF>> {
         array_any_match::array_any_match_higher_order_function(),
         array_filter::array_filter_higher_order_function(),
         array_first::array_first_higher_order_function(),
+        array_reduce::array_reduce_higher_order_function(),
         array_transform::array_transform_higher_order_function(),
     ]
 }
