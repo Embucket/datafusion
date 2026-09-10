@@ -1,0 +1,98 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+
+#   http://www.apache.org/licenses/LICENSE-2.0
+
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+#############
+## array_reduce Tests
+#############
+
+statement ok
+set datafusion.sql_parser.dialect = databricks;
+
+query I
+SELECT array_reduce([1, 2, 3], 0, (acc, value) -> acc + value);
+----
+6
+
+query I
+SELECT array_reduce([1, 2, 3], 0, (acc, value) -> acc + value * value);
+----
+14
+
+query T
+SELECT array_reduce(['a', 'b', 'c'], '', (acc, value) -> acc || value);
+----
+abc
+
+query I
+SELECT array_reduce([], 10, (acc, value) -> acc + value);
+----
+10
+
+query I
+SELECT array_reduce(NULL, 10, (acc, value) -> acc + value);
+----
+NULL
+
+query I
+SELECT array_reduce([1, 2, 3], NULL::BIGINT, (acc, value) -> acc + value);
+----
+NULL
+
+query I
+SELECT array_reduce([1, NULL, 2], 0, (acc, value) -> acc + value);
+----
+NULL
+
+query I
+SELECT array_reduce([1, NULL, 2], 0, (acc, value) -> acc + coalesce(value, 0));
+----
+3
+
+# A null merge result is terminal and cannot be recovered by a later element.
+query I
+SELECT array_reduce(
+  [1, 2],
+  0,
+  (acc, value) -> CASE WHEN value = 1 THEN NULL ELSE coalesce(acc, 0) + value END
+);
+----
+NULL
+
+query R
+SELECT array_reduce([1.2, 2.3], 0, (acc, value) -> acc + value);
+----
+3.5
+
+statement ok
+CREATE TABLE reduce_t (values ARRAY<BIGINT>, initial BIGINT, extra BIGINT)
+AS VALUES
+([1, 2, 3], 0, 10),
+([4], 5, 20),
+([], 7, 30),
+(NULL, 8, 40);
+
+query I rowsort
+SELECT array_reduce(values, initial, (acc, value) -> acc + value + extra)
+FROM reduce_t;
+----
+29
+36
+7
+NULL
+
+statement ok
+set datafusion.sql_parser.dialect = generic;
