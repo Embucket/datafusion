@@ -763,6 +763,77 @@ mod tests {
         Ok(())
     }
 
+    /// Verifies that with `open_ahead` the next file is morselized and its
+    /// I/O is issued while the previous file's morsel is still producing
+    /// batches, so per-file open latency overlaps with reading.
+    #[tokio::test]
+    async fn morsel_open_ahead_overlaps_next_file_io() -> Result<()> {
+        let test = FileStreamMorselTest::new()
+            .with_open_ahead(true)
+            .with_file(
+                MockPlanner::builder("file1.parquet")
+                    .add_plan(
+                        PendingPlannerBuilder::new(IoFutureId(1))
+                            .with_polls_to_resolve(PollsToResolve(1)),
+                    )
+                    .add_plan(
+                        MockPlanBuilder::new()
+                            .with_morsel_batches(MorselId(10), vec![42, 43]),
+                    )
+                    .return_none(),
+            )
+            .with_file(
+                MockPlanner::builder("file2.parquet")
+                    .add_plan(
+                        PendingPlannerBuilder::new(IoFutureId(2))
+                            .with_polls_to_resolve(PollsToResolve(1)),
+                    )
+                    .add_plan(
+                        MockPlanBuilder::new()
+                            .with_morsel_batches(MorselId(20), vec![44]),
+                    )
+                    .return_none(),
+            );
+
+        // file2 is morselized and its I/O issued while morsel 10 is still
+        // producing batches; the I/O resolves before morsel 10 finishes.
+        insta::assert_snapshot!(test.run().await.unwrap(), @r"
+        ----- Output Stream -----
+        Batch: 42
+        Batch: 43
+        Batch: 44
+        Done
+        ----- File Stream Events -----
+        morselize_file: file1.parquet
+        planner_created: file1.parquet
+        planner_called: file1.parquet
+        io_future_created: file1.parquet, IoFutureId(1)
+        io_future_polled: file1.parquet, IoFutureId(1)
+        io_future_polled: file1.parquet, IoFutureId(1)
+        io_future_resolved: file1.parquet, IoFutureId(1)
+        planner_called: file1.parquet
+        morsel_produced: file1.parquet, MorselId(10)
+        morsel_stream_started: MorselId(10)
+        morselize_file: file2.parquet
+        planner_created: file2.parquet
+        planner_called: file2.parquet
+        io_future_created: file2.parquet, IoFutureId(2)
+        morsel_stream_batch_produced: MorselId(10), BatchId(42)
+        io_future_polled: file2.parquet, IoFutureId(2)
+        morsel_stream_batch_produced: MorselId(10), BatchId(43)
+        io_future_polled: file2.parquet, IoFutureId(2)
+        io_future_resolved: file2.parquet, IoFutureId(2)
+        planner_called: file2.parquet
+        morsel_produced: file2.parquet, MorselId(20)
+        morsel_stream_finished: MorselId(10)
+        morsel_stream_started: MorselId(20)
+        morsel_stream_batch_produced: MorselId(20), BatchId(44)
+        morsel_stream_finished: MorselId(20)
+        ");
+
+        Ok(())
+    }
+
     /// Verifies that a planner can traverse two sequential I/O phases before
     /// producing one batch, similar to Parquet.
     #[tokio::test]
@@ -1368,6 +1439,7 @@ mod tests {
         preserve_order: bool,
         declared_output_partitioning: bool,
         enable_file_stream_work_stealing: bool,
+        open_ahead: bool,
         file_stream_events: bool,
         build_streams_on_first_read: bool,
         reads: Vec<PartitionId>,
@@ -1383,6 +1455,7 @@ mod tests {
                 preserve_order: false,
                 declared_output_partitioning: false,
                 enable_file_stream_work_stealing: true,
+                open_ahead: false,
                 file_stream_events: true,
                 build_streams_on_first_read: false,
                 reads: vec![],
@@ -1433,6 +1506,14 @@ mod tests {
         /// work queue with its siblings.
         fn with_enable_file_stream_work_stealing(mut self, enable: bool) -> Self {
             self.enable_file_stream_work_stealing = enable;
+            self
+        }
+
+        /// Sets `datafusion.execution.file_stream_open_ahead`: when enabled,
+        /// each stream starts planning its next file while the active reader
+        /// is still producing batches.
+        fn with_open_ahead(mut self, open_ahead: bool) -> Self {
+            self.open_ahead = open_ahead;
             self
         }
 
@@ -1527,6 +1608,7 @@ mod tests {
                         .with_shared_work_source(shared_work_source.clone())
                         .with_morselizer(Box::new(self.morselizer.clone()))
                         .with_metrics(&metrics_set)
+                        .with_open_ahead(self.open_ahead)
                         .build()?;
                     partitions[partition].set_stream(stream);
                 }
@@ -1554,6 +1636,7 @@ mod tests {
                         .with_shared_work_source(shared_work_source.clone())
                         .with_morselizer(Box::new(self.morselizer.clone()))
                         .with_metrics(&metrics_set)
+                        .with_open_ahead(self.open_ahead)
                         .build()?;
                     partition_state.set_stream(stream);
                 }

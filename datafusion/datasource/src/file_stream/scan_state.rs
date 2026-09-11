@@ -81,6 +81,9 @@ pub(super) struct ScanState {
     /// Once the I/O completes, yields the next planner and is pushed back
     /// onto `ready_planners`.
     pending_planner: Option<PendingMorselPlanner>,
+    /// Whether to start opening the next file while the active reader is
+    /// still producing batches. See [`Self::advance_open_ahead`].
+    open_ahead: bool,
     /// Metrics for the active scan queues.
     metrics: FileStreamMetrics,
 }
@@ -91,6 +94,7 @@ impl ScanState {
         remain: Option<usize>,
         morselizer: Box<dyn Morselizer>,
         on_error: OnError,
+        open_ahead: bool,
         metrics: FileStreamMetrics,
     ) -> Self {
         Self {
@@ -102,6 +106,7 @@ impl ScanState {
             ready_morsels: Default::default(),
             reader: None,
             pending_planner: None,
+            open_ahead,
             metrics,
         }
     }
@@ -115,16 +120,20 @@ impl ScanState {
     ///
     /// Work is attempted in this order:
     /// 1. resolve any pending planner I/O
-    /// 2. poll the active reader
-    /// 3. turn a ready morsel into the active reader
-    /// 4. run CPU planning on a ready planner
-    /// 5. morselize the next unopened file
+    /// 2. with `open_ahead`, start planning the next file behind the active
+    ///    reader (see [`Self::advance_open_ahead`])
+    /// 3. poll the active reader
+    /// 4. turn a ready morsel into the active reader
+    /// 5. run CPU planning on a ready planner
+    /// 6. morselize the next unopened file
     ///
     /// The return [`ScanAndReturn`] tells `poll_inner` how to update the
     /// outer `FileStreamState`.
     pub(super) fn poll_scan(&mut self, cx: &mut Context<'_>) -> ScanAndReturn {
-        let _processing_timer: ScopedTimerGuard<'_> =
-            self.metrics.time_processing.timer();
+        // Guard a clone of the shared timer so the borrow does not pin
+        // `self.metrics` for the whole poll (the look-ahead needs `&mut self`).
+        let time_processing = self.metrics.time_processing.clone();
+        let _processing_timer: ScopedTimerGuard<'_> = time_processing.timer();
 
         // Try and resolve outstanding IO first. If it is still pending, check
         // the current reader or ready morsels before yielding. New planning
@@ -152,6 +161,16 @@ impl ScanState {
                     };
                 }
             }
+        }
+
+        // With open-ahead enabled, use the time the active reader is busy to
+        // get the next file's planning (and its single outstanding I/O)
+        // under way, so per-file open latency overlaps with data reads.
+        if self.open_ahead
+            && self.reader.is_some()
+            && let Some(ret) = self.advance_open_ahead()
+        {
+            return ret;
         }
 
         // Next try and get the next batch from the active reader, if any.
@@ -225,6 +244,12 @@ impl ScanState {
         // still outstanding because they may need additional IO and ScanState
         // currently only permits a single outstanding IO
         if self.pending_planner.is_some() {
+            if self.open_ahead {
+                // The next file was claimed while a reader was active without
+                // starting the opening timer; only the wait that is actually
+                // exposed (no reader to drain) counts as opening time.
+                self.metrics.time_opening.start_if_stopped();
+            }
             return ScanAndReturn::Return(Poll::Pending);
         }
 
@@ -287,6 +312,86 @@ impl ScanState {
                 }
                 OnError::Fail => ScanAndReturn::Error(err),
             },
+        }
+    }
+}
+
+impl ScanState {
+    /// Drives planning of the *next* file while a reader is active, keeping at
+    /// most one file in flight ahead of it.
+    ///
+    /// Claims the next unopened file once nothing else is queued and runs its
+    /// CPU planning until it either yields a ready morsel or blocks on I/O.
+    /// The single-outstanding-I/O rule still holds: the pending planner is
+    /// polled by [`Self::poll_scan`] before the reader on every iteration, so
+    /// the file's open latency overlaps with the reader's data reads instead
+    /// of following them.
+    ///
+    /// The opening timer is deliberately not started here: time spent opening
+    /// a file behind an active reader is not exposed to the query. It is
+    /// started by `poll_scan` only if the stream later has to wait for that
+    /// open with no reader left to drain.
+    ///
+    /// Returns `Some` when the outer loop must return (an error surfaced by
+    /// the look-ahead), `None` to continue with the active reader.
+    fn advance_open_ahead(&mut self) -> Option<ScanAndReturn> {
+        loop {
+            // The next file is already either fully open or waiting on I/O.
+            if self.pending_planner.is_some() || !self.ready_morsels.is_empty() {
+                return None;
+            }
+
+            if let Some(planner) = self.ready_planners.pop_front() {
+                match planner.plan() {
+                    Ok(Some(mut plan)) => {
+                        self.ready_morsels.extend(plan.take_morsels());
+                        self.ready_planners.extend(plan.take_ready_planners());
+                        if let Some(pending_planner) = plan.take_pending_planner() {
+                            if self.pending_planner.is_some() {
+                                return Some(ScanAndReturn::Error(
+                                    internal_datafusion_err!(
+                                        "Conflicting pending planner state in FileStream ScanState"
+                                    ),
+                                ));
+                            }
+                            self.pending_planner = Some(pending_planner);
+                        }
+                    }
+                    // Nothing to read from this file (e.g. pruned late).
+                    Ok(None) => {
+                        self.metrics.files_processed.add(1);
+                    }
+                    Err(err) => {
+                        self.metrics.file_open_errors.add(1);
+                        match self.on_error {
+                            OnError::Skip => {
+                                self.metrics.files_processed.add(1);
+                            }
+                            OnError::Fail => return Some(ScanAndReturn::Error(err)),
+                        }
+                    }
+                }
+                continue;
+            }
+
+            // Nothing queued for the next file: claim it (`None` once the
+            // work source is drained: keep serving the active reader).
+            let part_file = self.work_source.pop_front()?;
+            match self.morselizer.plan_file(part_file) {
+                Ok(planner) => {
+                    self.metrics.files_opened.add(1);
+                    self.ready_planners.push_back(planner);
+                }
+                Err(err) => {
+                    self.metrics.file_open_errors.add(1);
+                    match self.on_error {
+                        OnError::Skip => {
+                            self.metrics.files_processed.add(1);
+                        }
+                        OnError::Fail => return Some(ScanAndReturn::Error(err)),
+                    }
+                }
+            }
         }
     }
 }

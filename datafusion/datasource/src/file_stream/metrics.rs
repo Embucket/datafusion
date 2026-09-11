@@ -33,6 +33,13 @@ impl StartableTime {
         self.start = Some(Instant::now());
     }
 
+    /// Start the timer unless it is already running.
+    pub fn start_if_stopped(&mut self) {
+        if self.start.is_none() {
+            self.start = Some(Instant::now());
+        }
+    }
+
     pub fn stop(&mut self) {
         if let Some(start) = self.start.take() {
             self.metrics.add_elapsed(start);
