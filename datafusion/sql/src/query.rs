@@ -24,12 +24,12 @@ use datafusion_expr::expr::{Sort, WildcardOptions};
 
 use datafusion_expr::select_expr::SelectExpr;
 use datafusion_expr::{
-    CreateMemoryTable, DdlStatement, Distinct, Expr, LogicalPlan, LogicalPlanBuilder,
+    CreateMemoryTable, DdlStatement, Distinct, Expr, LogicalPlan, LogicalPlanBuilder, lit,
 };
 use sqlparser::ast::{
-    Expr as SQLExpr, ExprWithAliasAndOrderBy, Ident, LimitClause, Offset, OffsetRows,
-    OrderBy, OrderByExpr, OrderByKind, PipeOperator, Query, SelectInto, SetExpr,
-    SetOperator, SetQuantifier, TableAlias,
+    Expr as SQLExpr, ExprWithAliasAndOrderBy, Fetch, Ident, LimitClause, Offset,
+    OffsetRows, OrderBy, OrderByExpr, OrderByKind, PipeOperator, Query, SelectInto,
+    SetExpr, SetOperator, SetQuantifier, TableAlias,
 };
 use sqlparser::tokenizer::Span;
 
@@ -58,10 +58,6 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             pipe_operators,
         } = query;
 
-        if fetch.is_some() {
-            return not_impl_err!("FETCH clause is not supported yet");
-        }
-
         if let Some(with) = with {
             self.plan_with_clause(with, planner_context)?;
         }
@@ -72,7 +68,12 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 let select_into = select.into.take();
                 let plan =
                     self.select_to_plan(*select, order_by.clone(), planner_context)?;
-                let plan = self.limit(plan, limit_clause.clone(), planner_context)?;
+                let plan = self.limit(
+                    plan,
+                    limit_clause.clone(),
+                    fetch.clone(),
+                    planner_context,
+                )?;
                 // Process the `SELECT INTO` after `LIMIT`.
                 self.select_into(plan, select_into)
             }
@@ -92,7 +93,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     None,
                 )?;
                 let plan = self.order_by(plan, order_by_rex)?;
-                self.limit(plan, limit_clause, planner_context)
+                self.limit(plan, limit_clause, fetch, planner_context)
             }
         }?;
 
@@ -143,6 +144,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     }),
                     limit_by: vec![],
                 }),
+                None,
                 planner_context,
             ),
             PipeOperator::Select { exprs } => {
@@ -245,20 +247,21 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         &self,
         input: LogicalPlan,
         limit_clause: Option<LimitClause>,
+        fetch_clause: Option<Fetch>,
         planner_context: &mut PlannerContext,
     ) -> Result<LogicalPlan> {
-        let Some(limit_clause) = limit_clause else {
+        if limit_clause.is_none() && fetch_clause.is_none() {
             return Ok(input);
-        };
+        }
 
         let empty_schema = DFSchema::empty();
 
-        let (skip, fetch, limit_by_exprs) = match limit_clause {
-            LimitClause::LimitOffset {
+        let (skip, mut fetch, limit_by_exprs) = match limit_clause {
+            Some(LimitClause::LimitOffset {
                 limit,
                 offset,
                 limit_by,
-            } => {
+            }) => {
                 let skip = offset
                     .map(|o| self.sql_to_expr(o.value, &empty_schema, planner_context))
                     .transpose()?;
@@ -274,14 +277,38 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
 
                 (skip, fetch, limit_by_exprs)
             }
-            LimitClause::OffsetCommaLimit { offset, limit } => {
+            Some(LimitClause::OffsetCommaLimit { offset, limit }) => {
                 let skip =
                     Some(self.sql_to_expr(offset, &empty_schema, planner_context)?);
                 let fetch =
                     Some(self.sql_to_expr(limit, &empty_schema, planner_context)?);
                 (skip, fetch, vec![])
             }
+            None => (None, None, vec![]),
         };
+
+        if let Some(Fetch {
+            with_ties,
+            percent,
+            quantity,
+        }) = fetch_clause
+        {
+            if with_ties {
+                return not_impl_err!("FETCH WITH TIES is not supported yet");
+            }
+            if percent {
+                return not_impl_err!("FETCH PERCENT is not supported yet");
+            }
+            if fetch.is_some() {
+                return not_impl_err!("LIMIT and FETCH cannot be used together");
+            }
+            fetch = Some(match quantity {
+                Some(quantity) => {
+                    self.sql_to_expr(quantity, &empty_schema, planner_context)?
+                }
+                None => lit(1_i64),
+            });
+        }
 
         if !limit_by_exprs.is_empty() {
             return not_impl_err!("LIMIT BY clause is not supported yet");
