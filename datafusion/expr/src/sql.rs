@@ -119,9 +119,21 @@ impl Display for ExceptSelectItem {
 }
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Hash, Debug)]
+pub struct IdentWithAlias {
+    pub ident: Ident,
+    pub alias: Ident,
+}
+
+impl Display for IdentWithAlias {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        write!(f, "{} AS {}", self.ident, self.alias)
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Hash, Debug)]
 pub enum RenameSelectItem {
-    Single(String),
-    Multiple(Vec<String>),
+    Single(IdentWithAlias),
+    Multiple(Vec<IdentWithAlias>),
 }
 
 impl Display for RenameSelectItem {
