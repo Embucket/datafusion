@@ -2723,8 +2723,10 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                         "MERGE UPDATE DELETE WHERE predicates are not supported"
                     );
                 }
-                let assignments = update_expr
-                    .assignments
+                let ast::MergeUpdateKind::Set(assignments) = update_expr.kind else {
+                    return not_impl_err!("MERGE UPDATE ALL BY NAME is not supported");
+                };
+                let assignments = assignments
                     .into_iter()
                     .map(|assign| {
                         let col_name = match &assign.target {
@@ -2801,6 +2803,11 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     }
                     ast::MergeInsertKind::Row => {
                         return not_impl_err!("MERGE INSERT ROW is not supported");
+                    }
+                    ast::MergeInsertKind::AllByName => {
+                        return not_impl_err!(
+                            "MERGE INSERT ALL BY NAME is not supported"
+                        );
                     }
                 };
 
