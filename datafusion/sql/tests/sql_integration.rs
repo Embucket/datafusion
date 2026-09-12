@@ -4997,10 +4997,57 @@ fn test_offset_after_limit() {
 }
 
 #[test]
-fn fetch_clause_is_not_supported() {
-    let sql = "SELECT 1 FETCH NEXT 1 ROW ONLY";
+fn fetch_clause() {
+    let sql = "SELECT id FROM person ORDER BY id OFFSET 3 ROWS FETCH NEXT 5 ROWS ONLY";
+    let plan = logical_plan(sql).unwrap();
+    assert_snapshot!(
+        plan,
+        @r"
+    Limit: skip=3, fetch=5
+      Sort: person.id ASC NULLS LAST
+        Projection: person.id
+          TableScan: person
+    "
+    );
+}
+
+#[test]
+fn fetch_clause_without_quantity_defaults_to_one() {
+    let sql = "SELECT id FROM person FETCH FIRST ROW ONLY";
+    let plan = logical_plan(sql).unwrap();
+    assert_snapshot!(
+        plan,
+        @r"
+    Limit: skip=0, fetch=1
+      Projection: person.id
+        TableScan: person
+    "
+    );
+}
+
+#[test]
+fn fetch_clause_applies_to_set_operation() {
+    let sql = "SELECT 1 AS id UNION ALL SELECT 2 FETCH FIRST 1 ROW ONLY";
+    let plan = logical_plan(sql).unwrap();
+    assert_snapshot!(
+        plan,
+        @r"
+    Limit: skip=0, fetch=1
+      Union
+        Projection: Int64(1) AS id
+          EmptyRelation: rows=1
+        Projection: Int64(2)
+          EmptyRelation: rows=1
+    "
+    );
+}
+
+#[rstest]
+#[case("SELECT 1 FETCH FIRST 10 PERCENT ROWS ONLY", "FETCH PERCENT")]
+#[case("SELECT 1 ORDER BY 1 FETCH FIRST 1 ROW WITH TIES", "FETCH WITH TIES")]
+fn unsupported_fetch_options(#[case] sql: &str, #[case] expected: &str) {
     let err = logical_plan(sql).unwrap_err();
-    assert_contains!(err.to_string(), "FETCH clause is not supported yet");
+    assert_contains!(err.to_string(), expected);
 }
 
 #[test]
