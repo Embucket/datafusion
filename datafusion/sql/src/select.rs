@@ -54,7 +54,7 @@ use datafusion_expr::{
 
 use indexmap::IndexMap;
 use sqlparser::ast::{
-    Distinct, Expr as SQLExpr, GroupByExpr, NamedWindowExpr, OrderBy,
+    Distinct, Expr as SQLExpr, GroupByExpr, NamedWindowExpr, OrderBy, RenameSelectItem,
     SelectItemQualifiedWildcardKind, WildcardAdditionalOptions, WindowType,
     visit_expressions_mut,
 };
@@ -1232,16 +1232,14 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             // opt_exclude is handled
             opt_exclude: _opt_exclude,
             opt_except: _opt_except,
-            opt_rename,
+            opt_rename: _opt_rename,
             opt_replace: _opt_replace,
             opt_ilike: _opt_ilike,
             opt_alias,
             wildcard_token: _wildcard_token,
         } = options;
 
-        if opt_rename.is_some() {
-            not_impl_err!("wildcard * with RENAME not supported ")
-        } else if opt_alias.is_some() {
+        if opt_alias.is_some() {
             not_impl_err!("wildcard * with AS alias not supported")
         } else {
             Ok(())
@@ -1258,12 +1256,23 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         planner_context: &mut PlannerContext,
         options: WildcardAdditionalOptions,
     ) -> Result<WildcardOptions> {
+        let rename = options.opt_rename.map(|mut rename| {
+            let items = match &mut rename {
+                RenameSelectItem::Single(item) => std::slice::from_mut(item),
+                RenameSelectItem::Multiple(items) => items,
+            };
+            for item in items {
+                item.ident.value = self.ident_normalizer.normalize(item.ident.clone());
+                item.alias.value = self.ident_normalizer.normalize(item.alias.clone());
+            }
+            rename
+        });
         let planned_option = WildcardOptions {
             ilike: options.opt_ilike,
             exclude: options.opt_exclude,
             except: options.opt_except,
             replace: None,
-            rename: options.opt_rename,
+            rename,
         };
         if let Some(replace) = options.opt_replace {
             let replace_expr = replace
@@ -1285,8 +1294,18 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 })
                 .collect::<Vec<_>>();
 
+            let items = replace
+                .items
+                .into_iter()
+                .map(|item| {
+                    let mut item = *item;
+                    item.column_name.value =
+                        self.ident_normalizer.normalize(item.column_name.clone());
+                    item
+                })
+                .collect();
             let planned_replace = PlannedReplaceSelectItem {
-                items: replace.items.into_iter().map(|i| *i).collect(),
+                items,
                 planned_expressions: replace_expr,
             };
             Ok(planned_option.with_replace(planned_replace))

@@ -2453,6 +2453,138 @@ fn scalar_expr_planner_applies_qualified_wildcard_options() {
 }
 
 #[test]
+fn select_wildcard_rename_columns() {
+    let plan = logical_plan_with_dialect(
+        "SELECT * RENAME (id AS person_id, state AS region) FROM person",
+        &SnowflakeDialect {},
+    )
+    .unwrap();
+
+    assert_eq!(
+        plan.schema()
+            .fields()
+            .iter()
+            .map(|field| field.name().as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "person_id",
+            "first_name",
+            "last_name",
+            "age",
+            "region",
+            "salary",
+            "birth_date",
+            "😀"
+        ]
+    );
+    assert_snapshot!(
+        plan,
+        @r"
+    Projection: person.id AS person_id, person.first_name, person.last_name, person.age, person.state AS region, person.salary, person.birth_date, person.😀
+      TableScan: person
+    "
+    );
+}
+
+#[test]
+fn select_wildcard_combines_replace_and_rename() {
+    let plan = logical_plan_with_dialect(
+        "SELECT * EXCLUDE salary REPLACE (age + 1 AS age) \
+         RENAME (id AS person_id, age AS years) FROM person",
+        &SnowflakeDialect {},
+    )
+    .unwrap();
+
+    assert_eq!(
+        plan.schema()
+            .fields()
+            .iter()
+            .map(|field| field.name().as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "person_id",
+            "first_name",
+            "last_name",
+            "years",
+            "state",
+            "birth_date",
+            "😀"
+        ]
+    );
+    assert_snapshot!(
+        plan,
+        @r"
+    Projection: person.id AS person_id, person.first_name, person.last_name, person.age + Int64(1) AS years, person.state, person.birth_date, person.😀
+      TableScan: person
+    "
+    );
+}
+
+#[test]
+fn select_qualified_wildcard_rename() {
+    let plan = logical_plan_with_dialect(
+        "SELECT p.* EXCLUDE age RENAME id AS person_id FROM person AS p",
+        &SnowflakeDialect {},
+    )
+    .unwrap();
+
+    assert_eq!(
+        plan.schema()
+            .fields()
+            .iter()
+            .map(|field| field.name().as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "person_id",
+            "first_name",
+            "last_name",
+            "state",
+            "salary",
+            "birth_date",
+            "😀"
+        ]
+    );
+}
+
+#[test]
+fn select_wildcard_rename_preserves_quoted_identifiers() {
+    let plan = logical_plan_with_dialect(
+        "SELECT * RENAME (\"First Name\" AS \"Given Name\") \
+         FROM person_quoted_cols",
+        &SnowflakeDialect {},
+    )
+    .unwrap();
+
+    assert_eq!(plan.schema().field(1).name(), "Given Name");
+}
+
+#[rstest]
+#[case(
+    "SELECT * REPLACE (id + 1 AS missing) FROM person",
+    "Column 'missing' specified in REPLACE does not exist"
+)]
+#[case(
+    "SELECT * RENAME missing AS renamed FROM person",
+    "Column 'missing' specified in RENAME does not exist"
+)]
+#[case(
+    "SELECT * RENAME (id AS one, id AS two) FROM person",
+    "Column 'id' is specified more than once in RENAME"
+)]
+#[case(
+    "SELECT * REPLACE (id + 1 AS id, id + 2 AS id) FROM person",
+    "Column 'id' is specified more than once in REPLACE"
+)]
+#[case(
+    "SELECT * RENAME id AS person_id FROM person p JOIN person q ON p.id = q.id",
+    "Column 'id' specified in RENAME is ambiguous"
+)]
+fn select_wildcard_modifiers_validate_targets(#[case] sql: &str, #[case] expected: &str) {
+    let err = logical_plan_with_dialect(sql, &SnowflakeDialect {}).unwrap_err();
+    assert_contains!(err.strip_backtrace(), expected);
+}
+
+#[test]
 fn select_approx_median() {
     let sql = "SELECT approx_median(age) FROM person";
     let plan = logical_plan(sql).unwrap();

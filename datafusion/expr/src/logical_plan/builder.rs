@@ -24,7 +24,7 @@ use std::iter::once;
 use std::sync::Arc;
 
 use crate::dml::CopyTo;
-use crate::expr::{Alias, PlannedReplaceSelectItem, Sort as SortExpr};
+use crate::expr::{Alias, PlannedReplaceSelectItem, RenameSelectItem, Sort as SortExpr};
 use crate::expr_rewriter::{
     coerce_plan_expr_for_schema, normalize_col,
     normalize_col_with_schemas_and_ambiguity_check, normalize_cols, normalize_sorts,
@@ -1975,6 +1975,11 @@ fn project_with_validation(
                 } else {
                     expanded
                 };
+                let expanded = if let Some(rename) = opt.rename {
+                    rename_columns(expanded, &rename)?
+                } else {
+                    expanded
+                };
 
                 for e in expanded {
                     if validate {
@@ -1994,6 +1999,11 @@ fn project_with_validation(
                 // replace expression. Column name remains the same.
                 let expanded = if let Some(replace) = opt.replace {
                     replace_columns(expanded, &replace)?
+                } else {
+                    expanded
+                };
+                let expanded = if let Some(rename) = opt.rename {
+                    rename_columns(expanded, &rename)?
                 } else {
                     expanded
                 };
@@ -2047,18 +2057,67 @@ fn replace_columns(
     mut exprs: Vec<Expr>,
     replace: &PlannedReplaceSelectItem,
 ) -> Result<Vec<Expr>> {
-    for expr in exprs.iter_mut() {
-        if let Expr::Column(Column { name, .. }) = expr
-            && let Some((_, new_expr)) = replace
-                .items()
-                .iter()
-                .zip(replace.expressions().iter())
-                .find(|(item, _)| item.column_name.value == *name)
-        {
-            *expr = new_expr.clone().alias(name.clone())
+    let indices = wildcard_column_indices(&exprs);
+    let mut seen = HashSet::new();
+    for (item, new_expr) in replace.items().iter().zip(replace.expressions()) {
+        let name = &item.column_name.value;
+        if !seen.insert(name) {
+            return plan_err!("Column '{name}' is specified more than once in REPLACE");
         }
+        let index = wildcard_column_index(&indices, name, "REPLACE")?;
+        exprs[index] = new_expr.clone().alias(name.clone());
     }
     Ok(exprs)
+}
+
+/// Rename columns produced by a wildcard without changing their order or values.
+fn rename_columns(mut exprs: Vec<Expr>, rename: &RenameSelectItem) -> Result<Vec<Expr>> {
+    let indices = wildcard_column_indices(&exprs);
+    let items = match rename {
+        RenameSelectItem::Single(item) => std::slice::from_ref(item),
+        RenameSelectItem::Multiple(items) => items,
+    };
+    let mut seen = HashSet::new();
+    for item in items {
+        let name = &item.ident.value;
+        if !seen.insert(name) {
+            return plan_err!("Column '{name}' is specified more than once in RENAME");
+        }
+        let index = wildcard_column_index(&indices, name, "RENAME")?;
+        let expr = std::mem::take(&mut exprs[index]);
+        exprs[index] = match expr {
+            Expr::Alias(mut alias) => {
+                alias.name.clone_from(&item.alias.value);
+                Expr::Alias(alias)
+            }
+            expr => expr.alias(item.alias.value.clone()),
+        };
+    }
+    Ok(exprs)
+}
+
+fn wildcard_column_indices(exprs: &[Expr]) -> HashMap<String, Option<usize>> {
+    let mut indices = HashMap::with_capacity(exprs.len());
+    for (index, expr) in exprs.iter().enumerate() {
+        let (_, name) = expr.qualified_name();
+        indices
+            .entry(name)
+            .and_modify(|existing| *existing = None)
+            .or_insert(Some(index));
+    }
+    indices
+}
+
+fn wildcard_column_index(
+    indices: &HashMap<String, Option<usize>>,
+    name: &str,
+    modifier: &str,
+) -> Result<usize> {
+    match indices.get(name) {
+        Some(Some(index)) => Ok(*index),
+        Some(None) => plan_err!("Column '{name}' specified in {modifier} is ambiguous"),
+        None => plan_err!("Column '{name}' specified in {modifier} does not exist"),
+    }
 }
 
 /// Create a SubqueryAlias to wrap a LogicalPlan.
