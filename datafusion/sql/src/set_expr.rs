@@ -167,12 +167,13 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             (SetOperator::Intersect, SetQuantifier::Distinct | SetQuantifier::None) => {
                 LogicalPlanBuilder::intersect(left_plan, right_plan, false)
             }
-            (SetOperator::Except, SetQuantifier::All) => {
+            (SetOperator::Except | SetOperator::Minus, SetQuantifier::All) => {
                 LogicalPlanBuilder::except(left_plan, right_plan, true)
             }
-            (SetOperator::Except, SetQuantifier::Distinct | SetQuantifier::None) => {
-                LogicalPlanBuilder::except(left_plan, right_plan, false)
-            }
+            (
+                SetOperator::Except | SetOperator::Minus,
+                SetQuantifier::Distinct | SetQuantifier::None,
+            ) => LogicalPlanBuilder::except(left_plan, right_plan, false),
             (op, quantifier) => {
                 not_impl_err!("{op} {quantifier} not implemented")
             }

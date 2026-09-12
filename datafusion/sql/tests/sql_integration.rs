@@ -3437,6 +3437,25 @@ fn except_with_duplicate_expressions() {
 }
 
 #[test]
+fn minus_is_an_alias_for_except() {
+    let sql = "SELECT order_id FROM orders MINUS SELECT order_id FROM orders";
+    let plan = logical_plan_with_dialect(sql, &SnowflakeDialect {}).unwrap();
+    assert_snapshot!(
+        plan,
+        @r"
+    LeftAnti Join: left.order_id = right.order_id
+      Distinct:
+        SubqueryAlias: left
+          Projection: orders.order_id
+            TableScan: orders
+      SubqueryAlias: right
+        Projection: orders.order_id
+          TableScan: orders
+    "
+    );
+}
+
+#[test]
 fn empty_over() {
     let sql = "SELECT order_id, MAX(order_id) OVER () from orders";
     let plan = logical_plan(sql).unwrap();
