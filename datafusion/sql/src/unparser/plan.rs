@@ -609,6 +609,7 @@ impl Unparser<'_> {
                 let cross_join = ast::Join {
                     relation: flatten_factor,
                     global: false,
+                    directed: false,
                     join_operator: ast::JoinOperator::CrossJoin(
                         ast::JoinConstraint::None,
                     ),
@@ -1449,6 +1450,7 @@ impl Unparser<'_> {
                         let ast_join = ast::Join {
                             relation,
                             global: false,
+                            directed: false,
                             join_operator: self
                                 .join_operator_to_sql(join.join_type, join_constraint)?,
                         };
@@ -1870,6 +1872,7 @@ impl Unparser<'_> {
         let ast_join = ast::Join {
             relation,
             global: false,
+            directed: false,
             join_operator: ast::JoinOperator::AsOf {
                 match_condition,
                 constraint,
