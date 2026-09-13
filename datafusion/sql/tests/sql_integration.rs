@@ -3456,6 +3456,24 @@ fn minus_is_an_alias_for_except() {
 }
 
 #[test]
+fn snowflake_directed_join_plans() {
+    let sql = "SELECT person.id, orders.order_id \
+               FROM person \
+               INNER DIRECTED JOIN orders \
+               ON person.id = orders.customer_id";
+    let plan = logical_plan_with_dialect(sql, &SnowflakeDialect {}).unwrap();
+    assert_snapshot!(
+        plan,
+        @r"
+    Projection: person.id, orders.order_id
+      Inner Join:  Filter: person.id = orders.customer_id
+        TableScan: person
+        TableScan: orders
+    "
+    );
+}
+
+#[test]
 fn empty_over() {
     let sql = "SELECT order_id, MAX(order_id) OVER () from orders";
     let plan = logical_plan(sql).unwrap();
