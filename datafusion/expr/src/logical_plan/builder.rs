@@ -316,17 +316,21 @@ impl LogicalPlanBuilder {
                     continue;
                 }
 
-                let metadata = value.metadata(&schema)?;
-                if let Some(ref cm) = common_metadata {
-                    if &metadata != cm {
-                        return plan_err!(
-                            "Inconsistent metadata across values list at row {i} column {j}. Was {:?} but found {:?}",
-                            cm,
-                            metadata
-                        );
+                let is_null_literal =
+                    matches!(value, Expr::Literal(value, _) if value.is_null());
+                if !is_null_literal {
+                    let metadata = value.metadata(&schema)?;
+                    if let Some(ref cm) = common_metadata {
+                        if &metadata != cm {
+                            return plan_err!(
+                                "Inconsistent metadata across values list at row {i} column {j}. Was {:?} but found {:?}",
+                                cm,
+                                metadata
+                            );
+                        }
+                    } else {
+                        common_metadata = Some(metadata.clone());
                     }
-                } else {
-                    common_metadata = Some(metadata.clone());
                 }
 
                 if let Some(prev_type) = common_type {
@@ -3253,23 +3257,25 @@ mod tests {
             .is_err()
         );
 
-        // Untyped NULL values adopt the type and metadata inferred from
-        // concrete values, regardless of their position in the column.
-        for values in [
-            vec![
-                vec![lit(ScalarValue::Null)],
-                vec![lit_with_metadata(1, Some(metadata.clone()))],
-            ],
-            vec![
-                vec![lit_with_metadata(1, Some(metadata.clone()))],
-                vec![lit(ScalarValue::Null)],
-            ],
-        ] {
-            let plan = LogicalPlanBuilder::values(values)?.build()?;
-            let field = plan.schema().field(0);
-            assert_eq!(field.data_type(), &DataType::Int32);
-            assert!(field.is_nullable());
-            assert_eq!(*field.metadata(), metadata.to_hashmap());
+        // Untyped and typed NULL values adopt metadata inferred from concrete
+        // values, regardless of their position in the column.
+        for null in [ScalarValue::Null, ScalarValue::Int32(None)] {
+            for values in [
+                vec![
+                    vec![lit(null.clone())],
+                    vec![lit_with_metadata(1, Some(metadata.clone()))],
+                ],
+                vec![
+                    vec![lit_with_metadata(1, Some(metadata.clone()))],
+                    vec![lit(null.clone())],
+                ],
+            ] {
+                let plan = LogicalPlanBuilder::values(values)?.build()?;
+                let field = plan.schema().field(0);
+                assert_eq!(field.data_type(), &DataType::Int32);
+                assert!(field.is_nullable());
+                assert_eq!(*field.metadata(), metadata.to_hashmap());
+            }
         }
 
         Ok(())
