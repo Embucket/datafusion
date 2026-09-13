@@ -308,6 +308,14 @@ impl LogicalPlanBuilder {
             let mut nullable = false;
             for (i, row) in values.iter().enumerate() {
                 let value = &row[j];
+                if !nullable && value.nullable(&schema)? {
+                    nullable = true;
+                }
+                let data_type = value.get_type(&schema)?;
+                if data_type == DataType::Null {
+                    continue;
+                }
+
                 let metadata = value.metadata(&schema)?;
                 if let Some(ref cm) = common_metadata {
                     if &metadata != cm {
@@ -319,13 +327,6 @@ impl LogicalPlanBuilder {
                     }
                 } else {
                     common_metadata = Some(metadata.clone());
-                }
-                if !nullable && value.nullable(&schema)? {
-                    nullable = true;
-                }
-                let data_type = value.get_type(&schema)?;
-                if data_type == DataType::Null {
-                    continue;
                 }
 
                 if let Some(prev_type) = common_type {
@@ -3251,6 +3252,25 @@ mod tests {
             ])
             .is_err()
         );
+
+        // Untyped NULL values adopt the type and metadata inferred from
+        // concrete values, regardless of their position in the column.
+        for values in [
+            vec![
+                vec![lit(ScalarValue::Null)],
+                vec![lit_with_metadata(1, Some(metadata.clone()))],
+            ],
+            vec![
+                vec![lit_with_metadata(1, Some(metadata.clone()))],
+                vec![lit(ScalarValue::Null)],
+            ],
+        ] {
+            let plan = LogicalPlanBuilder::values(values)?.build()?;
+            let field = plan.schema().field(0);
+            assert_eq!(field.data_type(), &DataType::Int32);
+            assert!(field.is_nullable());
+            assert_eq!(*field.metadata(), metadata.to_hashmap());
+        }
 
         Ok(())
     }
