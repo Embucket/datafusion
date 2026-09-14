@@ -345,8 +345,18 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 }
             }
         }
-        // User-defined function (UDF) should have precedence
-        if let Some(fm) = self.context_provider.get_function_meta(&name) {
+        // User-defined scalar functions take precedence unless their signature cannot
+        // accept this argument count and an aggregate overload exists.
+        let scalar_function = self.context_provider.get_function_meta(&name);
+        let prefer_aggregate_overload =
+            scalar_function.as_ref().is_some_and(|function| {
+                !function
+                    .signature()
+                    .type_signature
+                    .supports_argument_count(args.len())
+                    && self.context_provider.get_aggregate_meta(&name).is_some()
+            });
+        if let Some(fm) = scalar_function.filter(|_| !prefer_aggregate_overload) {
             let (args, arg_names) =
                 self.function_args_to_expr_with_names(args, schema, planner_context)?;
 
