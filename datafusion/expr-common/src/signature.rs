@@ -871,6 +871,35 @@ impl TypeSignature {
         }
     }
 
+    /// Returns whether this signature can accept `argument_count` arguments.
+    ///
+    /// User-defined signatures may implement arbitrary arity validation, so they
+    /// are conservatively treated as accepting any argument count here.
+    pub fn supports_argument_count(&self, argument_count: usize) -> bool {
+        match self {
+            TypeSignature::Variadic(_) | TypeSignature::VariadicAny => argument_count > 0,
+            TypeSignature::UserDefined => true,
+            TypeSignature::Uniform(count, _)
+            | TypeSignature::Comparable(count)
+            | TypeSignature::Any(count)
+            | TypeSignature::Numeric(count)
+            | TypeSignature::String(count) => *count == argument_count,
+            TypeSignature::Exact(types) => types.len() == argument_count,
+            TypeSignature::Coercible(coercions) => coercions.len() == argument_count,
+            TypeSignature::OneOf(signatures) => signatures
+                .iter()
+                .any(|signature| signature.supports_argument_count(argument_count)),
+            TypeSignature::ArraySignature(ArrayFunctionSignature::Array {
+                arguments,
+                ..
+            }) => arguments.len() == argument_count,
+            TypeSignature::ArraySignature(
+                ArrayFunctionSignature::RecursiveArray | ArrayFunctionSignature::MapArray,
+            ) => argument_count == 1,
+            TypeSignature::Nullary => argument_count == 0,
+        }
+    }
+
     /// Returns true if the signature currently supports or used to supported 0
     /// input arguments in a previous version of DataFusion.
     pub fn used_to_support_zero_arguments(&self) -> bool {
@@ -1608,6 +1637,25 @@ mod tests {
                 "Expected {case:?} not to support zero arguments"
             );
         }
+    }
+
+    #[test]
+    fn supports_argument_count_tests() {
+        let one_or_two = TypeSignature::OneOf(vec![
+            TypeSignature::Any(1),
+            TypeSignature::Exact(vec![DataType::Utf8, DataType::Int64]),
+        ]);
+        assert!(one_or_two.supports_argument_count(1));
+        assert!(one_or_two.supports_argument_count(2));
+        assert!(!one_or_two.supports_argument_count(0));
+        assert!(!one_or_two.supports_argument_count(3));
+
+        assert!(TypeSignature::VariadicAny.supports_argument_count(1));
+        assert!(TypeSignature::VariadicAny.supports_argument_count(4));
+        assert!(!TypeSignature::VariadicAny.supports_argument_count(0));
+        assert!(TypeSignature::UserDefined.supports_argument_count(0));
+        assert!(TypeSignature::Nullary.supports_argument_count(0));
+        assert!(!TypeSignature::Nullary.supports_argument_count(1));
     }
 
     #[test]

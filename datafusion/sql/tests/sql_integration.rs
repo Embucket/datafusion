@@ -2346,6 +2346,73 @@ fn select_count_column() {
 }
 
 #[test]
+fn scalar_and_aggregate_udfs_can_share_a_name_when_arities_differ() {
+    let state = mock_session_state().with_scalar_function(Arc::new(make_udf(
+        "sum",
+        vec![DataType::Int32, DataType::Int32],
+        DataType::Int32,
+    )));
+    let plan = logical_plan_from_state(
+        "SELECT sum(age) FROM person",
+        &GenericDialect {},
+        ParserOptions::default(),
+        state,
+    )
+    .unwrap();
+    assert_snapshot!(
+        plan,
+        @r"
+    Projection: sum(person.age)
+      Aggregate: groupBy=[[]], aggr=[[sum(person.age)]]
+        TableScan: person
+    "
+    );
+
+    let state = mock_session_state().with_scalar_function(Arc::new(make_udf(
+        "sum",
+        vec![DataType::Int32, DataType::Int32],
+        DataType::Int32,
+    )));
+    let plan = logical_plan_from_state(
+        "SELECT sum(age, age) FROM person",
+        &GenericDialect {},
+        ParserOptions::default(),
+        state,
+    )
+    .unwrap();
+    assert_snapshot!(
+        plan,
+        @r"
+    Projection: sum(person.age, person.age)
+      TableScan: person
+    "
+    );
+}
+
+#[test]
+fn scalar_udf_keeps_precedence_over_same_arity_aggregate_udf() {
+    let state = mock_session_state().with_scalar_function(Arc::new(make_udf(
+        "sum",
+        vec![DataType::Int32],
+        DataType::Int32,
+    )));
+    let plan = logical_plan_from_state(
+        "SELECT sum(age) FROM person",
+        &GenericDialect {},
+        ParserOptions::default(),
+        state,
+    )
+    .unwrap();
+    assert_snapshot!(
+        plan,
+        @r"
+    Projection: sum(person.age)
+      TableScan: person
+    "
+    );
+}
+
+#[test]
 fn aggregate_expr_planner_can_resolve_qualified_wildcard_from_schema() {
     let state =
         mock_session_state().with_expr_planner(Arc::new(QualifiedWildcardCountPlanner));
