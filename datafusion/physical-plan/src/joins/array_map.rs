@@ -16,7 +16,6 @@
 // under the License.
 
 use arrow_schema::DataType;
-use num_traits::AsPrimitive;
 use std::mem::size_of;
 
 use crate::joins::MapOffset;
@@ -26,12 +25,40 @@ use arrow::buffer::BooleanBuffer;
 use arrow::datatypes::ArrowNumericType;
 use datafusion_common::{Result, ScalarValue, internal_err};
 
-/// A macro to downcast only supported integer types (up to 64-bit) and invoke a generic function.
+/// Conversion to the dense map's index domain. Native <=64-bit integers retain
+/// their branch-free wrapping representation. Decimal128 values must fit i64:
+/// truncating arbitrary i128 probes would alias distinct keys separated by 2^64.
+trait ArrayMapKey: Copy {
+    fn map_key(self) -> Option<u64>;
+}
+
+macro_rules! native_map_keys {
+    ($($t:ty),*) => {$(
+        impl ArrayMapKey for $t {
+            #[inline]
+            fn map_key(self) -> Option<u64> {
+                Some(self as u64)
+            }
+        }
+    )*};
+}
+
+native_map_keys!(i8, i16, i32, i64, u8, u16, u32, u64);
+
+impl ArrayMapKey for i128 {
+    #[inline]
+    fn map_key(self) -> Option<u64> {
+        i64::try_from(self).ok().map(|value| value as u64)
+    }
+}
+
+/// Downcast supported native integers and Decimal128 without materializing a
+/// narrowed Arrow array. Decimal range eligibility is checked from build bounds.
 ///
 /// Usage: `downcast_supported_integer!(data_type => (Method, arg1, arg2, ...))`
 ///
 /// The `Method` must be an associated method of [`ArrayMap`] that is generic over
-/// `<T: ArrowNumericType>` and allow `T::Native: AsPrimitive<u64>`.
+/// `<T: ArrowNumericType>` and allow `T::Native: ArrayMapKey`.
 macro_rules! downcast_supported_integer {
     ($DATA_TYPE:expr => ($METHOD:ident $(, $ARGS:expr)*)) => {
         match $DATA_TYPE {
@@ -43,6 +70,7 @@ macro_rules! downcast_supported_integer {
             arrow::datatypes::DataType::UInt16 => ArrayMap::$METHOD::<arrow::datatypes::UInt16Type>($($ARGS),*),
             arrow::datatypes::DataType::UInt32 => ArrayMap::$METHOD::<arrow::datatypes::UInt32Type>($($ARGS),*),
             arrow::datatypes::DataType::UInt64 => ArrayMap::$METHOD::<arrow::datatypes::UInt64Type>($($ARGS),*),
+            arrow::datatypes::DataType::Decimal128(..) => ArrayMap::$METHOD::<arrow::datatypes::Decimal128Type>($($ARGS),*),
             _ => {
                 return internal_err!(
                     "Unsupported type for ArrayMap: {:?}",
@@ -124,6 +152,7 @@ impl ArrayMap {
                 | DataType::UInt16
                 | DataType::UInt32
                 | DataType::UInt64
+                | DataType::Decimal128(..)
         )
     }
 
@@ -137,6 +166,7 @@ impl ArrayMap {
             ScalarValue::UInt16(Some(v)) => Some(*v as u64),
             ScalarValue::UInt32(Some(v)) => Some(*v as u64),
             ScalarValue::UInt64(Some(v)) => Some(*v),
+            ScalarValue::Decimal128(Some(v), _, _) => v.map_key(),
             _ => None,
         }
     }
@@ -210,13 +240,17 @@ impl ArrayMap {
         num_of_distinct_key: &mut usize,
     ) -> Result<()>
     where
-        T::Native: AsPrimitive<u64>,
+        T::Native: ArrayMapKey,
     {
         let arr = array.as_primitive::<T>();
         // Iterate in reverse to maintain FIFO order when there are duplicate keys.
         for (i, val) in arr.iter().enumerate().rev() {
             if let Some(val) = val {
-                let key: u64 = val.as_();
+                let Some(key) = val.map_key() else {
+                    return internal_err!(
+                        "ArrayMap build key exceeds its supported domain"
+                    );
+                };
                 let Some(idx) = Self::key_to_index(key, offset_val, data.len()) else {
                     return internal_err!("failed build Array idx >= data.len()");
                 };
@@ -292,7 +326,7 @@ impl ArrayMap {
         build_indices: &mut Vec<u64>,
     ) -> Result<Option<MapOffset>>
     where
-        T::Native: Copy + AsPrimitive<u64>,
+        T::Native: ArrayMapKey,
     {
         probe_indices.clear();
         build_indices.clear();
@@ -312,7 +346,10 @@ impl ArrayMap {
                     continue;
                 }
                 // SAFETY: prob_idx is guaranteed to be within bounds by the loop range.
-                let prob_val: u64 = unsafe { arr.value_unchecked(prob_idx) }.as_();
+                let Some(prob_val) = unsafe { arr.value_unchecked(prob_idx) }.map_key()
+                else {
+                    continue;
+                };
                 let Some(build_value) = self.get_value(prob_val) else {
                     continue;
                 };
@@ -359,7 +396,11 @@ impl ArrayMap {
                 let is_last = prob_side_idx == arr.len() - 1;
 
                 // SAFETY: prob_idx is guaranteed to be within bounds by the loop range.
-                let prob_val: u64 = unsafe { arr.value_unchecked(prob_side_idx) }.as_();
+                let Some(prob_val) =
+                    unsafe { arr.value_unchecked(prob_side_idx) }.map_key()
+                else {
+                    continue;
+                };
                 let Some(build_idx) = self.get_value(prob_val) else {
                     continue;
                 };
@@ -403,7 +444,7 @@ impl ArrayMap {
         array: &ArrayRef,
     ) -> Result<BooleanArray>
     where
-        T::Native: AsPrimitive<u64>,
+        T::Native: ArrayMapKey,
     {
         let arr = array.as_primitive::<T>();
         let buffer = BooleanBuffer::collect_bool(arr.len(), |i| {
@@ -411,8 +452,9 @@ impl ArrayMap {
                 return false;
             }
             // SAFETY: i is within bounds [0, arr.len())
-            let key: u64 = unsafe { arr.value_unchecked(i) }.as_();
-            self.get_value(key).is_some()
+            unsafe { arr.value_unchecked(i) }
+                .map_key()
+                .is_some_and(|key| self.get_value(key).is_some())
         });
         Ok(BooleanArray::new(buffer, None))
     }
@@ -425,6 +467,121 @@ mod tests {
     use arrow::array::Int64Array;
     use arrow::array::UInt64Array;
     use std::sync::Arc;
+
+    #[test]
+    fn decimal_bounds_require_a_lossless_index_domain() {
+        for scale in [0, 2, 19] {
+            for value in [i128::from(i64::MIN), -1, 0, i128::from(i64::MAX)] {
+                assert_eq!(
+                    ArrayMap::key_to_u64(&ScalarValue::Decimal128(
+                        Some(value),
+                        38,
+                        scale
+                    )),
+                    Some(value as u64)
+                );
+            }
+            for value in [
+                i128::from(i64::MIN) - 1,
+                i128::from(i64::MAX) + 1,
+                1_i128 << 64,
+            ] {
+                assert_eq!(
+                    ArrayMap::key_to_u64(&ScalarValue::Decimal128(
+                        Some(value),
+                        38,
+                        scale
+                    )),
+                    None
+                );
+            }
+        }
+        assert_eq!(
+            ArrayMap::key_to_u64(&ScalarValue::Decimal128(None, 38, 0)),
+            None
+        );
+    }
+
+    #[test]
+    fn decimal_probes_do_not_alias_after_u64_truncation() -> Result<()> {
+        use arrow::array::Decimal128Array;
+
+        // Exercise both the unique-key and duplicate-chain lookup paths, and
+        // scaled decimals: the map indexes unscaled values, never SQL casts.
+        for duplicates in [false, true] {
+            for scale in [0, 2, 19] {
+                let values = if duplicates {
+                    vec![Some(-1), Some(0), None, Some(1), Some(1)]
+                } else {
+                    vec![Some(-1), Some(0), None, Some(1)]
+                };
+                let build: ArrayRef = Arc::new(
+                    Decimal128Array::from(values).with_precision_and_scale(38, scale)?,
+                );
+                let map = ArrayMap::try_new(&build, -1_i64 as u64, 1)?;
+                let probe = [Arc::new(
+                    Decimal128Array::from(vec![
+                        Some(-1),
+                        Some(0),
+                        Some(1),
+                        None,
+                        Some((1_i128 << 64) - 1),
+                        Some(1_i128 << 64),
+                        Some((1_i128 << 64) + 1),
+                        Some(-(1_i128 << 64)),
+                        Some(i128::from(i64::MIN) - 1),
+                        Some(i128::from(i64::MAX) + 1),
+                    ])
+                    .with_precision_and_scale(38, scale)?,
+                ) as ArrayRef];
+                let contains = map.contain_keys(&probe)?;
+                assert_eq!(
+                    contains.iter().collect::<Vec<_>>(),
+                    vec![
+                        Some(true),
+                        Some(true),
+                        Some(true),
+                        Some(false),
+                        Some(false),
+                        Some(false),
+                        Some(false),
+                        Some(false),
+                        Some(false),
+                        Some(false)
+                    ]
+                );
+                let mut offset = Some((0, None));
+                let (mut probes, mut builds, mut matches) = (vec![], vec![], vec![]);
+                while let Some(next) = offset {
+                    offset = map.get_matched_indices_with_limit_offset(
+                        &probe,
+                        1,
+                        next,
+                        &mut probes,
+                        &mut builds,
+                    )?;
+                    matches.extend(probes.iter().copied().zip(builds.iter().copied()));
+                }
+                let mut expected = vec![(0, 0), (1, 1), (2, 3)];
+                if duplicates {
+                    expected.push((2, 4));
+                }
+                assert_eq!(matches, expected);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_decimal_build_cannot_silently_truncate() -> Result<()> {
+        use arrow::array::Decimal128Array;
+        let build: ArrayRef = Arc::new(
+            Decimal128Array::from(vec![(1_i128 << 64) + 1])
+                .with_precision_and_scale(38, 0)?,
+        );
+        assert!(ArrayMap::try_new(&build, 0, 2).is_err());
+        Ok(())
+    }
 
     #[test]
     fn test_array_map_limit_offset_duplicate_elements() -> Result<()> {
