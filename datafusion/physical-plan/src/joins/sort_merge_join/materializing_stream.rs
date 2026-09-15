@@ -348,6 +348,11 @@ pub(super) struct MaterializingSortMergeJoinStream {
     /// Tracks the number of batches currently spilled
     pub spilled_batch_count: usize,
 
+    /// Spill-backed batches loaded for the current output window. Keep the
+    /// original files so a later streamed row can revisit the group without
+    /// retaining every previously read payload in memory or writing it again.
+    restored_batches: Vec<(usize, Arc<dyn SpillFile>)>,
+
     /// Time spent doing the join's own work (including spill write and
     /// read-back). The clock is stopped while awaiting the child inputs or
     /// the consumer taking an emitted batch — see [`Self::stop_join_time`].
@@ -584,6 +589,7 @@ impl MaterializingSortMergeJoinStream {
             runtime_env,
             spill_manager,
             spilled_batch_count: 0,
+            restored_batches: vec![],
             join_time,
             join_time_start: None,
             streamed_buffered_cmp: None,
@@ -949,7 +955,7 @@ impl MaterializingSortMergeJoinStream {
     fn get_required_batch_indices(&self, buffered_freeze_count: usize) -> Vec<usize> {
         let mut needed = vec![];
         // Avoid scanning if no spilled batches exist
-        if self.spilled_batch_count == 0 {
+        if self.spilled_batch_count == 0 && self.restored_batches.is_empty() {
             return needed;
         }
         // We need all batches that matched with streamed rows
@@ -959,9 +965,20 @@ impl MaterializingSortMergeJoinStream {
             }
         }
 
-        // Full Joins need to emit null-joined rows, so we need batches up to freeze_count
+        // Only batches with pending null output need to be restored here.
+        // Restoring every batch in a Full join would load the entire key group
+        // even when all its rows matched and none needs null materialization.
         if self.join_type == JoinType::Full {
-            needed.extend(0..buffered_freeze_count);
+            needed.extend(
+                self.buffered_data
+                    .batches
+                    .iter()
+                    .take(buffered_freeze_count)
+                    .enumerate()
+                    .filter_map(|(idx, batch)| {
+                        (!batch.null_joined.is_empty()).then_some(idx)
+                    }),
+            );
         }
 
         needed.sort_unstable();
@@ -975,6 +992,23 @@ impl MaterializingSortMergeJoinStream {
         &mut self,
         required_indices: &[usize],
     ) -> Result<()> {
+        // Drop decoded payloads outside this output's working set before
+        // reading more. Join arrays and per-row match state remain resident.
+        // Only visit the previous working set, not the entire buffered group.
+        let mut retained = Vec::new();
+        for (idx, file) in std::mem::take(&mut self.restored_batches) {
+            if required_indices.contains(&idx) {
+                retained.push((idx, file));
+            } else {
+                let batch = &mut self.buffered_data.batches[idx];
+                batch.batch = BufferedBatchState::Spilled(file);
+                self.reservation
+                    .shrink(batch.reserved_amount - batch.join_arrays_mem);
+                batch.reserved_amount = batch.join_arrays_mem;
+                self.spilled_batch_count += 1;
+            }
+        }
+        self.restored_batches = retained;
         for &idx in required_indices {
             // Guard against indices that might be out of bounds if the queue was cleared
             if idx >= self.buffered_data.batches.len() {
@@ -990,6 +1024,7 @@ impl MaterializingSortMergeJoinStream {
 
                 match spill_stream.next().await.transpose()? {
                     Some(batch) => {
+                        self.restored_batches.push((idx, Arc::clone(spill_file)));
                         // Transition the batch back to InMemory
                         bb.batch = BufferedBatchState::InMemory(batch);
                         self.spilled_batch_count -= 1;
@@ -1200,7 +1235,12 @@ impl MaterializingSortMergeJoinStream {
                 break;
             }
             // load the spilled head batch before dequeuing
-            let needed = self.get_required_batch_indices(1);
+            let mut needed = self.get_required_batch_indices(1);
+            if self.join_type == JoinType::Full && !needed.contains(&0) {
+                // Deferred filter failures can create null output as the head
+                // is removed, even if it had no earlier null-joined indices.
+                needed.push(0);
+            }
             self.restore_spilled_batches(&needed).await?;
 
             self.freeze_dequeuing_buffered()?;
@@ -1210,6 +1250,14 @@ impl MaterializingSortMergeJoinStream {
                 if matches!(buffered_batch.batch, BufferedBatchState::Spilled(_)) {
                     self.spilled_batch_count -= 1;
                 }
+                self.restored_batches.retain_mut(|(idx, _)| {
+                    if *idx == 0 {
+                        false
+                    } else {
+                        *idx -= 1;
+                        true
+                    }
+                });
                 head_changed = true;
             }
         }

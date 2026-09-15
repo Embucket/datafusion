@@ -2512,6 +2512,105 @@ async fn overallocation_multi_batch_spill() -> Result<()> {
     Ok(())
 }
 
+/// Reading a spilled key group must not progressively restore the entire group
+/// into memory. Two streamed rows revisit the same group, so evicting a restored
+/// batch must preserve its spill file and exact output on the second visit.
+#[tokio::test]
+async fn spill_restored_batches_do_not_accumulate() -> Result<()> {
+    const BATCH_ROWS: usize = 1024;
+    const BATCHES: usize = 64;
+    const MEMORY_LIMIT: usize = 32 * 1024;
+
+    for join_type in [Inner, Left, Right, Full] {
+        let buffered_batches: Vec<RecordBatch> = (0..BATCHES)
+            .map(|batch| {
+                let values: Vec<i32> = (0..BATCH_ROWS)
+                    .map(|row| (batch * BATCH_ROWS + row) as i32)
+                    .collect();
+                build_table_i32(
+                    ("a", &values),
+                    ("k", &vec![1; BATCH_ROWS]),
+                    ("v", &values),
+                )
+            })
+            .collect();
+        let key_bytes = buffered_batches
+            .iter()
+            .map(|batch| batch.column(1).get_array_memory_size())
+            .sum::<usize>();
+        let batch_bytes = buffered_batches[0].get_array_memory_size()
+            + buffered_batches[0].column(1).get_array_memory_size()
+            + BATCH_ROWS * size_of::<usize>()
+            + size_of::<std::ops::Range<usize>>()
+            + size_of::<usize>();
+        let buffered = build_table_from_batches(buffered_batches);
+        let streamed = build_table_from_batches(vec![build_table_i32(
+            ("a", &vec![0, 1]),
+            ("k", &vec![1, 1]),
+            ("v", &vec![-1, -2]),
+        )]);
+        let (left, right) = if join_type == Right {
+            (buffered, streamed)
+        } else {
+            (streamed, buffered)
+        };
+        let on = vec![(
+            Arc::new(Column::new_with_schema("k", &left.schema())?) as _,
+            Arc::new(Column::new_with_schema("k", &right.schema())?) as _,
+        )];
+        let make_join = || {
+            join_with_options(
+                Arc::clone(&left),
+                Arc::clone(&right),
+                on.clone(),
+                join_type,
+                vec![SortOptions::default()],
+                NullEquality::NullEqualsNothing,
+            )
+        };
+        let config = SessionConfig::default().with_batch_size(BATCH_ROWS);
+        let unlimited =
+            Arc::new(TaskContext::default().with_session_config(config.clone()));
+        let expected = common::collect(make_join()?.execute(0, unlimited)?).await?;
+        assert_eq!(
+            expected.iter().map(RecordBatch::num_rows).sum::<usize>(),
+            2 * BATCHES * BATCH_ROWS,
+        );
+        let runtime = RuntimeEnvBuilder::new()
+            .with_memory_limit(MEMORY_LIMIT, 1.0)
+            .with_disk_manager_builder(
+                DiskManagerBuilder::default().with_mode(DiskManagerMode::OsTmpDirectory),
+            )
+            .build_arc()?;
+        let context = Arc::new(
+            TaskContext::default()
+                .with_session_config(config)
+                .with_runtime(Arc::clone(&runtime)),
+        );
+        let join = make_join()?;
+        let actual = common::collect(join.execute(0, Arc::clone(&context))?).await?;
+        assert_eq!(actual, expected, "{join_type:?} spilled output differs");
+        let metrics = join.metrics().unwrap();
+        assert!(metrics.spill_count().unwrap() > 0);
+        let peak = metrics.sum_by_name("peak_mem_used").unwrap().as_usize();
+        // Keys remain resident by design. Only the current output's source
+        // batches, not all visited payloads, may be restored above the pool.
+        let bound = MEMORY_LIMIT + key_bytes + 3 * batch_bytes;
+        assert!(
+            peak <= bound,
+            "{join_type:?}: peak {peak} > bounded restore {bound}"
+        );
+        assert_eq!(runtime.memory_pool.reserved(), 0);
+
+        // Cancellation after the first output also releases restored buffers.
+        let mut partial = join.execute(0, context)?;
+        assert!(partial.next().await.transpose()?.is_some());
+        drop(partial);
+        assert_eq!(runtime.memory_pool.reserved(), 0);
+    }
+    Ok(())
+}
+
 /// Verifies that `peak_mem_used` reflects join_arrays memory on the spill path.
 ///
 /// Uses a memory limit smaller than a single batch's `size_estimation` so that
