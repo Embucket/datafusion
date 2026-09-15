@@ -2513,7 +2513,6 @@ dependencies = [
  "insta",
  "itertools 0.15.0",
  "log",
- "num-traits",
  "parking_lot",
  "pin-project-lite",
  "rand 0.9.4",

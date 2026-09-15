@@ -3048,8 +3048,31 @@ mod tests {
         let (data, pool, expected, used_map) =
             build_with_tight_map_budget(vec![0, 10_000], false)?;
         assert!(!used_map);
-        assert!(matches!(data.map.as_ref(), Map::HashMap(_)));
-        assert_eq!(data.map.num_of_distinct_key(), 2);
+        let Map::HashMap(map) = data.map.as_ref() else {
+            panic!("expected the general hash map after direct-map budget rejection");
+        };
+        // Bucket count is not a row count, especially with force_hash_collisions.
+        // Probe both keys, a miss, and a duplicate to verify the fallback retains
+        // the rows and still applies key equality when their hashes collide.
+        let probe_values: ArrayRef =
+            Arc::new(Int32Array::from(vec![10_000, 7, 0, 10_000]));
+        let mut hashes = vec![0; probe_values.len()];
+        create_hashes([&probe_values], HASH_JOIN_SEED.random_state(), &mut hashes)?;
+        let (build_ids, probe_ids, next_offset) = lookup_join_hashmap(
+            map.as_ref(),
+            &data.values,
+            &[probe_values],
+            NullEquality::NullEqualsNothing,
+            &hashes,
+            None,
+            8192,
+            (0, None),
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )?;
+        assert_eq!(build_ids, UInt64Array::from(vec![1, 0, 1]));
+        assert_eq!(probe_ids, UInt32Array::from(vec![0, 2, 3]));
+        assert!(next_offset.is_none());
         assert_eq!(pool.reserved(), expected);
         drop(data);
         assert_eq!(pool.reserved(), 0);
