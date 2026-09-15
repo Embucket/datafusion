@@ -27,7 +27,6 @@ use arrow::array::{
 };
 use arrow::buffer::ScalarBuffer;
 use arrow::datatypes::DataType;
-use arrow::util::bit_util::apply_bitwise_binary_op;
 use datafusion_common::Result;
 use datafusion_common::utils::split_vec_min_alloc;
 use datafusion_execution::memory_pool::proxy::VecAllocExt;
@@ -75,12 +74,8 @@ where
             "called with nullable input"
         );
         let array_values = array.as_primitive::<T>().values();
-        let n = lhs_rows.len();
-
-        // Build a packed comparison bitmask, then AND it into equal_to_results
-        let num_bytes = n.div_ceil(8);
-        let mut cmp_buf = vec![0u8; num_bytes];
-
+        // Most hash-selected candidates are equal. Preserve those bits and
+        // clear only mismatches, avoiding a temporary mask and a second pass.
         for (i, (&lhs_row, &rhs_row)) in lhs_rows.iter().zip(rhs_rows.iter()).enumerate()
         {
             if !equal_to_results.get_bit(i) {
@@ -98,20 +93,10 @@ where
             };
             // `left` was already canonicalized on append; canonicalize the
             // input so ±0 (and any future equivalence class) compares equal.
-            if left.is_eq(right.canonicalize()) {
-                cmp_buf[i / 8] |= 1 << (i % 8);
+            if !left.is_eq(right.canonicalize()) {
+                equal_to_results.set_bit(i, false);
             }
         }
-
-        // AND the comparison result into the existing equal_to_results bitmask
-        apply_bitwise_binary_op(
-            equal_to_results.as_slice_mut(),
-            0,
-            &cmp_buf,
-            0,
-            n,
-            |a, b| a & b,
-        );
     }
 
     pub fn vectorized_equal_nullable(
@@ -492,6 +477,89 @@ mod tests {
             };
 
         test_not_nullable_primitive_equal_to_internal(append, equal_to);
+    }
+
+    #[test]
+    fn primitive_vectorized_equality_preserves_prior_masks_and_tail_bits() {
+        use arrow::array::Decimal128Array;
+        use arrow::datatypes::Decimal128Type;
+
+        let array: ArrayRef = Arc::new(
+            Decimal128Array::from(vec![
+                -(10_i128.pow(38) - 1),
+                -1,
+                0,
+                1,
+                10_i128.pow(38) - 1,
+            ])
+            .with_precision_and_scale(38, 0)
+            .unwrap(),
+        );
+        let mut builder = PrimitiveGroupValueBuilder::<Decimal128Type, false>::new(
+            DataType::Decimal128(38, 0),
+        );
+        builder.vectorized_append(&array, &[0, 1, 2, 3, 4]).unwrap();
+        for n in [0, 1, 7, 8, 9, 63, 64, 65, 8193] {
+            let mut mask = make_true_buffer(n + 5);
+            let mut lhs = Vec::new();
+            let mut rhs = Vec::new();
+            let mut expected = Vec::new();
+            for i in 0..n {
+                if i % 3 == 0 {
+                    mask.set_bit(i, false);
+                    // Already-false candidates must not dereference either index.
+                    lhs.push(usize::MAX);
+                    rhs.push(usize::MAX);
+                    expected.push(false);
+                } else {
+                    lhs.push(i * 17 % 5);
+                    rhs.push(i * 13 % 5);
+                    expected.push(builder.equal_to(lhs[i], &array, rhs[i]));
+                }
+            }
+            expected.extend([true; 5]);
+            builder.vectorized_equal_to(&lhs, &array, &rhs, &mut mask);
+            assert_eq!(to_vec(&mask), expected, "n={n}");
+        }
+    }
+
+    #[test]
+    fn primitive_vectorized_equality_preserves_float_canonicalization() {
+        use arrow::array::Float64Array;
+        use arrow::datatypes::Float64Type;
+
+        let stored: ArrayRef = Arc::new(Float64Array::from(vec![
+            -0.0,
+            0.0,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        ]));
+        let input: ArrayRef = Arc::new(Float64Array::from(vec![
+            0.0,
+            -0.0,
+            f64::from_bits(0x7ff8_0000_0000_0001),
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        ]));
+        let mut builder =
+            PrimitiveGroupValueBuilder::<Float64Type, true>::new(DataType::Float64);
+        builder
+            .vectorized_append(&stored, &[0, 1, 2, 3, 4])
+            .unwrap();
+        let mut mask = make_true_buffer(5);
+        builder.vectorized_equal_to(
+            &[0, 1, 2, 3, 4],
+            &input,
+            &[0, 1, 2, 3, 4],
+            &mut mask,
+        );
+        assert_eq!(
+            to_vec(&mask),
+            (0..5)
+                .map(|i| builder.equal_to(i, &input, i))
+                .collect::<Vec<_>>()
+        );
     }
 
     fn test_not_nullable_primitive_equal_to_internal<A, E>(mut append: A, mut equal_to: E)
