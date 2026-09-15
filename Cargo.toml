@@ -196,7 +196,7 @@ regex = "1.12"
 rstest = "0.26.1"
 serde_json = "1"
 sha2 = "^0.11.0"
-sqlparser = { git = "https://github.com/Embucket/datafusion-sqlparser-rs.git", rev = "b35a88f35c54e95843b3bd2f12c10512e34da14a", default-features = false, features = [
+sqlparser = { git = "https://github.com/Embucket/datafusion-sqlparser-rs.git", rev = "8bef0fc58a0d75e058cd8e55476b0cb4521f9c78", default-features = false, features = [
     "std",
     "visitor",
 ] }
