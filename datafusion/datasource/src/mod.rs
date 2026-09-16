@@ -731,4 +731,23 @@ mod tests {
         // testing an empty path with `ignore_subdirectory` set to false
         assert!(url.contains(&Path::parse("/var/data/mytable/").unwrap(), false));
     }
+
+    #[test]
+    fn test_url_contains_full_path_regex() {
+        let url = ListingTableUrl::parse("s3://bucket/prefix/")
+            .unwrap()
+            .with_full_path_regex(
+                regex::Regex::new(r"\Aprefix/(?:nested/)?selected_[ab][.]csv\z").unwrap(),
+            );
+
+        assert!(url.get_glob().is_none());
+        assert_eq!(
+            url.get_full_path_regex().map(regex::Regex::as_str),
+            Some(r"\Aprefix/(?:nested/)?selected_[ab][.]csv\z")
+        );
+        assert!(url.contains(&Path::from("prefix/selected_a.csv"), true));
+        assert!(url.contains(&Path::from("prefix/nested/selected_b.csv"), true));
+        assert!(!url.contains(&Path::from("prefix/ignored.csv"), false));
+        assert!(!url.contains(&Path::from("other/selected_a.csv"), false));
+    }
 }
