@@ -121,6 +121,7 @@ fn try_create_array_map(
     batches: &[RecordBatch],
     on_left: &[PhysicalExprRef],
     reservation: &mut MemoryReservation,
+    prereserved_table_bytes: usize,
     perfect_hash_join_small_build_threshold: usize,
     perfect_hash_join_min_key_density: f64,
     null_equality: NullEquality,
@@ -187,12 +188,23 @@ fn try_create_array_map(
     }
 
     let mem_size = ArrayMap::estimate_memory_size(min_val, max_val, num_row);
-    reservation.try_grow(mem_size)?;
+    // The direct map replaces, rather than coexists with, the general hash
+    // table. Claim only the positive replacement delta. If this optional
+    // representation cannot fit, the already-budgeted general map remains valid.
+    if let Err(error) =
+        reservation.try_grow(mem_size.saturating_sub(prereserved_table_bytes))
+    {
+        return match error {
+            DataFusionError::ResourcesExhausted(_) => Ok(None),
+            error => Err(error),
+        };
+    }
 
     let batch = concat_batches(schema, batches)?;
     let left_values = evaluate_expressions_to_arrays(on_left, &batch)?;
 
     let array_map = ArrayMap::try_new(&left_values[0], min_val, max_val)?;
+    reservation.shrink(prereserved_table_bytes.saturating_sub(mem_size));
 
     Ok(Some((array_map, batch, left_values)))
 }
@@ -589,8 +601,9 @@ impl From<&HashJoinExec> for HashJoinExecBuilder {
 /// (also known as a "perfect hash join") instead of a general-purpose hash map.
 /// This optimization is used when:
 /// 1. There is exactly one join key.
-/// 2. The join key is an integer type up to 64 bits wide that can be losslessly converted
-///    to `u64` (128-bit integer types such as `i128` and `u128` are not supported).
+/// 2. The join key is a native integer up to 64 bits, or Decimal128 whose complete
+///    build bounds fit i64. Decimal probes outside that domain cannot match and
+///    are rejected before any conversion; no Arrow array is narrowed or copied.
 /// 3. The range of keys is small enough (controlled by `perfect_hash_join_small_build_threshold`)
 ///    OR the keys are sufficiently dense (controlled by `perfect_hash_join_min_key_density`).
 /// 4. build_side.num_rows() < u32::MAX
@@ -2659,16 +2672,13 @@ pub(super) fn build_left_data(
             batches,
             on_left,
             &mut reservation,
+            prereserved_table_bytes,
             config.execution.perfect_hash_join_small_build_threshold,
             config.execution.perfect_hash_join_min_key_density,
             null_equality,
         )? {
             array_map_created_count.add(1);
             metrics.build_mem_used.add(array_map.size());
-            // The perfect-hash map replaces the hash table the caller
-            // pre-reserved for; release that estimate.
-            reservation.shrink(prereserved_table_bytes);
-
             (Map::ArrayMap(array_map), batch, left_value)
         } else {
             // Estimation of memory size, required for hashtable, prior to allocation.
@@ -2837,6 +2847,109 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn decimal_array_map_matches_general_hash_join() -> Result<()> {
+        use arrow::array::Decimal128Array;
+
+        let make_input = |name: &str,
+                          keys: Vec<Option<i128>>,
+                          scale|
+         -> Result<Arc<dyn ExecutionPlan>> {
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                name,
+                DataType::Decimal128(38, scale),
+                true,
+            )]));
+            let array =
+                Decimal128Array::from(keys).with_precision_and_scale(38, scale)?;
+            let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(array)])?;
+            Ok(TestMemoryExec::try_new_exec(&[vec![batch]], schema, None)?)
+        };
+
+        for scale in [0, 2, 19] {
+            for wide_build in [false, true] {
+                let mut keys = vec![Some(-2), Some(-1), Some(-1), Some(0), Some(1), None];
+                if wide_build {
+                    keys.push(Some((1_i128 << 64) - 1));
+                }
+                let left = make_input("l", keys, scale)?;
+                let right = make_input(
+                    "r",
+                    vec![
+                        Some(-2),
+                        Some(-1),
+                        Some(0),
+                        Some(1),
+                        None,
+                        Some((1_i128 << 64) - 1),
+                        Some(1_i128 << 64),
+                        Some(1 - (1_i128 << 64)),
+                    ],
+                    scale,
+                )?;
+                let on: JoinOn =
+                    vec![(Arc::new(Column::new("l", 0)), Arc::new(Column::new("r", 0)))];
+                for null_equality in [
+                    NullEquality::NullEqualsNothing,
+                    NullEquality::NullEqualsNull,
+                ] {
+                    for join_type in [
+                        JoinType::Inner,
+                        JoinType::Left,
+                        JoinType::Right,
+                        JoinType::Full,
+                        JoinType::LeftSemi,
+                        JoinType::RightSemi,
+                        JoinType::LeftAnti,
+                        JoinType::RightAnti,
+                        JoinType::LeftMark,
+                        JoinType::RightMark,
+                    ] {
+                        for mode in
+                            [PartitionMode::CollectLeft, PartitionMode::Partitioned]
+                        {
+                            let mut outputs = Vec::new();
+                            for enabled in [false, true] {
+                                let (_, batches, metrics) =
+                                    join_collect_with_partition_mode(
+                                        Arc::clone(&left),
+                                        Arc::clone(&right),
+                                        on.clone(),
+                                        &join_type,
+                                        mode,
+                                        null_equality,
+                                        prepare_task_ctx(1, enabled),
+                                    )
+                                    .await?;
+                                if mode == PartitionMode::CollectLeft {
+                                    let used = metrics
+                                        .sum_by_name(ARRAY_MAP_CREATED_COUNT_METRIC_NAME)
+                                        .map(|v| v.as_usize())
+                                        .unwrap_or(0)
+                                        > 0;
+                                    assert_eq!(
+                                        used,
+                                        enabled
+                                            && !wide_build
+                                            && null_equality
+                                                == NullEquality::NullEqualsNothing,
+                                        "scale={scale}, wide_build={wide_build}, {join_type:?}, {mode:?}, {null_equality:?}, enabled={enabled}",
+                                    );
+                                }
+                                outputs.push(batches_to_sort_string(&batches));
+                            }
+                            assert_eq!(
+                                outputs[0], outputs[1],
+                                "scale={scale}, wide_build={wide_build}, {join_type:?}, {mode:?}, {null_equality:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn build_schema_and_on() -> Result<(SchemaRef, SchemaRef, JoinOn)> {
         let left_schema = Arc::new(Schema::new(vec![
             Field::new("a1", DataType::Int32, true),
@@ -2851,6 +2964,119 @@ mod tests {
             Arc::new(Column::new_with_schema("b1", &right_schema)?) as _,
         )];
         Ok((left_schema, right_schema, on))
+    }
+
+    fn build_with_tight_map_budget(
+        keys: Vec<i32>,
+        allow_map_bytes: bool,
+    ) -> Result<(JoinLeftData, Arc<dyn MemoryPool>, usize, bool)> {
+        use datafusion_execution::memory_pool::GreedyMemoryPool;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int32, false)]));
+        let low = *keys.iter().min().unwrap();
+        let high = *keys.iter().max().unwrap();
+        let num_rows = keys.len();
+        let table_bytes = hash_table_estimate(num_rows)?;
+        let map_bytes = ArrayMap::estimate_memory_size(low as u64, high as u64, num_rows);
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(keys))],
+        )?;
+        let input_bytes = get_record_batch_memory_size(&batch);
+        let permitted_map = if allow_map_bytes { map_bytes } else { 0 };
+        println!(
+            "MAP_CAPACITY input={input_bytes} general={table_bytes} direct={map_bytes} cap={} allow_direct={allow_map_bytes}",
+            input_bytes + table_bytes.max(permitted_map)
+        );
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(
+            input_bytes + table_bytes.max(permitted_map),
+        ));
+        let reservation = MemoryConsumer::new("tight-map-test").register(&pool);
+        reservation.try_grow(input_bytes + table_bytes)?;
+        let mut config = ConfigOptions::default();
+        config.execution.perfect_hash_join_small_build_threshold = usize::MAX;
+        config.execution.perfect_hash_join_min_key_density = 0.0;
+        let metrics = ExecutionPlanMetricsSet::new();
+        let created = Count::new();
+        let data = build_left_data(
+            &[batch],
+            num_rows,
+            &schema,
+            &[Arc::new(Column::new("k", 0))],
+            HASH_JOIN_SEED.random_state(),
+            reservation,
+            &BuildProbeJoinMetrics::new(0, &metrics),
+            false,
+            1,
+            Some(PartitionBounds::new(vec![ColumnBounds::new(
+                ScalarValue::Int32(Some(low)),
+                ScalarValue::Int32(Some(high)),
+            )])),
+            false,
+            &config,
+            NullEquality::NullEqualsNothing,
+            &created,
+            table_bytes,
+            None,
+        )?;
+        let expected = input_bytes
+            + if allow_map_bytes {
+                map_bytes
+            } else {
+                table_bytes
+            };
+        Ok((data, pool, expected, created.value() > 0))
+    }
+
+    #[test]
+    fn direct_map_reuses_pre_reserved_table_capacity() -> Result<()> {
+        // Cover both releasing an overestimate and growing only the positive
+        // replacement delta. Both fail if old and replacement estimates overlap.
+        for keys in [vec![0, 1, 2, 3], vec![0, 4095]] {
+            let (data, pool, expected, used_map) =
+                build_with_tight_map_budget(keys, true)?;
+            assert!(used_map);
+            assert_eq!(pool.reserved(), expected);
+            drop(data);
+            assert_eq!(pool.reserved(), 0);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn optional_direct_map_budget_rejection_keeps_general_hash_join() -> Result<()> {
+        let (data, pool, expected, used_map) =
+            build_with_tight_map_budget(vec![0, 10_000], false)?;
+        assert!(!used_map);
+        let Map::HashMap(map) = data.map.as_ref() else {
+            panic!("expected the general hash map after direct-map budget rejection");
+        };
+        // Bucket count is not a row count, especially with force_hash_collisions.
+        // Probe both keys, a miss, and a duplicate to verify the fallback retains
+        // the rows and still applies key equality when their hashes collide.
+        let probe_values: ArrayRef =
+            Arc::new(Int32Array::from(vec![10_000, 7, 0, 10_000]));
+        let mut hashes = vec![0; probe_values.len()];
+        create_hashes([&probe_values], HASH_JOIN_SEED.random_state(), &mut hashes)?;
+        let (build_ids, probe_ids, next_offset) = lookup_join_hashmap(
+            map.as_ref(),
+            &data.values,
+            &[probe_values],
+            NullEquality::NullEqualsNothing,
+            &hashes,
+            None,
+            8192,
+            (0, None),
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )?;
+        assert_eq!(build_ids, UInt64Array::from(vec![1, 0, 1]));
+        assert_eq!(probe_ids, UInt32Array::from(vec![0, 2, 3]));
+        assert!(next_offset.is_none());
+        assert_eq!(pool.reserved(), expected);
+        drop(data);
+        assert_eq!(pool.reserved(), 0);
+        Ok(())
     }
 
     use crate::coalesce_partitions::CoalescePartitionsExec;
@@ -2876,6 +3102,7 @@ mod tests {
         exec_err, internal_err,
     };
     use datafusion_execution::config::SessionConfig;
+    use datafusion_execution::memory_pool::MemoryPool;
     use datafusion_execution::runtime_env::RuntimeEnvBuilder;
     use datafusion_expr::Operator;
     use datafusion_physical_expr::expressions::{BinaryExpr, Literal};

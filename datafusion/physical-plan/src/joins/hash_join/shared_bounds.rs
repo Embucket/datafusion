@@ -238,9 +238,10 @@ fn combine_membership_and_bounds(
 ///
 /// ## Partition Counting
 ///
-/// The `total_partitions` count represents how many times `collect_build_side` will be called:
-/// - **CollectLeft**: Number of output partitions (each accesses shared build data)
-/// - **Partitioned**: Number of input partitions (each builds independently)
+/// Count independent build reports, not the number of probe streams:
+/// - **CollectLeft**: One report contains the complete shared build.
+/// - **Partitioned**: Every input partition builds independently and must report
+///   or be accounted for as canceled/unknown before a complete filter is safe.
 ///
 /// ## Thread Safety
 ///
@@ -355,23 +356,20 @@ enum FinalizeInput {
 impl SharedBuildAccumulator {
     /// Creates a new SharedBuildAccumulator configured for the given partition mode
     ///
-    /// This method calculates how many times `collect_build_side` will be called based on the
-    /// partition mode's execution pattern. This count is critical for determining when we have
-    /// complete information from all partitions to build the dynamic filter.
+    /// Count how many independent build results are needed for a complete filter.
     ///
     /// ## Partition Mode Execution Patterns
     ///
     /// - **CollectLeft**: Build side is collected ONCE from partition 0 and shared via `OnceFut`
-    ///   across all output partitions. Each output partition calls `collect_build_side` to access the shared build data.
-    ///   Although this results in multiple invocations, the  `report_partition_bounds` function contains deduplication logic to handle them safely.
-    ///   Expected calls = number of output partitions.
+    ///   across all output partitions. Every report therefore contains the same
+    ///   complete build. Expected reports = 1; waiting for all probes can deadlock
+    ///   when a parent polls only a subset of streams. Later reports are idempotent.
     ///
     ///
     /// - **Partitioned**: Each partition independently builds its own hash table by calling
     ///   `collect_build_side` once. Expected calls = number of build partitions.
     ///
-    /// - **Auto**: Placeholder mode resolved during optimization. Uses 1 as safe default since
-    ///   the actual mode will be determined and a new accumulator created before execution.
+    /// - **Auto**: Must be resolved during optimization, before execution.
     ///
     /// ## Why This Matters
     ///
@@ -392,10 +390,8 @@ impl SharedBuildAccumulator {
         // Troubleshooting: If partition counts are incorrect, verify this logic matches
         // the actual execution pattern in collect_build_side()
         let expected_calls = match partition_mode {
-            // Each output partition accesses shared build data
-            PartitionMode::CollectLeft => {
-                right_child.output_partitioning().partition_count()
-            }
+            // Any report already describes the complete OnceFut build.
+            PartitionMode::CollectLeft => 1,
             // Each partition builds its own data
             PartitionMode::Partitioned => {
                 left_child.output_partitioning().partition_count()
@@ -450,8 +446,8 @@ impl SharedBuildAccumulator {
 
     /// Report build-side data from a partition
     ///
-    /// This unified method handles both CollectLeft and Partitioned modes. When all partitions
-    /// have reported (barrier wait), the leader builds the appropriate filter expression:
+    /// Once all independent build results are available (one in CollectLeft),
+    /// the leader builds the appropriate filter expression:
     /// - CollectLeft: Simple conjunction of bounds and membership check
     /// - Partitioned: CASE expression routing to per-partition filters
     ///
@@ -960,6 +956,48 @@ mod tests {
             },
             test_on_right(),
         )
+    }
+
+    // Unlike the old helper (which hard-codes one expected report), use the
+    // production constructor with several probe partitions. A single report
+    // already describes the entire shared build, even if other probes are never
+    // polled by their parent or are canceled before reaching their build report.
+    #[tokio::test]
+    async fn collect_left_full_build_does_not_wait_for_unpolled_probes() {
+        let left = crate::empty::EmptyExec::new(test_probe_schema());
+        let right = crate::empty::EmptyExec::new(test_probe_schema()).with_partitions(6);
+        let on_right = test_on_right();
+        let dynamic_filter = test_dynamic_filter(&on_right);
+        let initial_generation = dynamic_filter.snapshot_generation();
+        let acc = SharedBuildAccumulator::new_from_partition_mode(
+            PartitionMode::CollectLeft,
+            &left,
+            &right,
+            Arc::clone(&dynamic_filter),
+            on_right,
+            SeededRandomState::with_seed(1),
+            NullEquality::NullEqualsNothing,
+            false,
+        );
+        for _ in 0..2 {
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                acc.report_build_data(PartitionBuildData::CollectLeft {
+                    pushdown: in_list(&[2, 5]),
+                    bounds: no_bounds(),
+                    keys_have_null: false,
+                }),
+            )
+            .await
+            .expect("a complete shared build must not wait for unpolled probe streams")
+            .unwrap();
+        }
+        assert_eq!(
+            dynamic_filter.snapshot_generation(),
+            initial_generation + 1,
+            "publish the filter only once"
+        );
+        assert_in_list_column_values(&current_expr(&acc), "probe_key", 0, &[2, 5]);
     }
 
     fn make_partitioned_expr_accumulator_for_test(
