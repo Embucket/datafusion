@@ -31,7 +31,25 @@ use log::debug;
 use object_store::path::DELIMITER;
 use object_store::path::Path;
 use object_store::{ObjectMeta, ObjectStore, ObjectStoreExt};
+use regex::Regex;
 use url::Url;
+
+#[derive(Debug, Clone)]
+struct FullPathRegex(Regex);
+
+impl PartialEq for FullPathRegex {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.as_str() == other.0.as_str()
+    }
+}
+
+impl Eq for FullPathRegex {}
+
+impl std::hash::Hash for FullPathRegex {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::hash::Hash::hash(self.0.as_str(), state);
+    }
+}
 
 /// A parsed URL identifying files for a listing table, see [`ListingTableUrl::parse`]
 /// for more information on the supported expressions
@@ -43,6 +61,8 @@ pub struct ListingTableUrl {
     prefix: Path,
     /// An optional glob expression used to filter files
     glob: Option<Pattern>,
+    /// An optional regular expression applied to the complete object path
+    full_path_regex: Option<FullPathRegex>,
     /// Optional table reference for the table this url belongs to
     table_ref: Option<TableReference>,
 }
@@ -153,6 +173,7 @@ impl ListingTableUrl {
             url,
             prefix,
             glob,
+            full_path_regex: None,
             table_ref: None,
         })
     }
@@ -172,6 +193,14 @@ impl ListingTableUrl {
 
     /// Returns `true` if `path` matches this [`ListingTableUrl`]
     pub fn contains(&self, path: &Path, ignore_subdirectory: bool) -> bool {
+        if let Some(regex) = &self.full_path_regex {
+            return self.strip_prefix(path).is_some() && regex.0.is_match(path.as_ref());
+        }
+
+        self.contains_without_regex(path, ignore_subdirectory)
+    }
+
+    fn contains_without_regex(&self, path: &Path, ignore_subdirectory: bool) -> bool {
         let Some(all_segments) = self.strip_prefix(path) else {
             return false;
         };
@@ -293,14 +322,27 @@ impl ListingTableUrl {
             }
         };
 
-        Ok(list
-            .try_filter(move |meta| {
-                let path = &meta.location;
-                let extension_match = path.as_ref().ends_with(file_extension);
-                let glob_match = self.contains(path, ignore_subdirectory);
-                futures::future::ready(extension_match && glob_match)
-            })
-            .boxed())
+        if let Some(regex) = &self.full_path_regex {
+            Ok(list
+                .try_filter(move |meta| {
+                    let path = &meta.location;
+                    let extension_match = path.as_ref().ends_with(file_extension);
+                    let regex_match = self.strip_prefix(path).is_some()
+                        && regex.0.is_match(path.as_ref());
+                    futures::future::ready(extension_match && regex_match)
+                })
+                .boxed())
+        } else {
+            Ok(list
+                .try_filter(move |meta| {
+                    let path = &meta.location;
+                    let extension_match = path.as_ref().ends_with(file_extension);
+                    let glob_match =
+                        self.contains_without_regex(path, ignore_subdirectory);
+                    futures::future::ready(extension_match && glob_match)
+                })
+                .boxed())
+        }
     }
 
     /// List all files identified by this [`ListingTableUrl`] for the provided `file_extension`
@@ -344,7 +386,25 @@ impl ListingTableUrl {
     pub fn with_glob(mut self, glob: &str) -> Result<Self> {
         self.glob =
             Some(Pattern::new(glob).map_err(|e| DataFusionError::External(Box::new(e)))?);
+        self.full_path_regex = None;
         Ok(self)
+    }
+
+    /// Returns the regular expression applied to the complete object path.
+    pub fn get_full_path_regex(&self) -> Option<&Regex> {
+        self.full_path_regex.as_ref().map(|regex| &regex.0)
+    }
+
+    /// Returns a copy of this [`ListingTableUrl`] with a precompiled regular expression that is
+    /// applied to the complete object path.
+    ///
+    /// The regular expression replaces any existing glob. Unlike the default path matching,
+    /// matching nested paths is controlled entirely by the regular expression and is therefore
+    /// unaffected by `listing_table_ignore_subdirectory`.
+    pub fn with_full_path_regex(mut self, regex: Regex) -> Self {
+        self.glob = None;
+        self.full_path_regex = Some(FullPathRegex(regex));
+        self
     }
 
     /// Set the table reference for this [`ListingTableUrl`]
@@ -785,6 +845,22 @@ mod tests {
             list_all_files("/t/", &store, "csv").await?,
             vec!["t/c.csv", "t/d.csv"],
         );
+
+        let session = MockSession::new();
+        let regex_url = ListingTableUrl::parse("memory:///t/")?.with_full_path_regex(
+            Regex::new(r"\At/(?:c|nested/e)[.]csv\z")
+                .map_err(|error| DataFusionError::External(Box::new(error)))?,
+        );
+        create_file(&store, "/t/nested/e.csv").await;
+        let regex_files = regex_url
+            .list_all_files(&session, &store, "csv")
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?
+            .into_iter()
+            .map(|meta| meta.location.to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(regex_files, ["t/c.csv", "t/nested/e.csv"]);
 
         // Test a non existing prefix
         assert_eq!(
