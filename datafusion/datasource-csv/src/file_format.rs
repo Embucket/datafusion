@@ -24,7 +24,7 @@ use std::sync::Arc;
 use crate::source::CsvSource;
 
 use arrow::array::RecordBatch;
-use arrow::csv::WriterBuilder;
+use arrow::csv::{CsvRecordErrorHandler, WriterBuilder};
 use arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef};
 use arrow::error::ArrowError;
 use datafusion_common::config::{ConfigField, ConfigFileType, CsvOptions};
@@ -134,6 +134,7 @@ impl GetExt for CsvFormatFactory {
 #[derive(Debug, Default)]
 pub struct CsvFormat {
     options: CsvOptions,
+    record_error_handler: Option<Arc<dyn CsvRecordErrorHandler>>,
 }
 
 impl CsvFormat {
@@ -197,6 +198,18 @@ impl CsvFormat {
     /// Set the csv options
     pub fn with_options(mut self, options: CsvOptions) -> Self {
         self.options = options;
+        self
+    }
+
+    /// Skip malformed field-count records and report them to `handler`.
+    ///
+    /// This recovery path retains source record bytes and disables file range
+    /// repartitioning. The default strict path is unchanged.
+    pub fn with_record_error_handler(
+        mut self,
+        handler: Arc<dyn CsvRecordErrorHandler>,
+    ) -> Self {
+        self.record_error_handler = Some(handler);
         self
     }
 
@@ -494,7 +507,11 @@ impl FileFormat for CsvFormat {
         if csv_options.has_header.is_none() {
             csv_options.has_header = Some(true);
         }
-        Arc::new(CsvSource::new(table_schema).with_csv_options(csv_options))
+        let mut source = CsvSource::new(table_schema).with_csv_options(csv_options);
+        if let Some(handler) = &self.record_error_handler {
+            source = source.with_record_error_handler(Arc::clone(handler));
+        }
+        Arc::new(source)
     }
 }
 
