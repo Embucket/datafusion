@@ -165,7 +165,7 @@ checksum = "7c02d123df017efcdfbd739ef81735b36c5ba83ec3c59c80a9d7ecc718f92e50"
 [[package]]
 name = "arrow"
 version = "59.2.0"
-source = "git+https://github.com/Embucket/arrow-rs.git?rev=c992af1276ac5aabac2df59b89d6993525b8dbfc#c992af1276ac5aabac2df59b89d6993525b8dbfc"
+source = "git+https://github.com/Embucket/arrow-rs.git?rev=4aee61ac7892a32a832d0cef2d21886e2a0adcc0#4aee61ac7892a32a832d0cef2d21886e2a0adcc0"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -187,7 +187,7 @@ dependencies = [
 [[package]]
 name = "arrow-arith"
 version = "59.2.0"
-source = "git+https://github.com/Embucket/arrow-rs.git?rev=c992af1276ac5aabac2df59b89d6993525b8dbfc#c992af1276ac5aabac2df59b89d6993525b8dbfc"
+source = "git+https://github.com/Embucket/arrow-rs.git?rev=4aee61ac7892a32a832d0cef2d21886e2a0adcc0#4aee61ac7892a32a832d0cef2d21886e2a0adcc0"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -200,7 +200,7 @@ dependencies = [
 [[package]]
 name = "arrow-array"
 version = "59.2.0"
-source = "git+https://github.com/Embucket/arrow-rs.git?rev=c992af1276ac5aabac2df59b89d6993525b8dbfc#c992af1276ac5aabac2df59b89d6993525b8dbfc"
+source = "git+https://github.com/Embucket/arrow-rs.git?rev=4aee61ac7892a32a832d0cef2d21886e2a0adcc0#4aee61ac7892a32a832d0cef2d21886e2a0adcc0"
 dependencies = [
  "ahash",
  "arrow-buffer",
@@ -219,7 +219,7 @@ dependencies = [
 [[package]]
 name = "arrow-avro"
 version = "59.2.0"
-source = "git+https://github.com/Embucket/arrow-rs.git?rev=c992af1276ac5aabac2df59b89d6993525b8dbfc#c992af1276ac5aabac2df59b89d6993525b8dbfc"
+source = "git+https://github.com/Embucket/arrow-rs.git?rev=4aee61ac7892a32a832d0cef2d21886e2a0adcc0#4aee61ac7892a32a832d0cef2d21886e2a0adcc0"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -242,7 +242,7 @@ dependencies = [
 [[package]]
 name = "arrow-buffer"
 version = "59.2.0"
-source = "git+https://github.com/Embucket/arrow-rs.git?rev=c992af1276ac5aabac2df59b89d6993525b8dbfc#c992af1276ac5aabac2df59b89d6993525b8dbfc"
+source = "git+https://github.com/Embucket/arrow-rs.git?rev=4aee61ac7892a32a832d0cef2d21886e2a0adcc0#4aee61ac7892a32a832d0cef2d21886e2a0adcc0"
 dependencies = [
  "bytes",
  "half",
@@ -253,7 +253,7 @@ dependencies = [
 [[package]]
 name = "arrow-cast"
 version = "59.2.0"
-source = "git+https://github.com/Embucket/arrow-rs.git?rev=c992af1276ac5aabac2df59b89d6993525b8dbfc#c992af1276ac5aabac2df59b89d6993525b8dbfc"
+source = "git+https://github.com/Embucket/arrow-rs.git?rev=4aee61ac7892a32a832d0cef2d21886e2a0adcc0#4aee61ac7892a32a832d0cef2d21886e2a0adcc0"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -274,7 +274,7 @@ dependencies = [
 [[package]]
 name = "arrow-csv"
 version = "59.2.0"
-source = "git+https://github.com/Embucket/arrow-rs.git?rev=c992af1276ac5aabac2df59b89d6993525b8dbfc#c992af1276ac5aabac2df59b89d6993525b8dbfc"
+source = "git+https://github.com/Embucket/arrow-rs.git?rev=4aee61ac7892a32a832d0cef2d21886e2a0adcc0#4aee61ac7892a32a832d0cef2d21886e2a0adcc0"
 dependencies = [
  "arrow-array",
  "arrow-cast",
@@ -288,7 +288,7 @@ dependencies = [
 [[package]]
 name = "arrow-data"
 version = "59.2.0"
-source = "git+https://github.com/Embucket/arrow-rs.git?rev=c992af1276ac5aabac2df59b89d6993525b8dbfc#c992af1276ac5aabac2df59b89d6993525b8dbfc"
+source = "git+https://github.com/Embucket/arrow-rs.git?rev=4aee61ac7892a32a832d0cef2d21886e2a0adcc0#4aee61ac7892a32a832d0cef2d21886e2a0adcc0"
 dependencies = [
  "arrow-buffer",
  "arrow-schema",
@@ -300,7 +300,7 @@ dependencies = [
 [[package]]
 name = "arrow-flight"
 version = "59.2.0"
-source = "git+https://github.com/Embucket/arrow-rs.git?rev=c992af1276ac5aabac2df59b89d6993525b8dbfc#c992af1276ac5aabac2df59b89d6993525b8dbfc"
+source = "git+https://github.com/Embucket/arrow-rs.git?rev=4aee61ac7892a32a832d0cef2d21886e2a0adcc0#4aee61ac7892a32a832d0cef2d21886e2a0adcc0"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -326,7 +326,7 @@ dependencies = [
 [[package]]
 name = "arrow-ipc"
 version = "59.2.0"
-source = "git+https://github.com/Embucket/arrow-rs.git?rev=c992af1276ac5aabac2df59b89d6993525b8dbfc#c992af1276ac5aabac2df59b89d6993525b8dbfc"
+source = "git+https://github.com/Embucket/arrow-rs.git?rev=4aee61ac7892a32a832d0cef2d21886e2a0adcc0#4aee61ac7892a32a832d0cef2d21886e2a0adcc0"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -341,7 +341,7 @@ dependencies = [
 [[package]]
 name = "arrow-json"
 version = "59.2.0"
-source = "git+https://github.com/Embucket/arrow-rs.git?rev=c992af1276ac5aabac2df59b89d6993525b8dbfc#c992af1276ac5aabac2df59b89d6993525b8dbfc"
+source = "git+https://github.com/Embucket/arrow-rs.git?rev=4aee61ac7892a32a832d0cef2d21886e2a0adcc0#4aee61ac7892a32a832d0cef2d21886e2a0adcc0"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -365,7 +365,7 @@ dependencies = [
 [[package]]
 name = "arrow-ord"
 version = "59.2.0"
-source = "git+https://github.com/Embucket/arrow-rs.git?rev=c992af1276ac5aabac2df59b89d6993525b8dbfc#c992af1276ac5aabac2df59b89d6993525b8dbfc"
+source = "git+https://github.com/Embucket/arrow-rs.git?rev=4aee61ac7892a32a832d0cef2d21886e2a0adcc0#4aee61ac7892a32a832d0cef2d21886e2a0adcc0"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -377,7 +377,7 @@ dependencies = [
 [[package]]
 name = "arrow-row"
 version = "59.2.0"
-source = "git+https://github.com/Embucket/arrow-rs.git?rev=c992af1276ac5aabac2df59b89d6993525b8dbfc#c992af1276ac5aabac2df59b89d6993525b8dbfc"
+source = "git+https://github.com/Embucket/arrow-rs.git?rev=4aee61ac7892a32a832d0cef2d21886e2a0adcc0#4aee61ac7892a32a832d0cef2d21886e2a0adcc0"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -389,7 +389,7 @@ dependencies = [
 [[package]]
 name = "arrow-schema"
 version = "59.2.0"
-source = "git+https://github.com/Embucket/arrow-rs.git?rev=c992af1276ac5aabac2df59b89d6993525b8dbfc#c992af1276ac5aabac2df59b89d6993525b8dbfc"
+source = "git+https://github.com/Embucket/arrow-rs.git?rev=4aee61ac7892a32a832d0cef2d21886e2a0adcc0#4aee61ac7892a32a832d0cef2d21886e2a0adcc0"
 dependencies = [
  "bitflags",
  "serde",
@@ -400,7 +400,7 @@ dependencies = [
 [[package]]
 name = "arrow-select"
 version = "59.2.0"
-source = "git+https://github.com/Embucket/arrow-rs.git?rev=c992af1276ac5aabac2df59b89d6993525b8dbfc#c992af1276ac5aabac2df59b89d6993525b8dbfc"
+source = "git+https://github.com/Embucket/arrow-rs.git?rev=4aee61ac7892a32a832d0cef2d21886e2a0adcc0#4aee61ac7892a32a832d0cef2d21886e2a0adcc0"
 dependencies = [
  "ahash",
  "arrow-array",
@@ -413,7 +413,7 @@ dependencies = [
 [[package]]
 name = "arrow-string"
 version = "59.2.0"
-source = "git+https://github.com/Embucket/arrow-rs.git?rev=c992af1276ac5aabac2df59b89d6993525b8dbfc#c992af1276ac5aabac2df59b89d6993525b8dbfc"
+source = "git+https://github.com/Embucket/arrow-rs.git?rev=4aee61ac7892a32a832d0cef2d21886e2a0adcc0#4aee61ac7892a32a832d0cef2d21886e2a0adcc0"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4483,7 +4483,7 @@ dependencies = [
 [[package]]
 name = "parquet"
 version = "59.2.0"
-source = "git+https://github.com/Embucket/arrow-rs.git?rev=c992af1276ac5aabac2df59b89d6993525b8dbfc#c992af1276ac5aabac2df59b89d6993525b8dbfc"
+source = "git+https://github.com/Embucket/arrow-rs.git?rev=4aee61ac7892a32a832d0cef2d21886e2a0adcc0#4aee61ac7892a32a832d0cef2d21886e2a0adcc0"
 dependencies = [
  "ahash",
  "arrow-array",
