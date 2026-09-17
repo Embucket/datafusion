@@ -86,6 +86,7 @@ use tokio::io::AsyncWriteExt;
 #[derive(Debug, Clone)]
 pub struct CsvSource {
     options: CsvOptions,
+    record_error_handler: Option<Arc<dyn csv::CsvRecordErrorHandler>>,
     batch_size: Option<usize>,
     table_schema: TableSchema,
     projection: SplitProjection,
@@ -98,6 +99,7 @@ impl CsvSource {
         let table_schema = table_schema.into();
         Self {
             options: CsvOptions::default(),
+            record_error_handler: None,
             projection: SplitProjection::unprojected(&table_schema),
             table_schema,
             batch_size: None,
@@ -108,6 +110,15 @@ impl CsvSource {
     /// Sets the CSV options
     pub fn with_csv_options(mut self, options: CsvOptions) -> Self {
         self.options = options;
+        self
+    }
+
+    /// Skip malformed field-count records and report them to `handler`.
+    pub fn with_record_error_handler(
+        mut self,
+        handler: Arc<dyn csv::CsvRecordErrorHandler>,
+    ) -> Self {
+        self.record_error_handler = Some(handler);
         self
     }
 
@@ -205,6 +216,9 @@ impl CsvSource {
         if let Some(comment) = self.comment() {
             builder = builder.with_comment(comment);
         }
+        if let Some(handler) = &self.record_error_handler {
+            builder = builder.with_record_error_handler(Arc::clone(handler));
+        }
 
         builder
     }
@@ -298,7 +312,8 @@ impl FileSource for CsvSource {
     fn supports_repartitioning(&self) -> bool {
         // Cannot repartition if values may contain newlines, as record
         // boundaries cannot be determined by byte offset alone
-        !self.options.newlines_in_values.unwrap_or(false)
+        self.record_error_handler.is_none()
+            && !self.options.newlines_in_values.unwrap_or(false)
     }
 
     fn fmt_extra(&self, t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
@@ -328,6 +343,12 @@ impl FileSource for CsvSource {
     ) -> Result<Option<datafusion_proto_models::protobuf::PhysicalPlanNode>> {
         use datafusion_proto_models::protobuf;
         use protobuf::physical_plan_node::PhysicalPlanType;
+
+        if self.record_error_handler.is_some() {
+            return datafusion_common::not_impl_err!(
+                "CSV record error handlers cannot be serialized"
+            );
+        }
 
         let node = protobuf::CsvScanExecNode {
             base_conf: Some(base.try_to_proto(ctx)?),
@@ -646,5 +667,75 @@ impl CsvSource {
         .with_file_compression_type(FileCompressionType::UNCOMPRESSED)
         .build();
         Ok(DataSourceExec::from_data_source(conf))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{Int64Array, StringArray};
+    use arrow::csv::{CsvRecordError, CsvRecordErrorHandler};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::error::ArrowError;
+    use std::io::Cursor;
+    use std::sync::Mutex;
+
+    #[derive(Debug, Default)]
+    struct CollectRecordErrors(Mutex<Vec<(usize, usize, usize)>>);
+
+    impl CsvRecordErrorHandler for CollectRecordErrors {
+        fn handle(&self, error: &CsvRecordError<'_>) -> Result<(), ArrowError> {
+            self.0.lock().unwrap().push((
+                error.line_number,
+                error.byte_offset,
+                error.actual_fields,
+            ));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn record_error_handler_skips_malformed_rows_and_disables_repartitioning() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Utf8, false),
+        ]));
+        let handler = Arc::new(CollectRecordErrors::default());
+        let options = CsvOptions {
+            has_header: Some(false),
+            ..Default::default()
+        };
+        let mut source = CsvSource::new(schema)
+            .with_csv_options(options)
+            .with_record_error_handler(handler.clone());
+        source.batch_size = Some(1024);
+
+        assert!(!source.supports_repartitioning());
+        let batches = source
+            .open(Cursor::new(b"1,ok\n2,extra,value\n3\n4,after\n"))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(
+            batches[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values(),
+            &[1, 4]
+        );
+        assert_eq!(
+            batches[0]
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            [Some("ok"), Some("after")]
+        );
+        assert_eq!(*handler.0.lock().unwrap(), [(2, 5, 3), (3, 19, 1)]);
     }
 }
