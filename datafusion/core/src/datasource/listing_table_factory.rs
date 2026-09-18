@@ -85,7 +85,9 @@ impl TableProviderFactory for ListingTableFactory {
         };
 
         let mut seen_paths = HashSet::with_capacity(table_paths.len());
-        if let Some(duplicate) = table_paths.iter().find(|path| !seen_paths.insert(*path))
+        if let Some(duplicate) = table_paths
+            .iter()
+            .find(|path| !seen_paths.insert(path.as_str()))
         {
             return plan_err!(
                 "Duplicate location '{}' in CREATE EXTERNAL TABLE",
