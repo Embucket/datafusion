@@ -860,7 +860,7 @@ datafusion public date_trunc datafusion public date_trunc FUNCTION true String S
 datafusion public date_trunc datafusion public date_trunc FUNCTION true Time(ns) SCALAR Truncates a timestamp or time value to a specified precision. date_trunc(precision, expression)
 datafusion public date_trunc datafusion public date_trunc FUNCTION true Timestamp(ns) SCALAR Truncates a timestamp or time value to a specified precision. date_trunc(precision, expression)
 datafusion public date_trunc datafusion public date_trunc FUNCTION true Timestamp(ns, "+TZ") SCALAR Truncates a timestamp or time value to a specified precision. date_trunc(precision, expression)
-datafusion public rank datafusion public rank FUNCTION true NULL WINDOW Returns the rank of the current row within its partition, allowing gaps between ranks. This function provides a ranking similar to `row_number`, but skips ranks for identical values. rank()
+datafusion public rank datafusion public rank FUNCTION true UInt64 WINDOW Returns the rank of the current row within its partition, allowing gaps between ranks. This function provides a ranking similar to `row_number`, but skips ranks for identical values. rank()
 datafusion public string_agg datafusion public string_agg FUNCTION true String AGGREGATE Concatenates the values of string expressions and places separator values between them. If ordering is required, strings are concatenated in the specified order. This aggregation function can only mix DISTINCT and ORDER BY if the ordering expression is exactly the same as the first argument expression. string_agg([DISTINCT] expression, delimiter [ORDER BY expression])
 
 query B
@@ -887,6 +887,7 @@ datafusion public date_trunc 1 OUT NULL Timestamp(ns) NULL false 3
 datafusion public date_trunc 1 IN precision String NULL false 4
 datafusion public date_trunc 2 IN expression Timestamp(ns, "+TZ") NULL false 4
 datafusion public date_trunc 1 OUT NULL Timestamp(ns, "+TZ") NULL false 4
+datafusion public rank 1 OUT NULL UInt64 NULL false 0
 datafusion public string_agg 2 IN delimiter Null NULL false 0
 datafusion public string_agg 1 IN expression String NULL false 0
 datafusion public string_agg 1 OUT NULL String NULL false 0
@@ -901,6 +902,21 @@ select specific_name, data_type, ordinal_position, parameter_mode, rid from info
 repeat Int64 2 IN 0
 repeat String 1 IN 0
 repeat String 1 OUT 0
+
+# Nullary functions retain their OUT metadata, and OneOf signatures retain a
+# nested variadic marker even when no representative input type is available.
+query TTTB rowsort
+select specific_name, data_type, parameter_mode, is_variadic
+from information_schema.parameters
+where specific_name in ('count', 'current_date');
+----
+count Int64 OUT true
+current_date Date OUT false
+
+query TT??TTT
+show functions like 'count';
+----
+count Int64 [NULL] [NULL] AGGREGATE Returns the number of non-null values in the specified column. To include null values in the total count, use `count(*)`. count(expression)
 
 query TT??TTT rowsort
 show functions like 'date_trunc';
