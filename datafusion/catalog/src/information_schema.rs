@@ -375,6 +375,7 @@ impl InformationSchemaConfig {
                 );
             }
             if let Some(return_type) = return_type {
+                // OUT-only rows still need to retain overload arity (for example, COUNT()).
                 builder.add_parameter(
                     catalog_name,
                     schema_name,
@@ -384,7 +385,7 @@ impl InformationSchemaConfig {
                     None::<&str>,
                     return_type.as_str(),
                     None::<&str>,
-                    false,
+                    is_variadic,
                     rid,
                 );
             }
@@ -447,11 +448,32 @@ impl InformationSchemaConfig {
     }
 
     fn is_variadic(signature: &Signature) -> bool {
-        matches!(
-            signature.type_signature,
-            TypeSignature::Variadic(_) | TypeSignature::VariadicAny
-        )
+        fn contains_variadic(signature: &TypeSignature) -> bool {
+            match signature {
+                TypeSignature::Variadic(_) | TypeSignature::VariadicAny => true,
+                TypeSignature::OneOf(signatures) => {
+                    signatures.iter().any(contains_variadic)
+                }
+                _ => false,
+            }
+        }
+
+        contains_variadic(&signature.type_signature)
     }
+}
+
+fn get_nullary_return_type(
+    signature: &Signature,
+    return_field: impl FnOnce() -> Result<FieldRef>,
+) -> Option<String> {
+    signature
+        .type_signature
+        .supports_zero_argument()
+        .then(return_field)
+        .and_then(Result::ok)
+        .map(|field| {
+            remove_native_type_prefix(&NativeType::from(field.data_type().clone()))
+        })
 }
 
 /// get the arguments and return types of a UDF
@@ -462,7 +484,15 @@ fn get_udf_args_and_return_types(
     let signature = udf.signature();
     let arg_types = signature.type_signature.get_example_types();
     if arg_types.is_empty() {
-        Ok(vec![(vec![], None)].into_iter().collect::<BTreeSet<_>>())
+        let return_type = get_nullary_return_type(signature, || {
+            udf.return_field_from_args(ReturnFieldArgs {
+                arg_fields: &[],
+                scalar_arguments: &[],
+            })
+        });
+        Ok(vec![(vec![], return_type)]
+            .into_iter()
+            .collect::<BTreeSet<_>>())
     } else {
         Ok(arg_types
             .into_iter()
@@ -502,7 +532,10 @@ fn get_udaf_args_and_return_types(
     let signature = udaf.signature();
     let arg_types = signature.type_signature.get_example_types();
     if arg_types.is_empty() {
-        Ok(vec![(vec![], None)].into_iter().collect::<BTreeSet<_>>())
+        let return_type = get_nullary_return_type(signature, || udaf.return_field(&[]));
+        Ok(vec![(vec![], return_type)]
+            .into_iter()
+            .collect::<BTreeSet<_>>())
     } else {
         Ok(arg_types
             .into_iter()
@@ -538,7 +571,12 @@ fn get_udwf_args_and_return_types(
     let signature = udwf.signature();
     let arg_types = signature.type_signature.get_example_types();
     if arg_types.is_empty() {
-        Ok(vec![(vec![], None)].into_iter().collect::<BTreeSet<_>>())
+        let return_type = get_nullary_return_type(signature, || {
+            udwf.field(WindowUDFFieldArgs::new(&[], udwf.name()))
+        });
+        Ok(vec![(vec![], return_type)]
+            .into_iter()
+            .collect::<BTreeSet<_>>())
     } else {
         Ok(arg_types
             .into_iter()
