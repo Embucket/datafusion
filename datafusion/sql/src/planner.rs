@@ -879,6 +879,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
             | SQLDataType::Datetime64(_, _)
             | SQLDataType::FixedString(_)
             | SQLDataType::Map(_, _)
+            | SQLDataType::SnowflakeMap(_, _, _)
             | SQLDataType::Tuple(_)
             | SQLDataType::Nested(_)
             | SQLDataType::Object(_)
