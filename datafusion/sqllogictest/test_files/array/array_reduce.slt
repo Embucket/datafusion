@@ -62,7 +62,7 @@ SELECT array_reduce([1, NULL, 2], 0, (acc, value) -> acc + coalesce(value, 0));
 ----
 3
 
-# A null merge result is terminal and cannot be recovered by a later element.
+# A later element may recover a null accumulator.
 query I
 SELECT array_reduce(
   [1, 2],
@@ -70,7 +70,12 @@ SELECT array_reduce(
   (acc, value) -> CASE WHEN value = 1 THEN NULL ELSE coalesce(acc, 0) + value END
 );
 ----
-NULL
+2
+
+query I
+SELECT array_reduce([1, 2], NULL::BIGINT, (acc, value) -> coalesce(acc, 0) + value);
+----
+3
 
 query R
 SELECT array_reduce([1.2, 2.3], 0, (acc, value) -> acc + value);
@@ -92,6 +97,16 @@ FROM reduce_t;
 29
 36
 7
+NULL
+
+query I rowsort
+SELECT array_reduce(values, initial,
+                    (acc, value) -> CASE WHEN value = 1 THEN NULL ELSE coalesce(acc, 0) + value END)
+FROM reduce_t;
+----
+5
+7
+9
 NULL
 
 statement ok
