@@ -77,6 +77,11 @@ SELECT array_reduce([1, 2], NULL::BIGINT, (acc, value) -> coalesce(acc, 0) + val
 ----
 3
 
+query I
+SELECT array_reduce([1, NULL, 2], 0, (acc, value) -> coalesce(acc, 0) + value);
+----
+2
+
 query R
 SELECT array_reduce([1.2, 2.3], 0, (acc, value) -> acc + value);
 ----
@@ -107,6 +112,16 @@ FROM reduce_t;
 5
 7
 9
+NULL
+
+query I rowsort
+SELECT array_reduce(values, initial,
+                    (acc, value) -> CASE WHEN value = 1 THEN NULL ELSE coalesce(acc, 0) + value + extra END)
+FROM reduce_t;
+----
+25
+29
+7
 NULL
 
 statement ok
