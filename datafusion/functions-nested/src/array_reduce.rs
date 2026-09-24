@@ -271,9 +271,8 @@ impl HigherOrderUDFImpl for ArrayReduce {
             let mut scatter_indices = Vec::with_capacity(list.len());
 
             for row in 0..list.len() {
-                let active = accumulator.is_valid(row)
-                    && list.is_valid(row)
-                    && position < offsets[row + 1] - offsets[row];
+                let active =
+                    list.is_valid(row) && position < offsets[row + 1] - offsets[row];
                 if active {
                     source_indices.push(u64::try_from(offsets[row] + position).map_err(
                         |error| internal_datafusion_err!("invalid list index: {error}"),
