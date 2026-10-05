@@ -2478,6 +2478,27 @@ fn scalar_expr_planner_receives_wildcard_options() {
 }
 
 #[test]
+fn scalar_expr_planner_normalizes_wildcard_exclude() {
+    let state = mock_session_state().with_expr_planner(Arc::new(ScalarWildcardPlanner));
+    let plan = logical_plan_from_state(
+        "SELECT concat(* EXCLUDE FIRST_NAME) FROM person AS p",
+        &GenericDialect {},
+        ParserOptions::default(),
+        state,
+    )
+    .unwrap();
+
+    assert_snapshot!(
+        plan,
+        @r"
+    Projection: concat(p.last_name, p.state)
+      SubqueryAlias: p
+        TableScan: person
+    "
+    );
+}
+
+#[test]
 fn scalar_expr_planner_applies_wildcard_ilike() {
     let state = mock_session_state().with_expr_planner(Arc::new(ScalarWildcardPlanner));
     let plan = logical_plan_from_state(

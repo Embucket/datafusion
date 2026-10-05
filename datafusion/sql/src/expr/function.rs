@@ -40,25 +40,6 @@ use sqlparser::ast::{
     WindowType,
 };
 
-fn function_wildcard_options(
-    options: WildcardAdditionalOptions,
-) -> Result<Box<WildcardOptions>> {
-    if options.opt_alias.is_some() {
-        return not_impl_err!("wildcard function argument with AS alias");
-    }
-    if options.opt_replace.is_some() {
-        return not_impl_err!("wildcard function argument with REPLACE");
-    }
-
-    Ok(Box::new(WildcardOptions {
-        ilike: options.opt_ilike,
-        exclude: options.opt_exclude,
-        except: options.opt_except,
-        replace: None,
-        rename: options.opt_rename,
-    }))
-}
-
 /// Suggest a valid function based on an invalid input function name
 ///
 /// Returns `None` if no valid matches are found. This happens when there are no
@@ -247,6 +228,28 @@ impl FunctionArgs {
 type WithinGroupExtraction = (Vec<SortExpr>, Vec<Expr>, Vec<Option<ArgumentName>>);
 
 impl<S: ContextProvider> SqlToRel<'_, S> {
+    fn function_wildcard_options(
+        &self,
+        options: WildcardAdditionalOptions,
+    ) -> Result<Box<WildcardOptions>> {
+        if options.opt_alias.is_some() {
+            return not_impl_err!("wildcard function argument with AS alias");
+        }
+        if options.opt_replace.is_some() {
+            return not_impl_err!("wildcard function argument with REPLACE");
+        }
+
+        Ok(Box::new(WildcardOptions {
+            ilike: options.opt_ilike,
+            exclude: options
+                .opt_exclude
+                .map(|exclude| self.normalize_wildcard_exclude(exclude)),
+            except: options.opt_except,
+            replace: None,
+            rename: options.opt_rename,
+        }))
+    }
+
     pub(super) fn sql_function_to_expr(
         &self,
         function: SQLFunction,
@@ -1109,7 +1112,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 #[expect(deprecated)]
                 let expr = Expr::Wildcard {
                     qualifier: None,
-                    options: function_wildcard_options(options)?,
+                    options: self.function_wildcard_options(options)?,
                 };
                 Ok((expr, None))
             }
@@ -1140,7 +1143,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 #[expect(deprecated)]
                 let expr = Expr::Wildcard {
                     qualifier: qualifier.into(),
-                    options: function_wildcard_options(options)?,
+                    options: self.function_wildcard_options(options)?,
                 };
                 Ok((expr, None))
             }

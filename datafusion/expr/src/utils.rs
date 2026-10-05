@@ -367,18 +367,18 @@ fn get_excluded_columns(
         };
         idents.extend(exclude_owned.iter());
     }
-    // Excluded columns should be unique
+    // Lookup uses the resolved name, so quoting differences cannot distinguish duplicates.
     let n_elem = idents.len();
-    let unique_idents = idents.into_iter().collect::<HashSet<_>>();
-    // If HashSet size, and vector length are different, this means that some of the excluded columns
-    // are not unique. In this case return error.
-    if n_elem != unique_idents.len() {
+    let unique_names = idents
+        .into_iter()
+        .map(|ident| ident.value.as_str())
+        .collect::<HashSet<_>>();
+    if n_elem != unique_names.len() {
         return plan_err!("EXCLUDE or EXCEPT contains duplicate column names");
     }
 
     let mut result = vec![];
-    for ident in unique_idents.into_iter() {
-        let col_name = ident.value.as_str();
+    for col_name in unique_names {
         let (qualifier, field) = schema.qualified_field_with_name(qualifier, col_name)?;
         result.push(Column::from((qualifier, field)));
     }

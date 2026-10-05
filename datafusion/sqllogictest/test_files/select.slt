@@ -1289,6 +1289,24 @@ LIMIT 5
 100 1000
 200 2000
 
+# Unquoted EXCLUDE targets follow the same normalization as input columns.
+query III
+SELECT * EXCLUDE B FROM table1 ORDER BY a
+----
+1 100 1000
+2 200 2000
+
+# Quoted targets preserve case and match quoted aliases.
+query III
+SELECT * EXCLUDE "B" FROM (SELECT a, b AS "B", c, d FROM table1) ORDER BY a
+----
+1 100 1000
+2 200 2000
+
+# Quoted and unquoted spellings that resolve to one field are duplicates.
+statement error DataFusion error: Error during planning: EXCLUDE or EXCEPT contains duplicate column names
+SELECT * EXCLUDE (B, "b") FROM table1
+
 # when wildcard is prepended with table name, exclude should still work
 # below query should emit all the columns except a and b
 query II
