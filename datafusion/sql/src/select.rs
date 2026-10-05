@@ -54,9 +54,9 @@ use datafusion_expr::{
 
 use indexmap::IndexMap;
 use sqlparser::ast::{
-    Distinct, Expr as SQLExpr, GroupByExpr, NamedWindowExpr, OrderBy, RenameSelectItem,
-    SelectItemQualifiedWildcardKind, WildcardAdditionalOptions, WindowType,
-    visit_expressions_mut,
+    Distinct, ExcludeSelectItem, Expr as SQLExpr, GroupByExpr, NamedWindowExpr,
+    ObjectNamePart, OrderBy, RenameSelectItem, SelectItemQualifiedWildcardKind,
+    WildcardAdditionalOptions, WindowType, visit_expressions_mut,
 };
 use sqlparser::ast::{NamedWindowDefinition, Select, SelectItem, TableWithJoins};
 
@@ -1246,6 +1246,22 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         }
     }
 
+    pub(crate) fn normalize_wildcard_exclude(
+        &self,
+        mut exclude: ExcludeSelectItem,
+    ) -> ExcludeSelectItem {
+        let names = match &mut exclude {
+            ExcludeSelectItem::Single(name) => std::slice::from_mut(name),
+            ExcludeSelectItem::Multiple(names) => names,
+        };
+        for name in names {
+            if let [ObjectNamePart::Identifier(ident)] = name.0.as_mut_slice() {
+                ident.value = self.ident_normalizer.normalize(ident.clone());
+            }
+        }
+        exclude
+    }
+
     /// If there is a REPLACE statement in the projected expression in the form of
     /// "REPLACE (some_column_within_an_expr AS some_column)", we should plan the
     /// replace expressions first.
@@ -1256,6 +1272,9 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         planner_context: &mut PlannerContext,
         options: WildcardAdditionalOptions,
     ) -> Result<WildcardOptions> {
+        let exclude = options
+            .opt_exclude
+            .map(|exclude| self.normalize_wildcard_exclude(exclude));
         let rename = options.opt_rename.map(|mut rename| {
             let items = match &mut rename {
                 RenameSelectItem::Single(item) => std::slice::from_mut(item),
@@ -1269,7 +1288,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         });
         let planned_option = WildcardOptions {
             ilike: options.opt_ilike,
-            exclude: options.opt_exclude,
+            exclude,
             except: options.opt_except,
             replace: None,
             rename,
