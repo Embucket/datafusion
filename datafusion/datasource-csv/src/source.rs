@@ -48,6 +48,7 @@ use crate::file_format::CsvDecoder;
 use futures::{StreamExt, TryStreamExt};
 use object_store::buffered::BufWriter;
 use object_store::{GetOptions, GetResultPayload, ObjectStore};
+use regex::Regex;
 use tokio::io::AsyncWriteExt;
 
 /// A Config for [`CsvOpener`]
@@ -192,10 +193,10 @@ impl CsvSource {
 
 impl CsvSource {
     fn open<R: Read>(&self, reader: R) -> Result<csv::Reader<R>> {
-        Ok(self.builder().build(reader)?)
+        Ok(self.builder()?.build(reader)?)
     }
 
-    fn builder(&self) -> csv::ReaderBuilder {
+    fn builder(&self) -> Result<csv::ReaderBuilder> {
         let mut builder =
             csv::ReaderBuilder::new(Arc::clone(self.table_schema.file_schema()))
                 .with_delimiter(self.delimiter())
@@ -216,11 +217,19 @@ impl CsvSource {
         if let Some(comment) = self.comment() {
             builder = builder.with_comment(comment);
         }
+        if let Some(pattern) = &self.options.null_regex {
+            let regex = Regex::new(pattern).map_err(|error| {
+                exec_datafusion_err!(
+                    "Unable to parse CSV null regex '{pattern}': {error}"
+                )
+            })?;
+            builder = builder.with_null_regex(regex);
+        }
         if let Some(handler) = &self.record_error_handler {
             builder = builder.with_record_error_handler(Arc::clone(handler));
         }
 
-        builder
+        Ok(builder)
     }
 }
 
@@ -468,7 +477,7 @@ impl FileOpener for CsvOpener {
                 .await?
                 .map_err(DataFusionError::from);
 
-                let decoder = config.builder().build_decoder();
+                let decoder = config.builder()?.build_decoder();
                 let input = file_compression_type
                     .convert_stream(aligned_stream.boxed())?
                     .fuse();
@@ -502,7 +511,7 @@ impl FileOpener for CsvOpener {
                         .boxed())
                 }
                 GetResultPayload::Stream(s) => {
-                    let decoder = config.builder().build_decoder();
+                    let decoder = config.builder()?.build_decoder();
                     let s = s.map_err(DataFusionError::from);
                     let input = file_compression_type.convert_stream(s.boxed())?.fuse();
 
@@ -679,6 +688,51 @@ mod tests {
     use arrow::error::ArrowError;
     use std::io::Cursor;
     use std::sync::Mutex;
+
+    #[test]
+    fn csv_source_applies_null_regex_to_loaded_rows() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Utf8, true),
+        ]));
+        let input = Cursor::new(b"1,\\N\n2,ok\n3,\n");
+        let mut source = CsvSource::new(schema).with_csv_options(CsvOptions {
+            has_header: Some(false),
+            null_regex: Some(r"\A(?:\\N|)\z".to_owned()),
+            ..Default::default()
+        });
+        source.batch_size = Some(1024);
+        let batches = source
+            .open(input)
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        let values = batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(values.iter().collect::<Vec<_>>(), [None, Some("ok"), None]);
+
+        source.options.null_regex = Some(r"\A\\N\z".to_owned());
+        let batches = source
+            .open(Cursor::new(b"1,\\N\n2,ok\n3,\n"))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        let values = batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(
+            values.iter().collect::<Vec<_>>(),
+            [None, Some("ok"), Some("")]
+        );
+
+        source.options.null_regex = Some("(".to_owned());
+        assert!(source.open(Cursor::new(b"ok\n")).is_err());
+    }
 
     #[derive(Debug, Default)]
     struct CollectRecordErrors(Mutex<Vec<(usize, usize, usize)>>);
