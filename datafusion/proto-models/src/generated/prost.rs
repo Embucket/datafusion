@@ -1966,6 +1966,8 @@ pub struct CsvScanExecNode {
     pub truncate_rows: bool,
     #[prost(string, optional, tag = "9")]
     pub null_regex: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(bool, tag = "10")]
+    pub preserve_quoted_empty: bool,
     #[prost(oneof = "csv_scan_exec_node::OptionalEscape", tags = "5")]
     pub optional_escape: ::core::option::Option<csv_scan_exec_node::OptionalEscape>,
     #[prost(oneof = "csv_scan_exec_node::OptionalComment", tags = "6")]

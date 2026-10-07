@@ -256,6 +256,7 @@ impl From<&CsvOptionsProto> for CsvOptions {
             } else {
                 Some(proto.null_regex.clone())
             },
+            preserve_quoted_empty: proto.preserve_quoted_empty,
             comment: if !proto.comment.is_empty() {
                 Some(proto.comment[0])
             } else {

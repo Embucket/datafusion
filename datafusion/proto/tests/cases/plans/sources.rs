@@ -230,6 +230,7 @@ fn roundtrip_csv_scan_preserves_format_options() -> Result<()> {
             newlines_in_values: Some(true),
             truncated_rows: Some(true),
             null_regex: Some(r"\A(?:NA|)\z".to_owned()),
+            preserve_quoted_empty: Some(true),
             ..Default::default()
         }));
 
@@ -268,6 +269,7 @@ fn roundtrip_csv_scan_preserves_format_options() -> Result<()> {
     assert!(csv_source.newlines_in_values());
     assert!(csv_source.truncate_rows());
     assert_eq!(csv_source.null_regex(), Some(r"\A(?:NA|)\z"));
+    assert!(csv_source.preserve_quoted_empty());
     Ok(())
 }
 

@@ -951,6 +951,7 @@ async fn roundtrip_logical_plan_copy_to_csv() -> Result<()> {
     csv_format.timestamp_format = Some("HH:mm:ss.SSSSSS".to_string());
     csv_format.time_format = Some("HH:mm:ss".to_string());
     csv_format.null_value = Some("NIL".to_string());
+    csv_format.preserve_quoted_empty = Some(true);
     csv_format.compression = CompressionTypeVariant::GZIP;
     csv_format.compression_level = Some(6);
 
@@ -997,6 +998,10 @@ async fn roundtrip_logical_plan_copy_to_csv() -> Result<()> {
             assert_eq!(csv_format.timestamp_format, csv_config.timestamp_format);
             assert_eq!(csv_format.time_format, csv_config.time_format);
             assert_eq!(csv_format.null_value, csv_config.null_value);
+            assert_eq!(
+                csv_format.preserve_quoted_empty,
+                csv_config.preserve_quoted_empty
+            );
             assert_eq!(csv_format.compression, csv_config.compression);
             assert_eq!(csv_format.compression_level, csv_config.compression_level);
         }

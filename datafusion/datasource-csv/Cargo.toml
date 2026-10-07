@@ -54,6 +54,7 @@ datafusion-session = { workspace = true }
 futures = { workspace = true }
 object_store = { workspace = true }
 regex = { workspace = true }
+regex-syntax = "0.8"
 tokio = { workspace = true }
 
 # Note: add additional linter rules in lib.rs.

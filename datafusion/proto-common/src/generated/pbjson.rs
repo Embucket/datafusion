@@ -1738,6 +1738,9 @@ impl serde::Serialize for CsvOptions {
         if !self.ignore_trailing_whitespace.is_empty() {
             len += 1;
         }
+        if self.preserve_quoted_empty.is_some() {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("datafusion_common.CsvOptions", len)?;
         if !self.has_header.is_empty() {
             #[allow(clippy::needless_borrow)]
@@ -1833,6 +1836,9 @@ impl serde::Serialize for CsvOptions {
             #[allow(clippy::needless_borrows_for_generic_args)]
             struct_ser.serialize_field("ignoreTrailingWhitespace", pbjson::private::base64::encode(&self.ignore_trailing_whitespace).as_str())?;
         }
+        if let Some(v) = self.preserve_quoted_empty.as_ref() {
+            struct_ser.serialize_field("preserveQuotedEmpty", v)?;
+        }
         struct_ser.end()
     }
 }
@@ -1881,6 +1887,8 @@ impl<'de> serde::Deserialize<'de> for CsvOptions {
             "ignoreLeadingWhitespace",
             "ignore_trailing_whitespace",
             "ignoreTrailingWhitespace",
+            "preserve_quoted_empty",
+            "preserveQuotedEmpty",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -1907,6 +1915,7 @@ impl<'de> serde::Deserialize<'de> for CsvOptions {
             QuoteStyle,
             IgnoreLeadingWhitespace,
             IgnoreTrailingWhitespace,
+            PreserveQuotedEmpty,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -1950,6 +1959,7 @@ impl<'de> serde::Deserialize<'de> for CsvOptions {
                             "quoteStyle" | "quote_style" => Ok(GeneratedField::QuoteStyle),
                             "ignoreLeadingWhitespace" | "ignore_leading_whitespace" => Ok(GeneratedField::IgnoreLeadingWhitespace),
                             "ignoreTrailingWhitespace" | "ignore_trailing_whitespace" => Ok(GeneratedField::IgnoreTrailingWhitespace),
+                            "preserveQuotedEmpty" | "preserve_quoted_empty" => Ok(GeneratedField::PreserveQuotedEmpty),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -1991,6 +2001,7 @@ impl<'de> serde::Deserialize<'de> for CsvOptions {
                 let mut quote_style__ = None;
                 let mut ignore_leading_whitespace__ = None;
                 let mut ignore_trailing_whitespace__ = None;
+                let mut preserve_quoted_empty__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::HasHeader => {
@@ -2151,6 +2162,12 @@ impl<'de> serde::Deserialize<'de> for CsvOptions {
                                 Some(map_.next_value::<::pbjson::private::BytesDeserialize<_>>()?.0)
                             ;
                         }
+                        GeneratedField::PreserveQuotedEmpty => {
+                            if preserve_quoted_empty__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("preserveQuotedEmpty"));
+                            }
+                            preserve_quoted_empty__ = map_.next_value()?;
+                        }
                     }
                 }
                 Ok(CsvOptions {
@@ -2176,6 +2193,7 @@ impl<'de> serde::Deserialize<'de> for CsvOptions {
                     quote_style: quote_style__.unwrap_or_default(),
                     ignore_leading_whitespace: ignore_leading_whitespace__.unwrap_or_default(),
                     ignore_trailing_whitespace: ignore_trailing_whitespace__.unwrap_or_default(),
+                    preserve_quoted_empty: preserve_quoted_empty__,
                 })
             }
         }
