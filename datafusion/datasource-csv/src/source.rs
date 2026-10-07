@@ -132,6 +132,12 @@ impl CsvSource {
     pub fn truncate_rows(&self) -> bool {
         self.options.truncated_rows.unwrap_or(false)
     }
+
+    /// The pattern matching CSV fields that should be read as null.
+    pub fn null_regex(&self) -> Option<&str> {
+        self.options.null_regex.as_deref()
+    }
+
     /// A column delimiter
     pub fn delimiter(&self) -> u8 {
         self.options.delimiter
@@ -386,6 +392,7 @@ impl FileSource for CsvSource {
                 .transpose()?,
             newlines_in_values: self.newlines_in_values(),
             truncate_rows: self.truncate_rows(),
+            null_regex: self.options.null_regex.clone(),
         };
         Ok(Some(protobuf::PhysicalPlanNode {
             physical_plan_type: Some(PhysicalPlanType::CsvScan(node)),
@@ -659,6 +666,7 @@ impl CsvSource {
             quote: proto_str_to_byte(&scan.quote, "quote")?,
             newlines_in_values: Some(scan.newlines_in_values),
             truncated_rows: Some(scan.truncate_rows),
+            null_regex: scan.null_regex.clone(),
             ..Default::default()
         };
         let source = Arc::new(

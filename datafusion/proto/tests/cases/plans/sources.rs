@@ -229,6 +229,7 @@ fn roundtrip_csv_scan_preserves_format_options() -> Result<()> {
             comment: Some(b'#'),
             newlines_in_values: Some(true),
             truncated_rows: Some(true),
+            null_regex: Some(r"\A(?:NA|)\z".to_owned()),
             ..Default::default()
         }));
 
@@ -266,6 +267,7 @@ fn roundtrip_csv_scan_preserves_format_options() -> Result<()> {
     assert_eq!(csv_source.comment(), Some(b'#'));
     assert!(csv_source.newlines_in_values());
     assert!(csv_source.truncate_rows());
+    assert_eq!(csv_source.null_regex(), Some(r"\A(?:NA|)\z"));
     Ok(())
 }
 
