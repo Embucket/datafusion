@@ -249,6 +249,15 @@ impl CsvFormat {
         self
     }
 
+    /// Keep quoted empty fields distinct from unquoted empty fields during CSV scans.
+    ///
+    /// If the null matcher includes an empty field, this requires an explicit
+    /// table schema: CSV schema inference cannot recover quoting information.
+    pub fn with_preserve_quoted_empty(mut self, preserve: bool) -> Self {
+        self.options.preserve_quoted_empty = Some(preserve);
+        self
+    }
+
     /// Returns `Some(true)` if the first line is a header, `Some(false)` if
     /// it is not, and `None` if it is not specified.
     pub fn has_header(&self) -> Option<bool> {
@@ -559,12 +568,19 @@ impl CsvFormat {
                 )
                 .with_delimiter(self.options.delimiter)
                 .with_quote(self.options.quote)
+                .with_preserve_quoted_empty(
+                    self.options.preserve_quoted_empty.unwrap_or(false),
+                )
                 .with_truncated_rows(self.options.truncated_rows.unwrap_or(false));
 
             if let Some(null_regex) = &self.options.null_regex {
-                let regex = Regex::new(null_regex.as_str())
-                    .expect("Unable to parse CSV null regex.");
-                format = format.with_null_regex(regex);
+                if let Some(values) = crate::exact_null_values(null_regex) {
+                    format = format.with_null_values(values);
+                } else {
+                    let regex = Regex::new(null_regex.as_str())
+                        .expect("Unable to parse CSV null regex.");
+                    format = format.with_null_regex(regex);
+                }
             }
 
             if let Some(escape) = self.options.escape {
@@ -971,6 +987,7 @@ impl From<&CsvFormatFactory> for datafusion_proto_models::protobuf::CsvOptions {
                 time_format: options.time_format.clone().unwrap_or_default(),
                 null_value: options.null_value.clone().unwrap_or_default(),
                 null_regex: options.null_regex.clone().unwrap_or_default(),
+                preserve_quoted_empty: options.preserve_quoted_empty,
                 comment: options.comment.map_or(vec![], |v| vec![v]),
                 newlines_in_values: options
                     .newlines_in_values

@@ -48,6 +48,7 @@ use crate::file_format::CsvDecoder;
 use futures::{StreamExt, TryStreamExt};
 use object_store::buffered::BufWriter;
 use object_store::{GetOptions, GetResultPayload, ObjectStore};
+use regex::Regex;
 use tokio::io::AsyncWriteExt;
 
 /// A Config for [`CsvOpener`]
@@ -131,6 +132,17 @@ impl CsvSource {
     pub fn truncate_rows(&self) -> bool {
         self.options.truncated_rows.unwrap_or(false)
     }
+
+    /// The pattern matching CSV fields that should be read as null.
+    pub fn null_regex(&self) -> Option<&str> {
+        self.options.null_regex.as_deref()
+    }
+
+    /// Whether quoted empty fields bypass CSV null matching.
+    pub fn preserve_quoted_empty(&self) -> bool {
+        self.options.preserve_quoted_empty.unwrap_or(false)
+    }
+
     /// A column delimiter
     pub fn delimiter(&self) -> u8 {
         self.options.delimiter
@@ -192,10 +204,10 @@ impl CsvSource {
 
 impl CsvSource {
     fn open<R: Read>(&self, reader: R) -> Result<csv::Reader<R>> {
-        Ok(self.builder().build(reader)?)
+        Ok(self.builder()?.build(reader)?)
     }
 
-    fn builder(&self) -> csv::ReaderBuilder {
+    fn builder(&self) -> Result<csv::ReaderBuilder> {
         let mut builder =
             csv::ReaderBuilder::new(Arc::clone(self.table_schema.file_schema()))
                 .with_delimiter(self.delimiter())
@@ -205,6 +217,7 @@ impl CsvSource {
                 )
                 .with_header(self.has_header())
                 .with_quote(self.quote())
+                .with_preserve_quoted_empty(self.preserve_quoted_empty())
                 .with_truncated_rows(self.truncate_rows());
         if let Some(terminator) = self.terminator() {
             builder = builder.with_terminator(terminator);
@@ -216,11 +229,23 @@ impl CsvSource {
         if let Some(comment) = self.comment() {
             builder = builder.with_comment(comment);
         }
+        if let Some(pattern) = &self.options.null_regex {
+            if let Some(values) = crate::exact_null_values(pattern) {
+                builder = builder.with_null_values(values);
+            } else {
+                let regex = Regex::new(pattern).map_err(|error| {
+                    exec_datafusion_err!(
+                        "Unable to parse CSV null regex '{pattern}': {error}"
+                    )
+                })?;
+                builder = builder.with_null_regex(regex);
+            }
+        }
         if let Some(handler) = &self.record_error_handler {
             builder = builder.with_record_error_handler(Arc::clone(handler));
         }
 
-        builder
+        Ok(builder)
     }
 }
 
@@ -377,6 +402,8 @@ impl FileSource for CsvSource {
                 .transpose()?,
             newlines_in_values: self.newlines_in_values(),
             truncate_rows: self.truncate_rows(),
+            null_regex: self.options.null_regex.clone(),
+            preserve_quoted_empty: self.preserve_quoted_empty(),
         };
         Ok(Some(protobuf::PhysicalPlanNode {
             physical_plan_type: Some(PhysicalPlanType::CsvScan(node)),
@@ -468,7 +495,7 @@ impl FileOpener for CsvOpener {
                 .await?
                 .map_err(DataFusionError::from);
 
-                let decoder = config.builder().build_decoder();
+                let decoder = config.builder()?.build_decoder();
                 let input = file_compression_type
                     .convert_stream(aligned_stream.boxed())?
                     .fuse();
@@ -502,7 +529,7 @@ impl FileOpener for CsvOpener {
                         .boxed())
                 }
                 GetResultPayload::Stream(s) => {
-                    let decoder = config.builder().build_decoder();
+                    let decoder = config.builder()?.build_decoder();
                     let s = s.map_err(DataFusionError::from);
                     let input = file_compression_type.convert_stream(s.boxed())?.fuse();
 
@@ -650,6 +677,8 @@ impl CsvSource {
             quote: proto_str_to_byte(&scan.quote, "quote")?,
             newlines_in_values: Some(scan.newlines_in_values),
             truncated_rows: Some(scan.truncate_rows),
+            null_regex: scan.null_regex.clone(),
+            preserve_quoted_empty: Some(scan.preserve_quoted_empty),
             ..Default::default()
         };
         let source = Arc::new(
@@ -679,6 +708,77 @@ mod tests {
     use arrow::error::ArrowError;
     use std::io::Cursor;
     use std::sync::Mutex;
+
+    #[test]
+    fn csv_source_applies_null_regex_to_loaded_rows() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Utf8, true),
+        ]));
+        let input = Cursor::new(b"1,\\N\n2,ok\n3,\n");
+        let mut source = CsvSource::new(schema).with_csv_options(CsvOptions {
+            has_header: Some(false),
+            null_regex: Some(r"\A(?:\\N|)\z".to_owned()),
+            ..Default::default()
+        });
+        source.batch_size = Some(1024);
+        let batches = source
+            .open(input)
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        let values = batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(values.iter().collect::<Vec<_>>(), [None, Some("ok"), None]);
+
+        source.options.null_regex = Some(r"\A\\N\z".to_owned());
+        let batches = source
+            .open(Cursor::new(b"1,\\N\n2,ok\n3,\n"))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        let values = batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(
+            values.iter().collect::<Vec<_>>(),
+            [None, Some("ok"), Some("")]
+        );
+
+        source.options.null_regex = Some("(".to_owned());
+        assert!(source.open(Cursor::new(b"ok\n")).is_err());
+    }
+
+    #[test]
+    fn csv_source_distinguishes_quoted_empty_from_null() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Utf8, true),
+        ]));
+        let mut source = CsvSource::new(schema).with_csv_options(CsvOptions {
+            has_header: Some(false),
+            null_regex: Some(r"\A(?:NA|)\z".to_owned()),
+            preserve_quoted_empty: Some(true),
+            ..Default::default()
+        });
+        source.batch_size = Some(1024);
+        let batches = source
+            .open(Cursor::new(b"1,\n2,\"\"\n3,NA\n"))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        let values = batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(values.iter().collect::<Vec<_>>(), [None, Some(""), None]);
+    }
 
     #[derive(Debug, Default)]
     struct CollectRecordErrors(Mutex<Vec<(usize, usize, usize)>>);

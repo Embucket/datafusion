@@ -1029,6 +1029,7 @@ impl TryFrom<&protobuf::CsvOptions> for CsvOptions {
                 .then(|| proto_opts.null_value.clone()),
             null_regex: (!proto_opts.null_regex.is_empty())
                 .then(|| proto_opts.null_regex.clone()),
+            preserve_quoted_empty: proto_opts.preserve_quoted_empty,
             comment: proto_opts.comment.first().copied(),
             truncated_rows: proto_opts.truncated_rows.first().map(|h| *h != 0),
             quote_style: proto_opts.quote_style().into(),

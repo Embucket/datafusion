@@ -3689,6 +3689,8 @@ config_namespace! {
         pub null_value: Option<String>, default = None
         // The input regex for Nulls when loading CSVs.
         pub null_regex: Option<String>, default = None
+        /// Keep quoted empty CSV fields distinct from unquoted empty fields when matching nulls.
+        pub preserve_quoted_empty: Option<bool>, default = None
         pub comment: Option<u8>, default = None
         /// Whether to allow truncated rows when parsing, both within a single file and across files.
         ///

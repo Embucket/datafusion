@@ -4381,6 +4381,12 @@ impl serde::Serialize for CsvScanExecNode {
         if self.truncate_rows {
             len += 1;
         }
+        if self.null_regex.is_some() {
+            len += 1;
+        }
+        if self.preserve_quoted_empty {
+            len += 1;
+        }
         if self.optional_escape.is_some() {
             len += 1;
         }
@@ -4405,6 +4411,12 @@ impl serde::Serialize for CsvScanExecNode {
         }
         if self.truncate_rows {
             struct_ser.serialize_field("truncateRows", &self.truncate_rows)?;
+        }
+        if let Some(v) = self.null_regex.as_ref() {
+            struct_ser.serialize_field("nullRegex", v)?;
+        }
+        if self.preserve_quoted_empty {
+            struct_ser.serialize_field("preserveQuotedEmpty", &self.preserve_quoted_empty)?;
         }
         if let Some(v) = self.optional_escape.as_ref() {
             match v {
@@ -4440,6 +4452,10 @@ impl<'de> serde::Deserialize<'de> for CsvScanExecNode {
             "newlinesInValues",
             "truncate_rows",
             "truncateRows",
+            "null_regex",
+            "nullRegex",
+            "preserve_quoted_empty",
+            "preserveQuotedEmpty",
             "escape",
             "comment",
         ];
@@ -4452,6 +4468,8 @@ impl<'de> serde::Deserialize<'de> for CsvScanExecNode {
             Quote,
             NewlinesInValues,
             TruncateRows,
+            NullRegex,
+            PreserveQuotedEmpty,
             Escape,
             Comment,
         }
@@ -4481,6 +4499,8 @@ impl<'de> serde::Deserialize<'de> for CsvScanExecNode {
                             "quote" => Ok(GeneratedField::Quote),
                             "newlinesInValues" | "newlines_in_values" => Ok(GeneratedField::NewlinesInValues),
                             "truncateRows" | "truncate_rows" => Ok(GeneratedField::TruncateRows),
+                            "nullRegex" | "null_regex" => Ok(GeneratedField::NullRegex),
+                            "preserveQuotedEmpty" | "preserve_quoted_empty" => Ok(GeneratedField::PreserveQuotedEmpty),
                             "escape" => Ok(GeneratedField::Escape),
                             "comment" => Ok(GeneratedField::Comment),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
@@ -4508,6 +4528,8 @@ impl<'de> serde::Deserialize<'de> for CsvScanExecNode {
                 let mut quote__ = None;
                 let mut newlines_in_values__ = None;
                 let mut truncate_rows__ = None;
+                let mut null_regex__ = None;
+                let mut preserve_quoted_empty__ = None;
                 let mut optional_escape__ = None;
                 let mut optional_comment__ = None;
                 while let Some(k) = map_.next_key()? {
@@ -4548,6 +4570,18 @@ impl<'de> serde::Deserialize<'de> for CsvScanExecNode {
                             }
                             truncate_rows__ = Some(map_.next_value()?);
                         }
+                        GeneratedField::NullRegex => {
+                            if null_regex__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("nullRegex"));
+                            }
+                            null_regex__ = map_.next_value()?;
+                        }
+                        GeneratedField::PreserveQuotedEmpty => {
+                            if preserve_quoted_empty__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("preserveQuotedEmpty"));
+                            }
+                            preserve_quoted_empty__ = Some(map_.next_value()?);
+                        }
                         GeneratedField::Escape => {
                             if optional_escape__.is_some() {
                                 return Err(serde::de::Error::duplicate_field("escape"));
@@ -4569,6 +4603,8 @@ impl<'de> serde::Deserialize<'de> for CsvScanExecNode {
                     quote: quote__.unwrap_or_default(),
                     newlines_in_values: newlines_in_values__.unwrap_or_default(),
                     truncate_rows: truncate_rows__.unwrap_or_default(),
+                    null_regex: null_regex__,
+                    preserve_quoted_empty: preserve_quoted_empty__.unwrap_or_default(),
                     optional_escape: optional_escape__,
                     optional_comment: optional_comment__,
                 })
