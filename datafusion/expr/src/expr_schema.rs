@@ -216,7 +216,9 @@ fn case_field_metadata(case: &Case, schema: &dyn ExprSchema) -> Result<FieldRef>
                         else_type = data_type.clone();
                     }
                     certainly_null &= branch.certainly_null;
-                    if branch.certainly_null || data_type.is_null() {
+                    if data_type.is_null()
+                        || (branch.certainly_null && branch.field.metadata().is_empty())
+                    {
                         continue;
                     }
                     if branch_type.as_ref().is_some_and(|other| other != data_type)
@@ -1332,6 +1334,13 @@ mod tests {
             TryCast::new(Box::new(lit(ScalarValue::Null)), DataType::Int32),
         ))?;
         assert_eq!(try_cast_null_else.to_field(&schema)?.1.metadata(), &shared);
+
+        let typed_null = Expr::Cast(Cast::new_from_field(
+            Box::new(lit(ScalarValue::Null)),
+            Arc::new(Field::new("", DataType::Int32, true).with_metadata(shared.clone())),
+        ));
+        let all_typed_null = when(lit(true), typed_null.clone()).otherwise(typed_null)?;
+        assert_eq!(all_typed_null.to_field(&schema)?.1.metadata(), &shared);
 
         let mut nested = col("a");
         for _ in 0..128 {
