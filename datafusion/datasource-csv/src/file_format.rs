@@ -136,6 +136,7 @@ impl GetExt for CsvFormatFactory {
 pub struct CsvFormat {
     options: CsvOptions,
     record_error_handler: Option<Arc<dyn CsvRecordErrorHandler>>,
+    numeric_boolean_values: bool,
 }
 
 impl CsvFormat {
@@ -199,6 +200,12 @@ impl CsvFormat {
     /// Set the csv options
     pub fn with_options(mut self, options: CsvOptions) -> Self {
         self.options = options;
+        self
+    }
+
+    /// Accept exact `0` and `1` values in Boolean CSV columns.
+    pub fn with_numeric_boolean_values(mut self, allow: bool) -> Self {
+        self.numeric_boolean_values = allow;
         self
     }
 
@@ -492,7 +499,9 @@ impl FileFormat for CsvFormat {
         if csv_options.has_header.is_none() {
             csv_options.has_header = Some(true);
         }
-        let mut source = CsvSource::new(table_schema).with_csv_options(csv_options);
+        let mut source = CsvSource::new(table_schema)
+            .with_csv_options(csv_options)
+            .with_numeric_boolean_values(self.numeric_boolean_values);
         if let Some(handler) = &self.record_error_handler {
             source = source.with_record_error_handler(Arc::clone(handler));
         }
