@@ -587,7 +587,7 @@ impl SingleRowListArrayBuilder {
     pub fn with_field(mut self, field: &Field) -> Self {
         self.field_name = Some(field.name().to_owned());
         self.nullable = field.is_nullable();
-        self.field_metadata = field.metadata().clone();
+        self.field_metadata.clone_from(field.metadata());
         self
     }
 
