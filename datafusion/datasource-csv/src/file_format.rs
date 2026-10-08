@@ -24,8 +24,9 @@ use std::sync::Arc;
 use crate::source::CsvSource;
 
 use arrow::array::RecordBatch;
+use arrow::csv::reader::SnowflakeCsvTypeState;
 use arrow::csv::{CsvRecordErrorHandler, WriterBuilder};
-use arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef, TimeUnit};
+use arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef};
 use arrow::error::ArrowError;
 use datafusion_common::config::{ConfigField, ConfigFileType, CsvOptions};
 use datafusion_common::file_options::csv_writer::CsvWriterOptions;
@@ -606,7 +607,7 @@ impl CsvFormat {
         let mut column_names = vec![];
         let mut column_type_possibilities = vec![];
         let mut decimal_integral_digits = (DECIMAL && !SNOWFLAKE).then(Vec::new);
-        let mut ordered_types = SNOWFLAKE.then(Vec::<OrderedCsvType>::new);
+        let mut ordered_types = SNOWFLAKE.then(Vec::<SnowflakeCsvTypeState>::new);
         let mut record_number = -1;
         let initial_records_to_read = records_to_read;
 
@@ -648,27 +649,28 @@ impl CsvFormat {
                 format = format.with_comment(comment);
             }
 
-            let (Schema { fields, .. }, records_read) = if SNOWFLAKE {
-                format.infer_schema_with_snowflake_types(
-                    chunk.reader(),
-                    Some(records_to_read),
-                )?
+            let (Schema { fields, .. }, records_read, chunk_states) = if SNOWFLAKE {
+                let (schema, states, records) = format
+                    .infer_schema_with_snowflake_types(
+                        chunk.reader(),
+                        Some(records_to_read),
+                    )?;
+                (schema, records, states)
             } else if DECIMAL {
-                format.infer_schema_with_decimal(chunk.reader(), Some(records_to_read))?
+                let (schema, records) = format
+                    .infer_schema_with_decimal(chunk.reader(), Some(records_to_read))?;
+                (schema, records, Vec::new())
             } else {
-                format.infer_schema(chunk.reader(), Some(records_to_read))?
+                let (schema, records) =
+                    format.infer_schema(chunk.reader(), Some(records_to_read))?;
+                (schema, records, Vec::new())
             };
 
             if let Some(ordered) = ordered_types.as_mut() {
-                for (current, field) in ordered.iter_mut().zip(&fields) {
-                    current.merge(field);
+                for (current, next) in ordered.iter_mut().zip(&chunk_states) {
+                    current.merge(next);
                 }
-                ordered.extend(
-                    fields
-                        .iter()
-                        .skip(ordered.len())
-                        .map(|field| OrderedCsvType::from_field(field)),
-                );
+                ordered.extend(chunk_states.into_iter().skip(ordered.len()));
             }
 
             records_to_read -= records_read;
@@ -771,7 +773,7 @@ impl CsvFormat {
                         let data_type = if initial_records_to_read == 0 {
                             DataType::Utf8
                         } else {
-                            inferred.data_type
+                            inferred.data_type()
                         };
                         Field::new(name, data_type, true)
                     })
@@ -786,64 +788,6 @@ impl CsvFormat {
             )
         };
         Ok((schema, total_records_read))
-    }
-}
-
-struct OrderedCsvType {
-    data_type: DataType,
-    integral_digits: u16,
-}
-
-impl OrderedCsvType {
-    fn from_field(field: &Field) -> Self {
-        Self {
-            data_type: field.data_type().clone(),
-            integral_digits: csv_decimal_integral_digits(field).unwrap_or(0),
-        }
-    }
-
-    fn merge(&mut self, field: &Field) {
-        let next = Self::from_field(field);
-        self.data_type = match (&self.data_type, &next.data_type) {
-            (DataType::Null, other) => other.clone(),
-            (other, DataType::Null) => other.clone(),
-            (
-                DataType::Decimal128(_, left_scale),
-                DataType::Decimal128(_, right_scale),
-            ) if *left_scale >= 0 && *right_scale >= 0 => {
-                let scale = (*left_scale).max(*right_scale);
-                let integral_digits = self.integral_digits.max(next.integral_digits);
-                let precision =
-                    integral_digits.max(1) + u16::try_from(scale).unwrap_or(0);
-                match u8::try_from(precision) {
-                    Ok(precision @ 1..=38) => DataType::Decimal128(precision, scale),
-                    _ => DataType::Utf8,
-                }
-            }
-            (DataType::Decimal128(_, _), DataType::Float64) => DataType::Utf8,
-            (DataType::Float64, DataType::Decimal128(_, _)) => DataType::Float64,
-            (DataType::Date32, DataType::Timestamp(_, _)) => DataType::Date32,
-            (DataType::Timestamp(_, _), DataType::Date32) => DataType::Utf8,
-            (
-                DataType::Timestamp(left, left_tz),
-                DataType::Timestamp(right, right_tz),
-            ) if left_tz == right_tz => DataType::Timestamp(
-                max_csv_timestamp_unit(*left, *right),
-                left_tz.clone(),
-            ),
-            (left, right) if left == right => left.clone(),
-            _ => DataType::Utf8,
-        };
-        self.integral_digits = self.integral_digits.max(next.integral_digits);
-    }
-}
-
-fn max_csv_timestamp_unit(left: TimeUnit, right: TimeUnit) -> TimeUnit {
-    match (left, right) {
-        (TimeUnit::Nanosecond, _) | (_, TimeUnit::Nanosecond) => TimeUnit::Nanosecond,
-        (TimeUnit::Microsecond, _) | (_, TimeUnit::Microsecond) => TimeUnit::Microsecond,
-        (TimeUnit::Millisecond, _) | (_, TimeUnit::Millisecond) => TimeUnit::Millisecond,
-        _ => TimeUnit::Second,
     }
 }
 
@@ -1583,5 +1527,39 @@ mod tests {
                 DataType::Decimal128(6, 3),
             ]
         );
+
+        for (first, later, expected) in [
+            (
+                "2024-01-02",
+                "2024-01-02 01:02:03\n2024-01-02",
+                DataType::Date32,
+            ),
+            ("1e2", "1\n1e2", DataType::Float64),
+            (
+                "1234567890123456789012345678901234567",
+                "0.01",
+                DataType::Decimal128(38, 1),
+            ),
+            (
+                "12345678901234567890123456789012345678",
+                "0.1",
+                DataType::Decimal128(38, 0),
+            ),
+        ] {
+            let chunks = stream::iter(vec![
+                Ok(Bytes::from(format!("VALUE\n{first}\n"))),
+                Ok(Bytes::from(format!("{later}\n"))),
+            ]);
+            let (schema, _) = CsvFormat::default()
+                .with_has_header(true)
+                .infer_schema_from_stream_impl::<_, true, true>(
+                    &InferenceSession::new(),
+                    3,
+                    chunks,
+                )
+                .await
+                .unwrap();
+            assert_eq!(schema.field(0).data_type(), &expected, "{first}; {later}");
+        }
     }
 }
