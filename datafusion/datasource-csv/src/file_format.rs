@@ -400,33 +400,7 @@ impl FileFormat for CsvFormat {
         store: &Arc<dyn ObjectStore>,
         objects: &[ObjectMeta],
     ) -> Result<SchemaRef> {
-        let mut schemas = vec![];
-
-        let mut records_to_read = self
-            .options
-            .schema_infer_max_rec
-            .unwrap_or(DEFAULT_SCHEMA_INFER_MAX_RECORD);
-
-        for object in objects {
-            let stream = self.read_to_delimited_chunks(store, object).await;
-            let (schema, records_read) = self
-                .infer_schema_from_stream(state, records_to_read, stream)
-                .await
-                .map_err(|err| {
-                    DataFusionError::Context(
-                        format!("Error when processing CSV file {}", object.location),
-                        Box::new(err),
-                    )
-                })?;
-            records_to_read -= records_read;
-            schemas.push(schema);
-            if records_to_read == 0 {
-                break;
-            }
-        }
-
-        let merged_schema = Schema::try_merge(schemas)?;
-        Ok(Arc::new(merged_schema))
+        self.infer_schema_impl::<false>(state, store, objects).await
     }
 
     async fn infer_stats(
@@ -525,6 +499,56 @@ impl FileFormat for CsvFormat {
 }
 
 impl CsvFormat {
+    /// Infer exact fixed-point CSV numbers as Arrow decimals. The ordinary
+    /// `FileFormat::infer_schema` path retains its existing inference rules.
+    pub async fn infer_schema_with_decimal(
+        &self,
+        state: &dyn Session,
+        store: &Arc<dyn ObjectStore>,
+        object: &ObjectMeta,
+    ) -> Result<SchemaRef> {
+        self.infer_schema_impl::<true>(state, store, std::slice::from_ref(object))
+            .await
+    }
+
+    async fn infer_schema_impl<const DECIMAL: bool>(
+        &self,
+        state: &dyn Session,
+        store: &Arc<dyn ObjectStore>,
+        objects: &[ObjectMeta],
+    ) -> Result<SchemaRef> {
+        let mut schemas = vec![];
+        let mut records_to_read = self
+            .options
+            .schema_infer_max_rec
+            .unwrap_or(DEFAULT_SCHEMA_INFER_MAX_RECORD);
+
+        for object in objects {
+            let stream = self.read_to_delimited_chunks(store, object).await;
+            let (schema, records_read) = self
+                .infer_schema_from_stream_impl::<_, DECIMAL>(
+                    state,
+                    records_to_read,
+                    stream,
+                )
+                .await
+                .map_err(|err| {
+                    DataFusionError::Context(
+                        format!("Error when processing CSV file {}", object.location),
+                        Box::new(err),
+                    )
+                })?;
+            records_to_read -= records_read;
+            schemas.push(schema);
+            if records_to_read == 0 {
+                break;
+            }
+        }
+
+        let merged_schema = Schema::try_merge(schemas)?;
+        Ok(Arc::new(merged_schema))
+    }
+
     /// Return the inferred schema reading up to records_to_read from a
     /// stream of delimited chunks returning the inferred schema and the
     /// number of lines that were read.
@@ -544,12 +568,26 @@ impl CsvFormat {
     pub async fn infer_schema_from_stream(
         &self,
         state: &dyn Session,
-        mut records_to_read: usize,
+        records_to_read: usize,
         stream: impl Stream<Item = Result<Bytes>>,
+    ) -> Result<(Schema, usize)> {
+        self.infer_schema_from_stream_impl::<_, false>(state, records_to_read, stream)
+            .await
+    }
+
+    async fn infer_schema_from_stream_impl<
+        S: Stream<Item = Result<Bytes>>,
+        const DECIMAL: bool,
+    >(
+        &self,
+        state: &dyn Session,
+        mut records_to_read: usize,
+        stream: S,
     ) -> Result<(Schema, usize)> {
         let mut total_records_read = 0;
         let mut column_names = vec![];
         let mut column_type_possibilities = vec![];
+        let mut decimal_integral_digits = DECIMAL.then(Vec::new);
         let mut record_number = -1;
         let initial_records_to_read = records_to_read;
 
@@ -591,8 +629,11 @@ impl CsvFormat {
                 format = format.with_comment(comment);
             }
 
-            let (Schema { fields, .. }, records_read) =
-                format.infer_schema(chunk.reader(), Some(records_to_read))?;
+            let (Schema { fields, .. }, records_read) = if DECIMAL {
+                format.infer_schema_with_decimal(chunk.reader(), Some(records_to_read))?
+            } else {
+                format.infer_schema(chunk.reader(), Some(records_to_read))?
+            };
 
             records_to_read -= records_read;
             total_records_read += records_read;
@@ -603,6 +644,9 @@ impl CsvFormat {
                     .into_iter()
                     .map(|field| {
                         let mut possibilities = HashSet::new();
+                        if let Some(digits) = decimal_integral_digits.as_mut() {
+                            digits.push(csv_decimal_integral_digits(field).unwrap_or(0));
+                        }
                         if records_read > 0 {
                             // at least 1 data row read, record the inferred datatype
                             possibilities.insert(field.data_type().clone());
@@ -624,11 +668,18 @@ impl CsvFormat {
                 }
 
                 // First update type possibilities for existing columns using zip
-                column_type_possibilities.iter_mut().zip(&fields).for_each(
-                    |(possibilities, field)| {
-                        possibilities.insert(field.data_type().clone());
-                    },
-                );
+                for (index, (possibilities, field)) in column_type_possibilities
+                    .iter_mut()
+                    .zip(&fields)
+                    .enumerate()
+                {
+                    if let Some(digits) = decimal_integral_digits.as_mut()
+                        && let Some(field_digits) = csv_decimal_integral_digits(field)
+                    {
+                        digits[index] = digits[index].max(field_digits);
+                    }
+                    possibilities.insert(field.data_type().clone());
+                }
 
                 // Handle files with different numbers of columns by extending the schema
                 if fields.len() > column_type_possibilities.len() {
@@ -636,6 +687,9 @@ impl CsvFormat {
                     for field in fields.iter().skip(column_type_possibilities.len()) {
                         column_names.push(field.name().clone());
                         let mut possibilities = HashSet::new();
+                        if let Some(digits) = decimal_integral_digits.as_mut() {
+                            digits.push(csv_decimal_integral_digits(field).unwrap_or(0));
+                        }
                         if records_read > 0 {
                             possibilities.insert(field.data_type().clone());
                         }
@@ -649,12 +703,27 @@ impl CsvFormat {
             }
         }
 
-        let schema = build_schema_helper(
+        let schema = build_schema_helper::<DECIMAL>(
             column_names,
             column_type_possibilities,
+            decimal_integral_digits.as_deref(),
             initial_records_to_read == 0,
         );
         Ok((schema, total_records_read))
+    }
+}
+
+fn csv_decimal_integral_digits(field: &Field) -> Option<u16> {
+    let DataType::Decimal128(precision, scale) = field.data_type() else {
+        return None;
+    };
+    if field
+        .metadata()
+        .contains_key(arrow::csv::reader::CSV_DECIMAL_ZERO_INTEGRAL_METADATA_KEY)
+    {
+        Some(0)
+    } else {
+        u16::from(*precision).checked_sub(u16::try_from(*scale).ok()?)
     }
 }
 
@@ -669,21 +738,34 @@ impl CsvFormat {
 ///   set to 0, indicating the user wants to skip type inference and treat
 ///   all fields as strings. When false, columns with no inferred types
 ///   will be set to Null, allowing schema merging to work properly.
-fn build_schema_helper(
+fn build_schema_helper<const DECIMAL: bool>(
     names: Vec<String>,
     types: Vec<HashSet<DataType>>,
+    decimal_integral_digits: Option<&[u16]>,
     disable_inference: bool,
 ) -> Schema {
     let fields = names
         .into_iter()
         .zip(types)
-        .map(|(field_name, mut data_type_possibilities)| {
+        .enumerate()
+        .map(|(index, (field_name, mut data_type_possibilities))| {
             // ripped from arrow::csv::reader::infer_reader_schema_with_csv_options
             // determine data type based on possible types
             // if there are incompatible types, use DataType::Utf8
 
             // ignore nulls, to avoid conflicting datatypes (e.g. [nulls, int]) being inferred as Utf8.
             data_type_possibilities.remove(&DataType::Null);
+
+            if DECIMAL
+                && let Some(decimal_type) = merge_csv_decimal_types(
+                    &data_type_possibilities,
+                    decimal_integral_digits
+                        .and_then(|digits| digits.get(index))
+                        .copied(),
+                )
+            {
+                return Field::new(field_name, decimal_type, true);
+            }
 
             match data_type_possibilities.len() {
                 // When no types were inferred (empty HashSet):
@@ -718,6 +800,47 @@ fn build_schema_helper(
         })
         .collect::<Fields>();
     Schema::new(fields)
+}
+
+fn merge_csv_decimal_types(
+    types: &HashSet<DataType>,
+    actual_integral_digits: Option<u16>,
+) -> Option<DataType> {
+    if !types
+        .iter()
+        .any(|t| matches!(t, DataType::Decimal128(_, _)))
+        || !types
+            .iter()
+            .all(|t| matches!(t, DataType::Decimal128(_, _) | DataType::Float64))
+    {
+        return None;
+    }
+    let mut integral_digits = 0_u16;
+    let mut scale = 0_u16;
+    for data_type in types {
+        match data_type {
+            DataType::Decimal128(precision, field_scale) if *field_scale >= 0 => {
+                let field_scale = u16::try_from(*field_scale).ok()?;
+                integral_digits =
+                    integral_digits.max(u16::from(*precision).checked_sub(field_scale)?);
+                scale = scale.max(field_scale);
+            }
+            DataType::Float64 => return Some(DataType::Float64),
+            _ => return None,
+        }
+    }
+    let integral_digits = actual_integral_digits.unwrap_or(integral_digits);
+    let precision = integral_digits + scale;
+    let precision = if integral_digits == 0 && scale > 0 && precision < 38 {
+        precision + 1
+    } else {
+        precision.max(1)
+    };
+    if precision > 38 {
+        Some(DataType::Float64)
+    } else {
+        Some(DataType::Decimal128(precision as u8, scale as i8))
+    }
 }
 
 impl Default for CsvSerializer {
@@ -1010,9 +1133,99 @@ impl From<&CsvFormatFactory> for datafusion_proto_models::protobuf::CsvOptions {
 
 #[cfg(test)]
 mod tests {
-    use super::build_schema_helper;
+    use super::{CsvFormat, build_schema_helper};
     use arrow::datatypes::DataType;
-    use std::collections::HashSet;
+    use bytes::Bytes;
+    use datafusion_common::DFSchema;
+    use datafusion_common::config::TableOptions;
+    use datafusion_execution::TaskContext;
+    use datafusion_execution::config::SessionConfig;
+    use datafusion_execution::runtime_env::RuntimeEnv;
+    use datafusion_expr::execution_props::ExecutionProps;
+    use datafusion_expr::registry::ExtensionTypeRegistryRef;
+    use datafusion_expr::{
+        AggregateUDF, Expr, HigherOrderUDF, LogicalPlan, ScalarUDF, WindowUDF,
+    };
+    use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
+    use datafusion_physical_plan::ExecutionPlan;
+    use datafusion_session::{CatalogProviderList, EmptyCatalogProviderList, Session};
+    use futures::stream;
+    use std::any::Any;
+    use std::collections::{HashMap, HashSet};
+    use std::sync::Arc;
+
+    struct InferenceSession {
+        config: SessionConfig,
+        runtime_env: Arc<RuntimeEnv>,
+    }
+
+    impl InferenceSession {
+        fn new() -> Self {
+            Self {
+                config: SessionConfig::new(),
+                runtime_env: Arc::new(RuntimeEnv::default()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Session for InferenceSession {
+        fn session_id(&self) -> &str {
+            unimplemented!()
+        }
+        fn config(&self) -> &SessionConfig {
+            &self.config
+        }
+        fn catalog_list(&self) -> Arc<dyn CatalogProviderList> {
+            Arc::new(EmptyCatalogProviderList)
+        }
+        async fn create_physical_plan(
+            &self,
+            _: &LogicalPlan,
+        ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+            unimplemented!()
+        }
+        fn create_physical_expr(
+            &self,
+            _: Expr,
+            _: &DFSchema,
+        ) -> datafusion_common::Result<Arc<dyn PhysicalExpr>> {
+            unimplemented!()
+        }
+        fn scalar_functions(&self) -> &HashMap<String, Arc<ScalarUDF>> {
+            unimplemented!()
+        }
+        fn higher_order_functions(&self) -> &HashMap<String, Arc<HigherOrderUDF>> {
+            unimplemented!()
+        }
+        fn aggregate_functions(&self) -> &HashMap<String, Arc<AggregateUDF>> {
+            unimplemented!()
+        }
+        fn window_functions(&self) -> &HashMap<String, Arc<WindowUDF>> {
+            unimplemented!()
+        }
+        fn extension_type_registry(&self) -> &ExtensionTypeRegistryRef {
+            unimplemented!()
+        }
+        fn runtime_env(&self) -> &Arc<RuntimeEnv> {
+            &self.runtime_env
+        }
+        fn execution_props(&self) -> &ExecutionProps {
+            unimplemented!()
+        }
+        fn as_any(&self) -> &dyn Any {
+            unimplemented!()
+        }
+        fn table_options(&self) -> &TableOptions {
+            unimplemented!()
+        }
+        fn table_options_mut(&mut self) -> &mut TableOptions {
+            unimplemented!()
+        }
+        fn task_ctx(&self) -> Arc<TaskContext> {
+            unimplemented!()
+        }
+    }
 
     #[test]
     fn test_build_schema_helper_different_column_counts() {
@@ -1032,7 +1245,12 @@ mod tests {
             HashSet::from([DataType::Utf8]), // col5
         ];
 
-        let schema = build_schema_helper(column_names, column_type_possibilities, false);
+        let schema = build_schema_helper::<false>(
+            column_names,
+            column_type_possibilities,
+            None,
+            false,
+        );
 
         // Verify schema has 5 columns
         assert_eq!(schema.fields().len(), 5);
@@ -1062,7 +1280,12 @@ mod tests {
             HashSet::from([DataType::Utf8]),                     // Should remain Utf8
         ];
 
-        let schema = build_schema_helper(column_names, column_type_possibilities, false);
+        let schema = build_schema_helper::<false>(
+            column_names,
+            column_type_possibilities,
+            None,
+            false,
+        );
 
         // col1 should be Float64 due to Int64 + Float64 = Float64
         assert_eq!(*schema.field(0).data_type(), DataType::Float64);
@@ -1080,9 +1303,103 @@ mod tests {
             HashSet::from([DataType::Boolean, DataType::Int64, DataType::Utf8]), // Should resolve to Utf8 due to conflicts
         ];
 
-        let schema = build_schema_helper(column_names, column_type_possibilities, false);
+        let schema = build_schema_helper::<false>(
+            column_names,
+            column_type_possibilities,
+            None,
+            false,
+        );
 
         // Should default to Utf8 for conflicting types
         assert_eq!(*schema.field(0).data_type(), DataType::Utf8);
+    }
+
+    #[test]
+    fn test_opt_in_decimal_chunk_merging() {
+        let names = vec![
+            "DECIMAL".to_owned(),
+            "SCIENTIFIC".to_owned(),
+            "TEXT".to_owned(),
+            "MIXED_TEXT".to_owned(),
+        ];
+        let types = vec![
+            HashSet::from([DataType::Decimal128(3, 1), DataType::Decimal128(6, 3)]),
+            HashSet::from([DataType::Decimal128(3, 1), DataType::Float64]),
+            HashSet::from([DataType::Decimal128(3, 1), DataType::Utf8]),
+            HashSet::from([
+                DataType::Decimal128(3, 1),
+                DataType::Float64,
+                DataType::Utf8,
+            ]),
+        ];
+        let schema =
+            build_schema_helper::<true>(names.clone(), types.clone(), None, false);
+        assert_eq!(schema.field(0).data_type(), &DataType::Decimal128(6, 3));
+        assert_eq!(schema.field(1).data_type(), &DataType::Float64);
+        assert_eq!(schema.field(2).data_type(), &DataType::Utf8);
+        assert_eq!(schema.field(3).data_type(), &DataType::Utf8);
+
+        let legacy = build_schema_helper::<false>(names, types, None, false);
+        assert_eq!(legacy.field(0).data_type(), &DataType::Utf8);
+    }
+
+    #[test]
+    fn test_opt_in_decimal_chunk_precision_overflow() {
+        let schema = build_schema_helper::<true>(
+            vec!["VALUE".to_owned()],
+            vec![HashSet::from([
+                DataType::Decimal128(38, 0),
+                DataType::Decimal128(38, 38),
+            ])],
+            None,
+            false,
+        );
+        assert_eq!(schema.field(0).data_type(), &DataType::Float64);
+    }
+
+    #[tokio::test]
+    async fn test_opt_in_decimal_stream_preserves_zero_only_chunks() {
+        let tiny = format!("0.{}1", "0".repeat(37));
+        let chunks = stream::iter(vec![
+            Ok(Bytes::from_static(b"EXACT,MIXED\n0.1,1.20\n")),
+            Ok(Bytes::from(format!("{tiny},1e2\n"))),
+            Ok(Bytes::from(format!("{tiny},hello\n"))),
+        ]);
+        let (schema, records) = CsvFormat::default()
+            .with_has_header(true)
+            .infer_schema_from_stream_impl::<_, true>(&InferenceSession::new(), 3, chunks)
+            .await
+            .unwrap();
+        assert_eq!(records, 3);
+        assert_eq!(schema.field(0).data_type(), &DataType::Decimal128(38, 38));
+        assert_eq!(schema.field(1).data_type(), &DataType::Utf8);
+        assert!(schema.field(0).metadata().is_empty());
+
+        let zeros = stream::iter(vec![
+            Ok(Bytes::from_static(b"VALUE\n0\n")),
+            Ok(Bytes::from_static(b"-0.000\n")),
+        ]);
+        let (schema, records) = CsvFormat::default()
+            .with_has_header(true)
+            .infer_schema_from_stream_impl::<_, true>(&InferenceSession::new(), 2, zeros)
+            .await
+            .unwrap();
+        assert_eq!(records, 2);
+        assert_eq!(schema.field(0).data_type(), &DataType::Decimal128(1, 0));
+
+        let integer_and_tiny = stream::iter(vec![
+            Ok(Bytes::from_static(b"VALUE\n1\n")),
+            Ok(Bytes::from(format!("{tiny}\n"))),
+        ]);
+        let (schema, _) = CsvFormat::default()
+            .with_has_header(true)
+            .infer_schema_from_stream_impl::<_, true>(
+                &InferenceSession::new(),
+                2,
+                integer_and_tiny,
+            )
+            .await
+            .unwrap();
+        assert_eq!(schema.field(0).data_type(), &DataType::Float64);
     }
 }
