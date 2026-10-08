@@ -220,19 +220,22 @@ fn roundtrip_csv_scan_preserves_format_options() -> Result<()> {
     let file_schema =
         Arc::new(Schema::new(vec![Field::new("col", DataType::Utf8, false)]));
     let table_schema = TableSchema::from(&file_schema);
-    let file_source =
-        Arc::new(CsvSource::new(table_schema).with_csv_options(CsvOptions {
-            has_header: Some(false),
-            delimiter: b'|',
-            quote: b'\'',
-            escape: Some(b'\\'),
-            comment: Some(b'#'),
-            newlines_in_values: Some(true),
-            truncated_rows: Some(true),
-            null_regex: Some(r"\A(?:NA|)\z".to_owned()),
-            preserve_quoted_empty: Some(true),
-            ..Default::default()
-        }));
+    let file_source = Arc::new(
+        CsvSource::new(table_schema)
+            .with_csv_options(CsvOptions {
+                has_header: Some(false),
+                delimiter: b'|',
+                quote: b'\'',
+                escape: Some(b'\\'),
+                comment: Some(b'#'),
+                newlines_in_values: Some(true),
+                truncated_rows: Some(true),
+                null_regex: Some(r"\A(?:NA|)\z".to_owned()),
+                preserve_quoted_empty: Some(true),
+                ..Default::default()
+            })
+            .with_numeric_boolean_values(true),
+    );
 
     let scan_config =
         FileScanConfigBuilder::new(ObjectStoreUrl::local_filesystem(), file_source)
@@ -270,6 +273,7 @@ fn roundtrip_csv_scan_preserves_format_options() -> Result<()> {
     assert!(csv_source.truncate_rows());
     assert_eq!(csv_source.null_regex(), Some(r"\A(?:NA|)\z"));
     assert!(csv_source.preserve_quoted_empty());
+    assert!(csv_source.numeric_boolean_values());
     Ok(())
 }
 

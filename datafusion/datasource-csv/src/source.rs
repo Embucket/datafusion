@@ -122,6 +122,11 @@ impl CsvSource {
         self
     }
 
+    /// Whether exact `0` and `1` values are accepted in Boolean CSV columns.
+    pub fn numeric_boolean_values(&self) -> bool {
+        self.numeric_boolean_values
+    }
+
     /// Skip malformed field-count records and report them to `handler`.
     pub fn with_record_error_handler(
         mut self,
@@ -413,6 +418,7 @@ impl FileSource for CsvSource {
             truncate_rows: self.truncate_rows(),
             null_regex: self.options.null_regex.clone(),
             preserve_quoted_empty: self.preserve_quoted_empty(),
+            numeric_boolean_values: self.numeric_boolean_values(),
         };
         Ok(Some(protobuf::PhysicalPlanNode {
             physical_plan_type: Some(PhysicalPlanType::CsvScan(node)),
@@ -693,6 +699,7 @@ impl CsvSource {
         let source = Arc::new(
             CsvSource::new(table_schema)
                 .with_csv_options(csv_options)
+                .with_numeric_boolean_values(scan.numeric_boolean_values)
                 .with_escape(escape)
                 .with_comment(comment),
         );

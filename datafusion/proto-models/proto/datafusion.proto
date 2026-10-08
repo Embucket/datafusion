@@ -1288,6 +1288,7 @@ message CsvScanExecNode {
   bool truncate_rows = 8;
   optional string null_regex = 9;
   bool preserve_quoted_empty = 10;
+  bool numeric_boolean_values = 11;
 }
 
 message JsonScanExecNode {
