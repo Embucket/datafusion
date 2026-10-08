@@ -1968,6 +1968,8 @@ pub struct CsvScanExecNode {
     pub null_regex: ::core::option::Option<::prost::alloc::string::String>,
     #[prost(bool, tag = "10")]
     pub preserve_quoted_empty: bool,
+    #[prost(bool, tag = "11")]
+    pub numeric_boolean_values: bool,
     #[prost(oneof = "csv_scan_exec_node::OptionalEscape", tags = "5")]
     pub optional_escape: ::core::option::Option<csv_scan_exec_node::OptionalEscape>,
     #[prost(oneof = "csv_scan_exec_node::OptionalComment", tags = "6")]

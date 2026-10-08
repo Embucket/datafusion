@@ -87,6 +87,7 @@ use tokio::io::AsyncWriteExt;
 #[derive(Debug, Clone)]
 pub struct CsvSource {
     options: CsvOptions,
+    numeric_boolean_values: bool,
     record_error_handler: Option<Arc<dyn csv::CsvRecordErrorHandler>>,
     batch_size: Option<usize>,
     table_schema: TableSchema,
@@ -100,6 +101,7 @@ impl CsvSource {
         let table_schema = table_schema.into();
         Self {
             options: CsvOptions::default(),
+            numeric_boolean_values: false,
             record_error_handler: None,
             projection: SplitProjection::unprojected(&table_schema),
             table_schema,
@@ -112,6 +114,17 @@ impl CsvSource {
     pub fn with_csv_options(mut self, options: CsvOptions) -> Self {
         self.options = options;
         self
+    }
+
+    /// Accept exact numeric Boolean literals (`0` and `1`) while scanning CSV.
+    pub fn with_numeric_boolean_values(mut self, allow: bool) -> Self {
+        self.numeric_boolean_values = allow;
+        self
+    }
+
+    /// Whether exact `0` and `1` values are accepted in Boolean CSV columns.
+    pub fn numeric_boolean_values(&self) -> bool {
+        self.numeric_boolean_values
     }
 
     /// Skip malformed field-count records and report them to `handler`.
@@ -217,6 +230,7 @@ impl CsvSource {
                 )
                 .with_header(self.has_header())
                 .with_quote(self.quote())
+                .with_numeric_boolean_values(self.numeric_boolean_values)
                 .with_preserve_quoted_empty(self.preserve_quoted_empty())
                 .with_truncated_rows(self.truncate_rows());
         if let Some(terminator) = self.terminator() {
@@ -404,6 +418,7 @@ impl FileSource for CsvSource {
             truncate_rows: self.truncate_rows(),
             null_regex: self.options.null_regex.clone(),
             preserve_quoted_empty: self.preserve_quoted_empty(),
+            numeric_boolean_values: self.numeric_boolean_values(),
         };
         Ok(Some(protobuf::PhysicalPlanNode {
             physical_plan_type: Some(PhysicalPlanType::CsvScan(node)),
@@ -684,6 +699,7 @@ impl CsvSource {
         let source = Arc::new(
             CsvSource::new(table_schema)
                 .with_csv_options(csv_options)
+                .with_numeric_boolean_values(scan.numeric_boolean_values)
                 .with_escape(escape)
                 .with_comment(comment),
         );
@@ -702,12 +718,49 @@ impl CsvSource {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Int64Array, StringArray};
+    use arrow::array::{AsArray, Int64Array, StringArray};
     use arrow::csv::{CsvRecordError, CsvRecordErrorHandler};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::error::ArrowError;
     use std::io::Cursor;
     use std::sync::Mutex;
+
+    #[test]
+    fn csv_source_numeric_boolean_values_are_opt_in() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "flag",
+            DataType::Boolean,
+            false,
+        )]));
+        let mut source = CsvSource::new(schema).with_csv_options(CsvOptions {
+            has_header: Some(false),
+            ..Default::default()
+        });
+        source.batch_size = Some(1024);
+        let strict_error = source
+            .open(Cursor::new(b"true\n1\n0\nfalse\n"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            strict_error
+                .to_string()
+                .contains("value '1' as type 'Boolean'")
+        );
+
+        let batches = source
+            .with_numeric_boolean_values(true)
+            .open(Cursor::new(b"true\n1\n0\nfalse\n"))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        let values = batches[0].column(0).as_boolean();
+        assert_eq!(
+            values.values().iter().collect::<Vec<_>>(),
+            [true, true, false, false]
+        );
+    }
 
     #[test]
     fn csv_source_applies_null_regex_to_loaded_rows() {
