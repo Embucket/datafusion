@@ -1535,6 +1535,9 @@ mod tests {
                 DataType::Date32,
             ),
             ("1e2", "1\n1e2", DataType::Float64),
+            ("true", "1\nfalse", DataType::Boolean),
+            ("1", "true\n0", DataType::Utf8),
+            ("true", "1\n2", DataType::Utf8),
             (
                 "1234567890123456789012345678901234567",
                 "0.01",
