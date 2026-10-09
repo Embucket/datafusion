@@ -4385,7 +4385,7 @@ impl TryFrom<Expr> for AsOfMatch {
             Operator::Lt | Operator::LtEq | Operator::Gt | Operator::GtEq
         ) {
             return plan_err!(
-                "ASOF MATCH_CONDITION requires <, <=, >, or >=, found {op}"
+                "MATCH_CONDITION clause is invalid: Only comparison operators '>=', '>', '<=' and '<' are allowed. Keywords such as AND and OR are not allowed."
             );
         }
         Ok(Self::new(*left, op, *right))
@@ -4434,8 +4434,7 @@ impl AsOfJoin {
             Operator::Lt | Operator::LtEq | Operator::Gt | Operator::GtEq
         ) {
             return plan_err!(
-                "ASOF MATCH_CONDITION requires <, <=, >, or >=, found {}",
-                match_condition.op
+                "MATCH_CONDITION clause is invalid: Only comparison operators '>=', '>', '<=' and '<' are allowed. Keywords such as AND and OR are not allowed."
             );
         }
 
