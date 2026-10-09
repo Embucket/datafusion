@@ -60,8 +60,7 @@ use datafusion_common::{internal_err, tree_node::Transformed};
 use datafusion_expr::{BinaryExpr, lit};
 use datafusion_expr::{Cast, Expr, Operator, TryCast, simplify::SimplifyContext};
 use datafusion_expr_common::casts::{
-    is_date_narrowing_cast, is_supported_type, is_timestamp_precision_narrowing_cast,
-    try_cast_literal_to_type,
+    is_date_narrowing_cast, is_supported_type, try_cast_literal_to_type,
 };
 
 pub(super) fn unwrap_cast_in_comparison_for_binary(
@@ -133,7 +132,7 @@ pub(super) fn is_cast_expr_and_support_unwrap_cast_in_comparison_for_binary(
                 return false;
             };
 
-            if is_timestamp_precision_narrowing_cast(&expr_type, field.data_type())
+            if changes_timestamp_semantics(&expr_type, field.data_type())
                 || is_date_narrowing_cast(&expr_type, field.data_type())
             {
                 return false;
@@ -176,7 +175,7 @@ pub(super) fn is_cast_expr_and_support_unwrap_cast_in_comparison_for_inlist(
         return false;
     }
 
-    if is_timestamp_precision_narrowing_cast(&expr_type, field.data_type())
+    if changes_timestamp_semantics(&expr_type, field.data_type())
         || is_date_narrowing_cast(&expr_type, field.data_type())
     {
         return false;
@@ -199,6 +198,15 @@ pub(super) fn is_cast_expr_and_support_unwrap_cast_in_comparison_for_inlist(
     }
 
     true
+}
+
+fn changes_timestamp_semantics(from_type: &DataType, to_type: &DataType) -> bool {
+    // Changing units can truncate or overflow; attaching a timezone can shift values.
+    matches!(
+        (from_type, to_type),
+        (DataType::Timestamp(from_unit, from_tz), DataType::Timestamp(to_unit, to_tz))
+            if from_unit != to_unit || from_tz != to_tz
+    )
 }
 
 ///// Tries to move a cast from an expression (such as column) to the literal other side of a comparison operator./
@@ -594,15 +602,57 @@ mod tests {
     }
 
     #[test]
-    /// Basic integration test for unwrapping casts with different timezones
-    fn test_unwrap_cast_with_timestamp_nanos() {
+    fn test_not_unwrap_cast_with_timestamp_timezone_change() {
+        use arrow::array::{Array, TimestampNanosecondArray};
+        use arrow::compute::{CastOptions, cast_with_options};
+
+        let offset: Arc<str> = Arc::from("+01:00");
+        let offset_type =
+            DataType::Timestamp(TimeUnit::Nanosecond, Some(Arc::clone(&offset)));
+        let source = TimestampNanosecondArray::from(vec![Some(0)]);
+        let shifted = cast_with_options(
+            &source,
+            &offset_type,
+            &CastOptions {
+                safe: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let shifted = shifted
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>()
+            .unwrap();
+        assert_ne!(shifted.value(0), 0);
+
         let schema = expr_test_schema();
-        // cast(ts_nano as Timestamp(Nanosecond, UTC)) < 1666612093000000000::Timestamp(Nanosecond, Utc))
-        let expr_lt = try_cast(col("ts_nano_none"), timestamp_nano_utc_type())
-            .lt(lit_timestamp_nano_utc(1666612093000000000));
+        let widened = try_cast(col("ts_nano_none"), offset_type);
+        let offset_literal = |value| {
+            lit(ScalarValue::TimestampNanosecond(
+                Some(value),
+                Some(Arc::clone(&offset)),
+            ))
+        };
+        let equality = widened.clone().eq(offset_literal(0));
+        assert_eq!(optimize_test(equality.clone(), &schema), equality);
+
+        let list = in_list(
+            widened,
+            vec![
+                offset_literal(0),
+                offset_literal(1),
+                offset_literal(2),
+                offset_literal(3),
+            ],
+            false,
+        );
+        assert_eq!(optimize_test(list.clone(), &schema), list);
+
+        let unchanged = try_cast(col("ts_nano_utf"), timestamp_nano_utc_type())
+            .lt(lit_timestamp_nano_utc(1_666_612_093_000_000_000));
         let expected =
-            col("ts_nano_none").lt(lit_timestamp_nano_none(1666612093000000000));
-        assert_eq!(optimize_test(expr_lt, &schema), expected);
+            col("ts_nano_utf").lt(lit_timestamp_nano_utc(1_666_612_093_000_000_000));
+        assert_eq!(optimize_test(unchanged, &schema), expected);
     }
 
     #[test]
@@ -615,13 +665,102 @@ mod tests {
     }
 
     #[test]
-    fn test_unwrap_cast_timestamp_precision_widening() {
+    fn test_not_unwrap_cast_timestamp_precision_widening() {
         let schema = expr_test_schema();
         let expr_input = cast(col("ts_millis_none"), timestamp_nano_none_type())
             .eq(lit_timestamp_nano_none(1_000_000));
-        let expected = col("ts_millis_none").eq(lit_timestamp_millis_none(1));
+        assert_eq!(optimize_test(expr_input.clone(), &schema), expr_input);
 
-        assert_eq!(optimize_test(expr_input, &schema), expected);
+        let exact_list = in_list(
+            cast(col("ts_millis_none"), timestamp_nano_none_type()),
+            vec![
+                lit_timestamp_nano_none(1_000_000),
+                lit_timestamp_nano_none(2_000_000),
+                lit_timestamp_nano_none(3_000_000),
+                lit_timestamp_nano_none(4_000_000),
+            ],
+            false,
+        );
+        assert_eq!(optimize_test(exact_list.clone(), &schema), exact_list);
+    }
+
+    #[test]
+    fn test_not_unwrap_try_cast_timestamp_widening_that_can_overflow() {
+        use arrow::array::{Array, TimestampMillisecondArray};
+        use arrow::compute::{CastOptions, cast_with_options};
+
+        let overflow_ms = i64::MAX / 1_000_000 + 1;
+        let values = TimestampMillisecondArray::from(vec![Some(overflow_ms)]);
+        assert!(
+            cast_with_options(
+                &values,
+                &timestamp_nano_none_type(),
+                &CastOptions {
+                    safe: false,
+                    ..Default::default()
+                },
+            )
+            .is_err()
+        );
+        let safe_cast = cast_with_options(
+            &values,
+            &timestamp_nano_none_type(),
+            &CastOptions {
+                safe: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(safe_cast.is_null(0));
+
+        let schema = expr_test_schema();
+        let widened = try_cast(col("ts_millis_none"), timestamp_nano_none_type());
+        let equality = widened.clone().eq(lit_timestamp_nano_none(1_000_000));
+        assert_eq!(optimize_test(equality.clone(), &schema), equality);
+
+        let range = widened.clone().gt(lit_timestamp_nano_none(0));
+        assert_eq!(optimize_test(range.clone(), &schema), range);
+
+        let not_in = in_list(
+            widened,
+            vec![
+                lit_timestamp_nano_none(1_000_000),
+                lit_timestamp_nano_none(2_000_000),
+                lit_timestamp_nano_none(3_000_000),
+                lit_timestamp_nano_none(4_000_000),
+            ],
+            true,
+        );
+        assert_eq!(optimize_test(not_in.clone(), &schema), not_in);
+    }
+
+    #[test]
+    fn test_not_unwrap_timestamp_precision_widening_with_inexact_literal() {
+        let schema = expr_test_schema();
+        let column = cast(col("ts_millis_none"), timestamp_nano_none_type());
+
+        for literal in [1_000_001, -1] {
+            let equality = column.clone().eq(lit_timestamp_nano_none(literal));
+            assert_eq!(optimize_test(equality.clone(), &schema), equality);
+
+            let reversed = lit_timestamp_nano_none(literal).eq(column.clone());
+            assert_eq!(optimize_test(reversed.clone(), &schema), reversed);
+
+            let range = column.clone().lt(lit_timestamp_nano_none(literal));
+            assert_eq!(optimize_test(range.clone(), &schema), range);
+        }
+
+        let inexact_list = in_list(
+            column,
+            vec![
+                lit_timestamp_nano_none(1_000_000),
+                lit_timestamp_nano_none(2_000_001),
+                lit_timestamp_nano_none(3_000_000),
+                lit_timestamp_nano_none(4_000_000),
+            ],
+            false,
+        );
+        assert_eq!(optimize_test(inexact_list.clone(), &schema), inexact_list);
     }
 
     fn optimize_test(expr: Expr, schema: &DFSchemaRef) -> Expr {
