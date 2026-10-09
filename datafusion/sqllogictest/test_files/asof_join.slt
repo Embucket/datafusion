@@ -258,21 +258,21 @@ physical_plan
 05)----SortExec: expr=[grp@0 ASC, ts@1 ASC], preserve_partitioning=[false]
 06)------DataSourceExec: partitions=1, partition_sizes=[1]
 
-query error ASOF MATCH_CONDITION requires <, <=, >, or >=
+query error MATCH_CONDITION clause is invalid: Only comparison operators '>=', '>', '<=' and '<' are allowed
 SELECT *
 FROM asof_left l
 ASOF JOIN asof_right r
 MATCH_CONDITION (l.ts = r.ts)
 ON l.grp = r.grp;
 
-query error ASOF MATCH_CONDITION left operand must reference only the left input
+query error MATCH_CONDITION clause is invalid: The left side allows only column references from the left side table
 SELECT *
 FROM asof_left l
 ASOF JOIN asof_right r
 MATCH_CONDITION (r.ts >= l.ts)
 ON l.grp = r.grp;
 
-query error ASOF ON accepts only equality conditions combined with AND
+query error ON clause for ASOF JOIN must contain conjunctions of equality conditions only
 SELECT *
 FROM asof_left l
 ASOF JOIN asof_right r

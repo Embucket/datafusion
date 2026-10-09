@@ -1040,7 +1040,7 @@ impl LogicalPlanBuilder {
                 }) = predicate
                 else {
                     return plan_err!(
-                        "ASOF ON accepts only equality conditions combined with AND"
+                        "ON clause for ASOF JOIN must contain conjunctions of equality conditions only. Disjunctions are not allowed. Each side of an equality condition must only refer to either the left table or the right table."
                     );
                 };
                 find_valid_equijoin_key_pair(
@@ -1107,7 +1107,7 @@ impl LogicalPlanBuilder {
             || !check_all_columns_from_schema(&right_columns, right.schema())?
         {
             return plan_err!(
-                "ASOF MATCH_CONDITION left operand must reference only the left input and right operand only the right input"
+                "MATCH_CONDITION clause is invalid: The left side allows only column references from the left side table, and the right side allows only column references from the right side table."
             );
         }
         let normalize = |expr, schema: &DFSchema| {
@@ -3079,7 +3079,7 @@ mod tests {
                 col("l.column2").gt_eq(col("r.column2")),
             )
             .expect_err("non-equality ASOF ON should fail");
-        assert_snapshot!(invalid_on.strip_backtrace(), @r#"Error during planning: ASOF ON accepts only equality conditions combined with AND"#);
+        assert_snapshot!(invalid_on.strip_backtrace(), @r#"Error during planning: ON clause for ASOF JOIN must contain conjunctions of equality conditions only. Disjunctions are not allowed. Each side of an equality condition must only refer to either the left table or the right table."#);
 
         let invalid_match = LogicalPlanBuilder::from(left.clone())
             .asof_join_on(
@@ -3088,7 +3088,7 @@ mod tests {
                 col("l.column2").eq(col("r.column2")),
             )
             .expect_err("equality ASOF MATCH_CONDITION should fail");
-        assert_snapshot!(invalid_match.strip_backtrace(), @r#"Error during planning: ASOF MATCH_CONDITION requires <, <=, >, or >=, found ="#);
+        assert_snapshot!(invalid_match.strip_backtrace(), @r#"Error during planning: MATCH_CONDITION clause is invalid: Only comparison operators '>=', '>', '<=' and '<' are allowed. Keywords such as AND and OR are not allowed."#);
 
         let reversed_match = LogicalPlanBuilder::from(left)
             .asof_join_on(
@@ -3097,7 +3097,7 @@ mod tests {
                 col("r.column2").gt_eq(col("l.column2")),
             )
             .expect_err("reversed ASOF MATCH_CONDITION should fail");
-        assert_snapshot!(reversed_match.strip_backtrace(), @r#"Error during planning: ASOF MATCH_CONDITION left operand must reference only the left input and right operand only the right input"#);
+        assert_snapshot!(reversed_match.strip_backtrace(), @r#"Error during planning: MATCH_CONDITION clause is invalid: The left side allows only column references from the left side table, and the right side allows only column references from the right side table."#);
 
         Ok(())
     }
