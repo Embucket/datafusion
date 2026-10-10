@@ -434,7 +434,7 @@ impl FileCompressionType {
                 let mut header = [0_u8; Self::AUTO_PROBE_BYTES];
                 let mut header_len = 0;
                 while header_len < AUTO_HEADER_BYTES {
-                    let read = source.read(&mut header[header_len..])?;
+                    let read = source.read(&mut header[header_len..AUTO_HEADER_BYTES])?;
                     if read == 0 {
                         break;
                     }
@@ -659,6 +659,42 @@ mod tests {
             reader.read_to_end(&mut decoded)?;
             assert_eq!(decoded, plain);
         }
+        Ok(())
+    }
+
+    #[cfg(feature = "compression")]
+    #[test]
+    fn auto_read_only_probes_six_bytes_for_non_zlib_input() -> Result<(), DataFusionError>
+    {
+        use std::io::{Cursor, Read};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountedReader {
+            source: Cursor<Vec<u8>>,
+            bytes_read: Arc<AtomicUsize>,
+        }
+
+        impl Read for CountedReader {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let count = self.source.read(buf)?;
+                self.bytes_read.fetch_add(count, Ordering::Relaxed);
+                Ok(count)
+            }
+        }
+
+        let plain = b"ordinary,uncompressed,csv\n";
+        let bytes_read = Arc::new(AtomicUsize::new(0));
+        let source = CountedReader {
+            source: Cursor::new(plain.to_vec()),
+            bytes_read: Arc::clone(&bytes_read),
+        };
+        let mut decoded = FileCompressionType::AUTO.convert_read(source)?;
+        assert_eq!(bytes_read.load(Ordering::Relaxed), 6);
+
+        let mut output = Vec::new();
+        decoded.read_to_end(&mut output)?;
+        assert_eq!(output, plain);
         Ok(())
     }
 
