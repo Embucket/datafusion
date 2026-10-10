@@ -2800,7 +2800,7 @@ mod test {
                 &metadata
             );
 
-            let coerced = coerce_case_expression(case, &schema, None)?;
+            let coerced = coerce_case_expression(case, &schema)?;
             assert!(matches!(coerced.else_expr.as_deref(), Some(Expr::Cast(_))));
             assert_eq!(
                 Expr::Case(coerced).to_field(&schema)?.1.metadata(),
