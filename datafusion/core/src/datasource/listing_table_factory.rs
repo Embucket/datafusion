@@ -32,6 +32,7 @@ use datafusion_common::{Result, config_datafusion_err};
 use datafusion_common::{
     ToDFSchema, arrow_datafusion_err, internal_datafusion_err, plan_err,
 };
+use datafusion_datasource::file_compression_type::FileCompressionType;
 use datafusion_expr::CreateExternalTable;
 
 use async_trait::async_trait;
@@ -130,8 +131,14 @@ impl TableProviderFactory for ListingTableFactory {
         } else {
             String::new()
         };
+        let auto_extension = (file_format.compression_type()
+            == Some(FileCompressionType::AUTO))
+        .then(|| file_format.get_ext());
         let mut options =
             ListingOptions::new(file_format).with_file_extension(file_extension);
+        if let Some(extension) = auto_extension {
+            options = options.with_auto_compression_file_extension(&extension);
+        }
 
         // Partition columns are derived from the first location; all locations
         // are expected to share the same partitioning.
@@ -215,6 +222,9 @@ impl TableProviderFactory for ListingTableFactory {
                         // derive the pattern based on compression type.
                         // So for gzipped CSV the pattern is `*.csv.gz`
                         let glob = match options.format.compression_type() {
+                            Some(FileCompressionType::AUTO) => {
+                                format!("*.{}*", options.format.get_ext())
+                            }
                             Some(compression) => {
                                 match options
                                     .format
@@ -489,6 +499,380 @@ mod tests {
         assert_eq!(
             table_path.get_glob().clone().unwrap(),
             Pattern::new("*.csv.gz").unwrap()
+        );
+    }
+
+    #[cfg(feature = "compression")]
+    #[tokio::test]
+    async fn test_create_using_folder_with_auto_compression() {
+        use crate::prelude::CsvReadOptions;
+        use arrow::array::Int64Array;
+        use flate2::{Compression, write::GzEncoder};
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("plain.csv"), "id\n1\n").unwrap();
+        let mut gzip = GzEncoder::new(Vec::new(), Compression::default());
+        gzip.write_all(b"id\n2\n").unwrap();
+        fs::write(dir.path().join("compressed.csv.gz"), gzip.finish().unwrap()).unwrap();
+        fs::write(dir.path().join("ignored.csv.bak"), "not,a,csv\n").unwrap();
+        fs::write(dir.path().join("ignored.json"), "{\"id\":999}\n").unwrap();
+
+        let factory = ListingTableFactory::new();
+        let context = SessionContext::new();
+        let state = context.state();
+        let cmd = CreateExternalTable::builder(
+            TableReference::bare("auto_csv"),
+            dir.path().to_str().unwrap().to_owned(),
+            "csv",
+            Arc::new(DFSchema::empty()),
+        )
+        .with_options(HashMap::from([
+            ("format.has_header".into(), "true".into()),
+            ("format.compression".into(), "auto".into()),
+        ]))
+        .build();
+        let provider = factory.create(&state, &cmd).await.unwrap();
+        let table = provider.downcast_ref::<ListingTable>().unwrap();
+
+        assert_eq!(table.options().file_extension, "");
+        assert_eq!(
+            table.options().format.compression_type(),
+            Some(FileCompressionType::AUTO)
+        );
+        assert_eq!(
+            table.table_paths()[0].get_glob().as_ref().unwrap(),
+            &Pattern::new("*.csv*").unwrap()
+        );
+        context.register_table("auto_csv", provider).unwrap();
+        let batches = context
+            .sql("SELECT id FROM auto_csv ORDER BY id")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let values = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(values.values(), &[1, 2]);
+
+        let options =
+            CsvReadOptions::new().file_compression_type(FileCompressionType::AUTO);
+        let direct = context
+            .read_csv(
+                dir.path().join("compressed.csv.gz").to_str().unwrap(),
+                options.clone(),
+            )
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(
+            direct[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            2
+        );
+        let folder = context
+            .read_csv(dir.path().to_str().unwrap(), options)
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let mut ids = folder
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .copied()
+            })
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        assert_eq!(ids, [1, 2]);
+    }
+
+    #[cfg(feature = "compression")]
+    #[tokio::test]
+    async fn test_read_json_with_auto_compression_filters_other_files() {
+        use crate::prelude::JsonReadOptions;
+        use arrow::array::Int64Array;
+        use flate2::{Compression, write::GzEncoder};
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("plain.json"), "{\"id\":1}\n").unwrap();
+        let mut gzip = GzEncoder::new(Vec::new(), Compression::default());
+        gzip.write_all(b"{\"id\":2}\n").unwrap();
+        fs::write(
+            dir.path().join("compressed.json.gz"),
+            gzip.finish().unwrap(),
+        )
+        .unwrap();
+        fs::write(dir.path().join("ignored.json.bak"), "bad json\n").unwrap();
+        fs::write(dir.path().join("ignored.csv"), "id\n999\n").unwrap();
+
+        let context = SessionContext::new();
+        let options =
+            JsonReadOptions::default().file_compression_type(FileCompressionType::AUTO);
+        let direct = context
+            .read_json(
+                dir.path().join("compressed.json.gz").to_str().unwrap(),
+                options.clone(),
+            )
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(
+            direct[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            2
+        );
+        let folder = context
+            .read_json(dir.path().to_str().unwrap(), options)
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let mut ids = folder
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .copied()
+            })
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        assert_eq!(ids, [1, 2]);
+    }
+
+    #[cfg(feature = "compression")]
+    #[tokio::test]
+    async fn test_auto_compression_filters_multiple_folders_but_keeps_explicit_files() {
+        use arrow::array::Int64Array;
+        use flate2::{Compression, write::GzEncoder};
+        use std::io::Write;
+
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let explicit = tempfile::tempdir().unwrap();
+        fs::write(first.path().join("plain.csv"), "id\n1\n").unwrap();
+        let mut gzip = GzEncoder::new(Vec::new(), Compression::default());
+        gzip.write_all(b"id\n2\n").unwrap();
+        fs::write(
+            second.path().join("compressed.csv.gz"),
+            gzip.finish().unwrap(),
+        )
+        .unwrap();
+        fs::write(second.path().join("ignored.csv.bak"), "bad,data\n").unwrap();
+        let explicit_path = explicit.path().join("custom.data");
+        fs::write(&explicit_path, "id\n3\n").unwrap();
+
+        let factory = ListingTableFactory::new();
+        let context = SessionContext::new();
+        let state = context.state();
+        let locations = vec![
+            first.path().to_str().unwrap().to_owned(),
+            second.path().to_str().unwrap().to_owned(),
+            explicit_path.to_str().unwrap().to_owned(),
+        ];
+        let cmd = CreateExternalTable::builder(
+            TableReference::bare("auto_multi"),
+            locations[0].clone(),
+            "csv",
+            Arc::new(DFSchema::empty()),
+        )
+        .with_locations(locations)
+        .with_options(HashMap::from([
+            ("format.has_header".into(), "true".into()),
+            ("format.compression".into(), "auto".into()),
+        ]))
+        .build();
+        let provider = factory.create(&state, &cmd).await.unwrap();
+        context.register_table("auto_multi", provider).unwrap();
+        let batches = context
+            .sql("SELECT id FROM auto_multi ORDER BY id")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let values = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(values.values(), &[1, 2, 3]);
+    }
+
+    #[cfg(feature = "compression")]
+    #[tokio::test]
+    async fn test_large_plain_csv_auto_preserves_parallel_range_scan() {
+        use crate::prelude::CsvReadOptions;
+        use datafusion_datasource::source::DataSourceExec;
+        use datafusion_datasource_csv::source::CsvSource;
+        use datafusion_physical_plan::ExecutionPlan;
+
+        fn find_scan(plan: &dyn ExecutionPlan) -> Option<&DataSourceExec> {
+            plan.downcast_ref::<DataSourceExec>().or_else(|| {
+                plan.children()
+                    .into_iter()
+                    .find_map(|child| find_scan(child.as_ref()))
+            })
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large.csv");
+        fs::write(&path, "1\n".repeat(9_000_000)).unwrap();
+        let schema = Schema::new(vec![Field::new("id", DataType::Int64, true)]);
+        let context = SessionContext::new_with_config(
+            SessionConfig::new()
+                .with_target_partitions(4)
+                .with_repartition_file_scans(true),
+        );
+        let plan = context
+            .read_csv(
+                path.to_str().unwrap(),
+                CsvReadOptions::new()
+                    .has_header(false)
+                    .schema(&schema)
+                    .file_compression_type(FileCompressionType::AUTO),
+            )
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        let scan = find_scan(plan.as_ref()).unwrap();
+        let (config, _) = scan.downcast_to_file_source::<CsvSource>().unwrap();
+        assert_eq!(
+            config.file_compression_type,
+            FileCompressionType::UNCOMPRESSED
+        );
+        assert!(config.file_groups.len() > 1);
+        let batches = datafusion_physical_plan::collect(plan, context.task_ctx())
+            .await
+            .unwrap();
+        assert_eq!(
+            batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+            9_000_000
+        );
+    }
+
+    #[cfg(feature = "compression")]
+    #[tokio::test]
+    async fn test_multiple_large_plain_csv_auto_preserves_parallel_range_scan() {
+        use crate::prelude::CsvReadOptions;
+        use datafusion_datasource::source::DataSourceExec;
+        use datafusion_datasource_csv::source::CsvSource;
+        use datafusion_physical_plan::ExecutionPlan;
+
+        fn find_scan(plan: &dyn ExecutionPlan) -> Option<&DataSourceExec> {
+            plan.downcast_ref::<DataSourceExec>().or_else(|| {
+                plan.children()
+                    .into_iter()
+                    .find_map(|child| find_scan(child.as_ref()))
+            })
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let contents = "10000000000000000000000000000000\n".repeat(600_000);
+        fs::write(dir.path().join("first.csv"), &contents).unwrap();
+        fs::write(dir.path().join("second.csv"), contents).unwrap();
+        let schema = Schema::new(vec![Field::new("value", DataType::Utf8, true)]);
+        let context = SessionContext::new_with_config(
+            SessionConfig::new()
+                .with_target_partitions(4)
+                .with_repartition_file_scans(true),
+        );
+        let plan = context
+            .read_csv(
+                dir.path().to_str().unwrap(),
+                CsvReadOptions::new()
+                    .has_header(false)
+                    .schema(&schema)
+                    .file_compression_type(FileCompressionType::AUTO),
+            )
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        let scan = find_scan(plan.as_ref()).unwrap();
+        let (config, _) = scan.downcast_to_file_source::<CsvSource>().unwrap();
+        assert_eq!(
+            config.file_compression_type,
+            FileCompressionType::UNCOMPRESSED
+        );
+        assert!(config.file_groups.len() > 2);
+        let batches = datafusion_physical_plan::collect(plan, context.task_ctx())
+            .await
+            .unwrap();
+        assert_eq!(
+            batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+            1_200_000
+        );
+    }
+
+    #[cfg(not(feature = "compression"))]
+    #[tokio::test]
+    async fn test_large_plain_csv_auto_requires_compression_feature() {
+        use crate::prelude::CsvReadOptions;
+        use datafusion_datasource::source::DataSourceExec;
+        use datafusion_datasource_csv::source::CsvSource;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large.csv");
+        fs::write(&path, "1\n".repeat(9_000_000)).unwrap();
+        let schema = Schema::new(vec![Field::new("id", DataType::Int64, true)]);
+        let context = SessionContext::new_with_config(
+            SessionConfig::new().with_target_partitions(4),
+        );
+        let frame = context
+            .read_csv(
+                path.to_str().unwrap(),
+                CsvReadOptions::new()
+                    .has_header(false)
+                    .schema(&schema)
+                    .file_compression_type(FileCompressionType::AUTO),
+            )
+            .await
+            .unwrap();
+        let plan = frame.create_physical_plan().await.unwrap();
+        let scan = plan.downcast_ref::<DataSourceExec>().unwrap();
+        let (config, _) = scan.downcast_to_file_source::<CsvSource>().unwrap();
+        assert_eq!(config.file_compression_type, FileCompressionType::AUTO);
+        assert!(
+            frame
+                .collect()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("Compression feature is not enabled")
         );
     }
 

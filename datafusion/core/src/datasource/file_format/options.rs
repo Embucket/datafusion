@@ -643,8 +643,13 @@ impl ReadOptions<'_> for CsvReadOptions<'_> {
             .with_null_regex(self.null_regex.clone())
             .with_truncated_rows(self.truncated_rows);
 
-        ListingOptions::new(Arc::new(file_format))
-            .with_file_extension(self.file_extension)
+        let listing = ListingOptions::new(Arc::new(file_format));
+        let listing = if self.file_compression_type == FileCompressionType::AUTO {
+            listing.with_auto_compression_file_extension(self.file_extension)
+        } else {
+            listing.with_file_extension(self.file_extension)
+        };
+        listing
             .with_table_partition_cols(self.table_partition_cols.clone())
             .with_file_sort_order(self.file_sort_order.clone())
     }
@@ -724,8 +729,13 @@ impl ReadOptions<'_> for JsonReadOptions<'_> {
             .with_file_compression_type(self.file_compression_type.to_owned())
             .with_newline_delimited(self.newline_delimited);
 
-        ListingOptions::new(Arc::new(file_format))
-            .with_file_extension(self.file_extension)
+        let listing = ListingOptions::new(Arc::new(file_format));
+        let listing = if self.file_compression_type == FileCompressionType::AUTO {
+            listing.with_auto_compression_file_extension(self.file_extension)
+        } else {
+            listing.with_file_extension(self.file_extension)
+        };
+        listing
             .with_table_partition_cols(self.table_partition_cols.clone())
             .with_file_sort_order(self.file_sort_order.clone())
     }

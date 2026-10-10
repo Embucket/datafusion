@@ -280,6 +280,20 @@ impl ListingTableUrl {
         prefix: Option<Path>,
         file_extension: &'a str,
     ) -> Result<BoxStream<'a, Result<ObjectMeta>>> {
+        self.list_prefixed_files_with_suffixes(ctx, store, prefix, file_extension, None)
+            .await
+    }
+
+    /// List files with optional accepted suffixes for collections. Explicit
+    /// paths retain their existing ability to name files with arbitrary suffixes.
+    pub async fn list_prefixed_files_with_suffixes<'a>(
+        &'a self,
+        ctx: &'a dyn Session,
+        store: &'a dyn ObjectStore,
+        prefix: Option<Path>,
+        file_extension: &'a str,
+        file_suffixes: Option<&'a [String]>,
+    ) -> Result<BoxStream<'a, Result<ObjectMeta>>> {
         let exec_options = &ctx.config_options().execution;
         let ignore_subdirectory = exec_options.listing_table_ignore_subdirectory;
 
@@ -292,23 +306,9 @@ impl ListingTableUrl {
             self.prefix.clone()
         };
 
-        let list: BoxStream<'a, Result<ObjectMeta>> = if self.is_collection() {
-            list_with_cache(
-                ctx,
-                store,
-                self.table_ref.as_ref(),
-                &self.prefix,
-                prefix.as_ref(),
-            )
-            .await?
-        } else {
-            match store.head(&full_prefix).await {
-                Ok(meta) => futures::stream::once(async { Ok(meta) })
-                    .map_err(|e| DataFusionError::ObjectStore(Box::new(e)))
-                    .boxed(),
-                // If the head command fails, it is likely that object doesn't exist.
-                // Retry as though it were a prefix (aka a collection)
-                Err(object_store::Error::NotFound { .. }) => {
+        let (list, is_collection): (BoxStream<'a, Result<ObjectMeta>>, bool) =
+            if self.is_collection() {
+                (
                     list_with_cache(
                         ctx,
                         store,
@@ -316,17 +316,47 @@ impl ListingTableUrl {
                         &self.prefix,
                         prefix.as_ref(),
                     )
-                    .await?
+                    .await?,
+                    true,
+                )
+            } else {
+                match store.head(&full_prefix).await {
+                    Ok(meta) => (
+                        futures::stream::once(async { Ok(meta) })
+                            .map_err(|e| DataFusionError::ObjectStore(Box::new(e)))
+                            .boxed(),
+                        false,
+                    ),
+                    // If the head command fails, it is likely that object doesn't exist.
+                    // Retry as though it were a prefix (aka a collection)
+                    Err(object_store::Error::NotFound { .. }) => (
+                        list_with_cache(
+                            ctx,
+                            store,
+                            self.table_ref.as_ref(),
+                            &self.prefix,
+                            prefix.as_ref(),
+                        )
+                        .await?,
+                        true,
+                    ),
+                    Err(e) => return Err(e.into()),
                 }
-                Err(e) => return Err(e.into()),
-            }
-        };
+            };
 
         if let Some(regex) = &self.full_path_regex {
             Ok(list
                 .try_filter(move |meta| {
                     let path = &meta.location;
-                    let extension_match = path.as_ref().ends_with(file_extension);
+                    let extension_match = file_suffixes.map_or_else(
+                        || path.as_ref().ends_with(file_extension),
+                        |suffixes| {
+                            !is_collection
+                                || suffixes
+                                    .iter()
+                                    .any(|suffix| path.as_ref().ends_with(suffix))
+                        },
+                    );
                     let regex_match = self.strip_prefix(path).is_some()
                         && regex.0.is_match(path.as_ref());
                     futures::future::ready(extension_match && regex_match)
@@ -336,7 +366,15 @@ impl ListingTableUrl {
             Ok(list
                 .try_filter(move |meta| {
                     let path = &meta.location;
-                    let extension_match = path.as_ref().ends_with(file_extension);
+                    let extension_match = file_suffixes.map_or_else(
+                        || path.as_ref().ends_with(file_extension),
+                        |suffixes| {
+                            !is_collection
+                                || suffixes
+                                    .iter()
+                                    .any(|suffix| path.as_ref().ends_with(suffix))
+                        },
+                    );
                     let glob_match =
                         self.contains_without_regex(path, ignore_subdirectory);
                     futures::future::ready(extension_match && glob_match)
@@ -354,6 +392,24 @@ impl ListingTableUrl {
     ) -> Result<BoxStream<'a, Result<ObjectMeta>>> {
         self.list_prefixed_files(ctx, store, None, file_extension)
             .await
+    }
+
+    /// List files matching any of the supplied suffixes.
+    pub async fn list_all_files_with_suffixes<'a>(
+        &'a self,
+        ctx: &'a dyn Session,
+        store: &'a dyn ObjectStore,
+        file_extension: &'a str,
+        file_suffixes: Option<&'a [String]>,
+    ) -> Result<BoxStream<'a, Result<ObjectMeta>>> {
+        self.list_prefixed_files_with_suffixes(
+            ctx,
+            store,
+            None,
+            file_extension,
+            file_suffixes,
+        )
+        .await
     }
 
     /// Returns this [`ListingTableUrl`] as a string
@@ -845,6 +901,22 @@ mod tests {
             list_all_files("/t/", &store, "csv").await?,
             vec!["t/c.csv", "t/d.csv"],
         );
+
+        create_file(&store, "/t/e.csv.gz").await;
+        create_file(&store, "/t/ignored.csv.bak").await;
+        let suffixes = vec![".csv".to_owned(), ".csv.gz".to_owned()];
+        let session = MockSession::new();
+        for url in ["/t", "/t/"] {
+            let files = ListingTableUrl::parse(url)?
+                .list_all_files_with_suffixes(&session, &store, "", Some(&suffixes))
+                .await?
+                .try_collect::<Vec<_>>()
+                .await?
+                .into_iter()
+                .map(|meta| meta.location.to_string())
+                .collect::<Vec<_>>();
+            assert_eq!(files, ["t/c.csv", "t/d.csv", "t/e.csv.gz"]);
+        }
 
         let session = MockSession::new();
         let regex_url = ListingTableUrl::parse("memory:///t/")?.with_full_path_regex(

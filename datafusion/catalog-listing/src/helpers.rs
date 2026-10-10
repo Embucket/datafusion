@@ -390,6 +390,28 @@ pub async fn pruned_partition_list<'a>(
     file_extension: &'a str,
     partition_cols: &'a [(String, DataType)],
 ) -> Result<BoxStream<'a, Result<PartitionedFile>>> {
+    pruned_partition_list_with_suffixes(
+        ctx,
+        store,
+        table_path,
+        filters,
+        file_extension,
+        None,
+        partition_cols,
+    )
+    .await
+}
+
+/// As [`pruned_partition_list`], but accepts several filename suffixes.
+pub async fn pruned_partition_list_with_suffixes<'a>(
+    ctx: &'a dyn Session,
+    store: &'a dyn ObjectStore,
+    table_path: &'a ListingTableUrl,
+    filters: &'a [Expr],
+    file_extension: &'a str,
+    file_suffixes: Option<&'a [String]>,
+    partition_cols: &'a [(String, DataType)],
+) -> Result<BoxStream<'a, Result<PartitionedFile>>> {
     let prefix = if !partition_cols.is_empty() {
         evaluate_partition_prefix(partition_cols, filters)
     } else {
@@ -397,7 +419,13 @@ pub async fn pruned_partition_list<'a>(
     };
 
     let objects = table_path
-        .list_prefixed_files(ctx, store, prefix, file_extension)
+        .list_prefixed_files_with_suffixes(
+            ctx,
+            store,
+            prefix,
+            file_extension,
+            file_suffixes,
+        )
         .await?
         .try_filter(|object_meta| futures::future::ready(object_meta.size > 0));
 

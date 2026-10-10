@@ -841,6 +841,10 @@ impl From<&CompressionTypeVariant> for protobuf::CompressionTypeVariant {
             CompressionTypeVariant::XZ => Self::Xz,
             CompressionTypeVariant::ZSTD => Self::Zstd,
             CompressionTypeVariant::UNCOMPRESSED => Self::Uncompressed,
+            CompressionTypeVariant::AUTO => Self::Auto,
+            CompressionTypeVariant::BROTLI => Self::Brotli,
+            CompressionTypeVariant::DEFLATE => Self::Deflate,
+            CompressionTypeVariant::RAW_DEFLATE => Self::RawDeflate,
         }
     }
 }

@@ -156,6 +156,12 @@ pub fn partitioned_file_groups(
             FileCompressionType::BZIP2 => {
                 Box::new(BzEncoder::new(file, BzCompression::default()))
             }
+            FileCompressionType::AUTO
+            | FileCompressionType::BROTLI
+            | FileCompressionType::DEFLATE
+            | FileCompressionType::RAW_DEFLATE => {
+                panic!("This test helper cannot write the requested compression type")
+            }
             #[cfg(not(feature = "compression"))]
             FileCompressionType::GZIP
             | FileCompressionType::BZIP2

@@ -35,6 +35,15 @@ pub enum CompressionTypeVariant {
     ZSTD,
     /// Uncompressed file
     UNCOMPRESSED,
+    /// Detect file compression from its header when reading
+    AUTO,
+    /// Brotli-compressed file
+    BROTLI,
+    /// Deflate-compressed file with a zlib header
+    DEFLATE,
+    /// Deflate-compressed file without a zlib header
+    #[expect(non_camel_case_types, reason = "match the external codec name")]
+    RAW_DEFLATE,
 }
 
 impl FromStr for CompressionTypeVariant {
@@ -48,6 +57,10 @@ impl FromStr for CompressionTypeVariant {
             "XZ" => Ok(Self::XZ),
             "ZST" | "ZSTD" => Ok(Self::ZSTD),
             "" | "UNCOMPRESSED" => Ok(Self::UNCOMPRESSED),
+            "AUTO" => Ok(Self::AUTO),
+            "BROTLI" | "BR" => Ok(Self::BROTLI),
+            "DEFLATE" | "ZLIB" => Ok(Self::DEFLATE),
+            "RAW_DEFLATE" => Ok(Self::RAW_DEFLATE),
             _ => Err(DataFusionError::NotImplemented(format!(
                 "Unsupported file compression type {s}"
             ))),
@@ -63,6 +76,10 @@ impl Display for CompressionTypeVariant {
             Self::XZ => "XZ",
             Self::ZSTD => "ZSTD",
             Self::UNCOMPRESSED => "",
+            Self::AUTO => "AUTO",
+            Self::BROTLI => "BROTLI",
+            Self::DEFLATE => "DEFLATE",
+            Self::RAW_DEFLATE => "RAW_DEFLATE",
         };
         write!(f, "{str}")
     }

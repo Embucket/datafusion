@@ -450,8 +450,60 @@ impl FileFormat for CsvFormat {
             .expect("file_source should be a CsvSource");
         let source = Arc::new(csv_source.clone().with_csv_options(csv_options));
 
+        let mut compression: FileCompressionType = self.options.compression.into();
+        if compression == FileCompressionType::AUTO
+            && FileCompressionType::compression_enabled()
+            && source.supports_repartitioning()
+            && state.config_options().optimizer.repartition_file_scans
+            && state.config_options().execution.target_partitions > 1
+        {
+            let files = conf
+                .file_groups
+                .iter()
+                .flat_map(|group| group.iter())
+                .take(33)
+                .collect::<Vec<_>>();
+            let min_size = u64::try_from(
+                state
+                    .config_options()
+                    .optimizer
+                    .repartition_file_min_size
+                    .max(16 * 1024 * 1024),
+            )
+            .unwrap_or(u64::MAX);
+            if !files.is_empty()
+                && files.len() <= 32
+                && files.iter().all(|file| file.range.is_none())
+                && files.iter().fold(0_u64, |size, file| {
+                    size.saturating_add(file.object_meta.size)
+                }) >= min_size
+            {
+                let store = state.runtime_env().object_store(&conf.object_store_url)?;
+                let plain = futures::future::join_all(files.into_iter().map(|file| {
+                    let store = Arc::clone(&store);
+                    async move {
+                        if file.object_meta.size == 0 {
+                            return true;
+                        }
+                        let len = file.object_meta.size.min(6);
+                        store
+                            .get_range(&file.object_meta.location, 0..len)
+                            .await
+                            .is_ok_and(|header| {
+                                FileCompressionType::detect_from_header(&header)
+                                    == FileCompressionType::UNCOMPRESSED
+                            })
+                    }
+                }))
+                .await;
+                if plain.into_iter().all(|is_plain| is_plain) {
+                    compression = FileCompressionType::UNCOMPRESSED;
+                }
+            }
+        }
+
         let config = FileScanConfigBuilder::from(conf)
-            .with_file_compression_type(self.options.compression.into())
+            .with_file_compression_type(compression)
             .with_source(source)
             .build();
 
