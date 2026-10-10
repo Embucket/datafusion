@@ -301,6 +301,51 @@ mod tests {
     }
 
     #[test]
+    fn test_unwrap_timestamp_timezone_removal_or_replacement() {
+        let source_type =
+            DataType::Timestamp(TimeUnit::Microsecond, Some("+01:00".into()));
+        let schema = Schema::new(vec![Field::new("ts", source_type, false)]);
+        for target_type in [
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            DataType::Timestamp(TimeUnit::Microsecond, Some("+02:00".into())),
+        ] {
+            let column = col("ts", &schema).unwrap();
+            for cast in [
+                Arc::new(CastExpr::new(
+                    Arc::clone(&column),
+                    target_type.clone(),
+                    None,
+                )) as Arc<dyn PhysicalExpr>,
+                Arc::new(TryCastExpr::new(Arc::clone(&column), target_type.clone())),
+            ] {
+                let comparison = Arc::new(BinaryExpr::new(
+                    cast,
+                    Operator::Eq,
+                    lit(ScalarValue::TimestampMicrosecond(
+                        Some(42),
+                        match &target_type {
+                            DataType::Timestamp(_, tz) => tz.clone(),
+                            _ => unreachable!(),
+                        },
+                    )),
+                ));
+                let result = unwrap_cast_in_comparison(comparison, &schema).unwrap();
+                assert!(
+                    result.transformed,
+                    "cast to {target_type:?} was not unwrapped"
+                );
+                let optimized = result.data;
+                let binary = optimized.downcast_ref::<BinaryExpr>().unwrap();
+                assert!(!is_cast_expr(binary.left()));
+                assert_eq!(
+                    binary.right().downcast_ref::<Literal>().unwrap().value(),
+                    &ScalarValue::TimestampMicrosecond(Some(42), Some("+01:00".into()))
+                );
+            }
+        }
+    }
+
+    #[test]
     fn test_no_unwrap_when_types_unsupported() {
         let schema = Schema::new(vec![Field::new("f1", DataType::Float32, false)]);
 

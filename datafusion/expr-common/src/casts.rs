@@ -87,13 +87,14 @@ pub fn is_supported_type(data_type: &DataType) -> bool {
 /// Returns true when moving a timestamp cast across a comparison may change its result.
 ///
 /// Narrowing can truncate values, widening can overflow the integer storage,
-/// and changing the timezone can shift timestamp values. An identity cast does
-/// none of these and remains eligible for unwrapping.
+/// and attaching a timezone to a timezone-less timestamp shifts its value.
+/// Removing or changing an existing timezone does not change the stored value
+/// when the unit stays the same, so those casts remain eligible for unwrapping.
 pub fn changes_timestamp_semantics(from_type: &DataType, to_type: &DataType) -> bool {
     matches!(
         (from_type, to_type),
         (DataType::Timestamp(from_unit, from_tz), DataType::Timestamp(to_unit, to_tz))
-            if from_unit != to_unit || from_tz != to_tz
+            if from_unit != to_unit || (from_tz.is_none() && to_tz.is_some())
     )
 }
 
@@ -1036,7 +1037,11 @@ mod tests {
         assert!(changes_timestamp_semantics(&ts_us, &ts_ns));
         assert!(changes_timestamp_semantics(&ts_ns, &ts_us));
         assert!(changes_timestamp_semantics(&ts_us, &ts_tz));
-        assert!(changes_timestamp_semantics(&ts_tz, &ts_us));
+        assert!(!changes_timestamp_semantics(&ts_tz, &ts_us));
+        assert!(!changes_timestamp_semantics(
+            &ts_tz,
+            &DataType::Timestamp(TimeUnit::Microsecond, Some("+02:00".into()))
+        ));
         assert!(!changes_timestamp_semantics(&ts_us, &ts_us));
         assert!(!changes_timestamp_semantics(&DataType::Int64, &ts_us));
     }
