@@ -17,8 +17,9 @@
 
 use arrow::datatypes::{DataType, SchemaRef};
 use datafusion_catalog::Session;
-use datafusion_common::plan_err;
+use datafusion_common::{GetExt, plan_err};
 use datafusion_datasource::ListingTableUrl;
+use datafusion_datasource::file_compression_type::FileCompressionType;
 use datafusion_datasource::file_format::FileFormat;
 use datafusion_expr::{Partitioning, SortExpr};
 use futures::StreamExt;
@@ -33,6 +34,9 @@ pub struct ListingOptions {
     /// A suffix on which files should be filtered (leave empty to
     /// keep all files on the path)
     pub file_extension: String,
+    /// Accepted filename suffixes for header-detected compression. An explicit
+    /// file-extension override disables this filter.
+    pub auto_file_suffixes: Option<Vec<String>>,
     /// The file format
     pub format: Arc<dyn FileFormat>,
     /// The expected partition column names in the folder structure.
@@ -96,14 +100,38 @@ pub struct ListingOptions {
     pub output_partitioning: Option<Partitioning>,
 }
 
+fn auto_compression_suffixes(base_extension: &str) -> Vec<String> {
+    let base = format!(".{}", base_extension.trim_start_matches('.'));
+    [
+        FileCompressionType::UNCOMPRESSED,
+        FileCompressionType::GZIP,
+        FileCompressionType::BZIP2,
+        FileCompressionType::XZ,
+        FileCompressionType::ZSTD,
+        FileCompressionType::DEFLATE,
+    ]
+    .into_iter()
+    .map(|compression| format!("{base}{}", compression.get_ext()))
+    .collect()
+}
+
 impl ListingOptions {
     /// Creates an options instance with the given format
     /// Default values:
     /// - use default file extension filter
     /// - no input partition to discover
     pub fn new(format: Arc<dyn FileFormat>) -> Self {
+        let auto = format.compression_type() == Some(FileCompressionType::AUTO);
+        let file_extension = if auto {
+            String::new()
+        } else {
+            format.get_ext()
+        };
+        let auto_file_suffixes =
+            auto.then(|| auto_compression_suffixes(&format.get_ext()));
         Self {
-            file_extension: format.get_ext(),
+            file_extension,
+            auto_file_suffixes,
             format,
             table_partition_cols: vec![],
             file_sort_order: vec![],
@@ -126,6 +154,15 @@ impl ListingOptions {
     /// ```
     pub fn with_file_extension(mut self, file_extension: impl Into<String>) -> Self {
         self.file_extension = file_extension.into();
+        self.auto_file_suffixes = None;
+        self
+    }
+
+    /// Detect compression while restricting a listing to files of this format.
+    pub fn with_auto_compression_file_extension(mut self, base_extension: &str) -> Self {
+        self.file_extension.clear();
+        self.auto_file_suffixes = (!base_extension.is_empty())
+            .then(|| auto_compression_suffixes(base_extension));
         self
     }
 
@@ -150,7 +187,7 @@ impl ListingOptions {
         S: Into<String>,
     {
         if let Some(file_extension) = file_extension {
-            self.file_extension = file_extension.into();
+            self = self.with_file_extension(file_extension);
         }
         self
     }
@@ -280,7 +317,12 @@ impl ListingOptions {
         let store = state.runtime_env().object_store(table_path)?;
 
         let all_files: Vec<_> = table_path
-            .list_all_files(state, store.as_ref(), &self.file_extension)
+            .list_all_files_with_suffixes(
+                state,
+                store.as_ref(),
+                &self.file_extension,
+                self.auto_file_suffixes.as_deref(),
+            )
             .await?
             .try_collect()
             .await?;
@@ -375,7 +417,12 @@ impl ListingOptions {
         // This can fail to detect inconsistent partition keys
         // A DFS traversal approach of the store can help here
         let files: Vec<_> = table_path
-            .list_all_files(state, store.as_ref(), &self.file_extension)
+            .list_all_files_with_suffixes(
+                state,
+                store.as_ref(),
+                &self.file_extension,
+                self.auto_file_suffixes.as_deref(),
+            )
             .await?
             .take(10)
             .try_collect()

@@ -78,7 +78,7 @@ impl GetExt for FileCompressionType {
             AUTO => "".to_owned(),
             BROTLI => ".br".to_owned(),
             DEFLATE => ".zlib".to_owned(),
-            RAW_DEFLATE => ".deflate".to_owned(),
+            RAW_DEFLATE => ".raw_deflate".to_owned(),
         }
     }
 }
@@ -341,7 +341,7 @@ impl FileCompressionType {
             #[cfg(feature = "compression")]
             AUTO => futures::stream::once(async move {
                 let mut source = s;
-                let mut header = [0_u8; 4];
+                let mut header = [0_u8; 6];
                 let mut header_len = 0;
                 let mut initial_chunks = Vec::new();
                 while header_len < header.len() {
@@ -405,7 +405,7 @@ impl FileCompressionType {
             #[cfg(feature = "compression")]
             AUTO => {
                 let mut source = r;
-                let mut header = [0_u8; 4];
+                let mut header = [0_u8; 6];
                 let mut header_len = 0;
                 while header_len < header.len() {
                     let read = source.read(&mut header[header_len..])?;
@@ -437,6 +437,8 @@ fn detect_compression(header: &[u8]) -> FileCompressionType {
         FileCompressionType::BZIP2
     } else if header.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
         FileCompressionType::ZSTD
+    } else if header.starts_with(&[0xfd, b'7', b'z', b'X', b'Z', 0x00]) {
+        FileCompressionType::XZ
     } else if header.len() >= 2
         && header[0] & 0x0f == 8
         && header[0] >> 4 <= 7
@@ -483,7 +485,9 @@ mod tests {
             ("ZSTD", FileCompressionType::ZSTD),
             ("AUTO", FileCompressionType::AUTO),
             ("BROTLI", FileCompressionType::BROTLI),
+            ("BR", FileCompressionType::BROTLI),
             ("DEFLATE", FileCompressionType::DEFLATE),
+            ("ZLIB", FileCompressionType::DEFLATE),
             ("RAW_DEFLATE", FileCompressionType::RAW_DEFLATE),
             ("", FileCompressionType::UNCOMPRESSED),
         ] {
@@ -513,6 +517,7 @@ mod tests {
             FileCompressionType::BZIP2,
             FileCompressionType::ZSTD,
             FileCompressionType::DEFLATE,
+            FileCompressionType::XZ,
         ] {
             let input = futures::stream::once(async {
                 Ok::<Bytes, DataFusionError>(Bytes::from_static(plain))

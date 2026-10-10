@@ -40,6 +40,24 @@ pub enum SchemaSource {
     Specified,
 }
 
+#[cfg(test)]
+mod compression_extension_tests {
+    use super::ListingTableConfig;
+
+    #[test]
+    fn new_codec_suffixes_preserve_csv_extension() {
+        for suffix in ["br", "zlib", "raw_deflate"] {
+            assert_eq!(
+                ListingTableConfig::infer_file_extension_and_compression_type(&format!(
+                    "data.csv.{suffix}"
+                ))
+                .unwrap(),
+                ("csv".to_owned(), Some(suffix.to_owned()))
+            );
+        }
+    }
+}
+
 /// Configuration for creating a [`crate::ListingTable`]
 ///
 /// # Schema Evolution Support

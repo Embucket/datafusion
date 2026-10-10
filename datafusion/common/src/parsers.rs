@@ -58,8 +58,8 @@ impl FromStr for CompressionTypeVariant {
             "ZST" | "ZSTD" => Ok(Self::ZSTD),
             "" | "UNCOMPRESSED" => Ok(Self::UNCOMPRESSED),
             "AUTO" => Ok(Self::AUTO),
-            "BROTLI" => Ok(Self::BROTLI),
-            "DEFLATE" => Ok(Self::DEFLATE),
+            "BROTLI" | "BR" => Ok(Self::BROTLI),
+            "DEFLATE" | "ZLIB" => Ok(Self::DEFLATE),
             "RAW_DEFLATE" => Ok(Self::RAW_DEFLATE),
             _ => Err(DataFusionError::NotImplemented(format!(
                 "Unsupported file compression type {s}"

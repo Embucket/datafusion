@@ -17,7 +17,8 @@
 
 use crate::config::SchemaSource;
 use crate::helpers::{
-    expr_applicable_for_cols, filter_partitioned_file, pruned_partition_list,
+    expr_applicable_for_cols, filter_partitioned_file,
+    pruned_partition_list_with_suffixes as pruned_partition_list,
 };
 use crate::{ListingOptions, ListingTableConfig};
 use arrow::datatypes::{Field, Schema, SchemaBuilder, SchemaRef};
@@ -725,6 +726,7 @@ impl TableProvider for ListingTable {
             table_path,
             &[],
             &self.options.file_extension,
+            self.options.auto_file_suffixes.as_deref(),
             &self.options.table_partition_cols,
         )
         .await?;
@@ -812,6 +814,7 @@ impl ListingTable {
                 table_path,
                 listing_time_filters,
                 &self.options.file_extension,
+                self.options.auto_file_suffixes.as_deref(),
                 &self.options.table_partition_cols,
             )
         }))
