@@ -21,7 +21,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Debug};
 use std::sync::Arc;
 
-use crate::source::CsvSource;
+use crate::source::{CsvRecordErrorHandlerFactory, CsvSource};
 
 use arrow::array::RecordBatch;
 use arrow::csv::reader::SnowflakeCsvTypeState;
@@ -152,6 +152,7 @@ impl GetExt for CsvFormatFactory {
 pub struct CsvFormat {
     options: CsvOptions,
     record_error_handler: Option<Arc<dyn CsvRecordErrorHandler>>,
+    record_error_handler_factory: Option<Arc<dyn CsvRecordErrorHandlerFactory>>,
     numeric_boolean_values: bool,
 }
 
@@ -235,6 +236,18 @@ impl CsvFormat {
         handler: Arc<dyn CsvRecordErrorHandler>,
     ) -> Self {
         self.record_error_handler = Some(handler);
+        self.record_error_handler_factory = None;
+        self
+    }
+
+    /// Use a file-specific handler for malformed and decoded CSV records.
+    /// The factory is called when each source file is opened.
+    pub fn with_record_error_handler_factory(
+        mut self,
+        factory: Arc<dyn CsvRecordErrorHandlerFactory>,
+    ) -> Self {
+        self.record_error_handler = None;
+        self.record_error_handler_factory = Some(factory);
         self
     }
 
@@ -563,6 +576,8 @@ impl FileFormat for CsvFormat {
             .with_numeric_boolean_values(self.numeric_boolean_values);
         if let Some(handler) = &self.record_error_handler {
             source = source.with_record_error_handler(Arc::clone(handler));
+        } else if let Some(factory) = &self.record_error_handler_factory {
+            source = source.with_record_error_handler_factory(Arc::clone(factory));
         }
         Arc::new(source)
     }
