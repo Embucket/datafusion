@@ -450,8 +450,39 @@ impl FileFormat for CsvFormat {
             .expect("file_source should be a CsvSource");
         let source = Arc::new(csv_source.clone().with_csv_options(csv_options));
 
+        let mut compression: FileCompressionType = self.options.compression.into();
+        if compression == FileCompressionType::AUTO
+            && FileCompressionType::compression_enabled()
+            && source.supports_repartitioning()
+            && state.config_options().optimizer.repartition_file_scans
+            && state.config_options().execution.target_partitions > 1
+        {
+            let mut files = conf.file_groups.iter().flat_map(|group| group.iter());
+            if let Some(file) = files.next().filter(|_| files.next().is_none())
+                && file.range.is_none()
+                && file.object_meta.size
+                    >= u64::try_from(
+                        state
+                            .config_options()
+                            .optimizer
+                            .repartition_file_min_size
+                            .max(16 * 1024 * 1024),
+                    )
+                    .unwrap_or(u64::MAX)
+            {
+                let store = state.runtime_env().object_store(&conf.object_store_url)?;
+                if let Ok(header) =
+                    store.get_range(&file.object_meta.location, 0..6).await
+                    && FileCompressionType::detect_from_header(&header)
+                        == FileCompressionType::UNCOMPRESSED
+                {
+                    compression = FileCompressionType::UNCOMPRESSED;
+                }
+            }
+        }
+
         let config = FileScanConfigBuilder::from(conf)
-            .with_file_compression_type(self.options.compression.into())
+            .with_file_compression_type(compression)
             .with_source(source)
             .build();
 

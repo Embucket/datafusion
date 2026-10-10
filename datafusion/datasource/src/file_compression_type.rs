@@ -108,6 +108,11 @@ impl FromStr for FileCompressionType {
 
 /// `FileCompressionType` implementation
 impl FileCompressionType {
+    /// Whether this build can decode compressed input or use AUTO detection.
+    pub const fn compression_enabled() -> bool {
+        cfg!(feature = "compression")
+    }
+
     /// Gzip-ed file
     pub const GZIP: Self = Self { variant: GZIP };
 
@@ -359,7 +364,7 @@ impl FileCompressionType {
                     }
                 }
                 let replay = futures::stream::iter(initial_chunks).chain(source).boxed();
-                detect_compression(&header[..header_len]).convert_stream(replay)
+                Self::detect_from_header(&header[..header_len]).convert_stream(replay)
             })
             .try_flatten()
             .boxed(),
@@ -417,7 +422,7 @@ impl FileCompressionType {
                 let replay: Box<dyn Read + Send> = Box::new(
                     std::io::Cursor::new(header[..header_len].to_vec()).chain(source),
                 );
-                detect_compression(&header[..header_len]).convert_read(replay)?
+                Self::detect_from_header(&header[..header_len]).convert_read(replay)?
             }
             #[cfg(not(feature = "compression"))]
             AUTO => {
@@ -429,24 +434,27 @@ impl FileCompressionType {
     }
 }
 
-#[cfg(feature = "compression")]
-fn detect_compression(header: &[u8]) -> FileCompressionType {
-    if header.starts_with(&[0x1f, 0x8b]) {
-        FileCompressionType::GZIP
-    } else if header.starts_with(b"BZh") {
-        FileCompressionType::BZIP2
-    } else if header.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
-        FileCompressionType::ZSTD
-    } else if header.starts_with(&[0xfd, b'7', b'z', b'X', b'Z', 0x00]) {
-        FileCompressionType::XZ
-    } else if header.len() >= 2
-        && header[0] & 0x0f == 8
-        && header[0] >> 4 <= 7
-        && u16::from_be_bytes([header[0], header[1]]).is_multiple_of(31)
-    {
-        FileCompressionType::DEFLATE
-    } else {
-        FileCompressionType::UNCOMPRESSED
+impl FileCompressionType {
+    /// Identify codecs supported by AUTO from up to the first six file bytes.
+    /// Headerless codecs such as Brotli and raw Deflate require explicit selection.
+    pub fn detect_from_header(header: &[u8]) -> Self {
+        if header.starts_with(&[0x1f, 0x8b]) {
+            Self::GZIP
+        } else if header.starts_with(b"BZh") {
+            Self::BZIP2
+        } else if header.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
+            Self::ZSTD
+        } else if header.starts_with(&[0xfd, b'7', b'z', b'X', b'Z', 0x00]) {
+            Self::XZ
+        } else if header.len() >= 2
+            && header[0] & 0x0f == 8
+            && header[0] >> 4 <= 7
+            && u16::from_be_bytes([header[0], header[1]]).is_multiple_of(31)
+        {
+            Self::DEFLATE
+        } else {
+            Self::UNCOMPRESSED
+        }
     }
 }
 
