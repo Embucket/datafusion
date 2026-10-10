@@ -60,7 +60,8 @@ use datafusion_common::{internal_err, tree_node::Transformed};
 use datafusion_expr::{BinaryExpr, lit};
 use datafusion_expr::{Cast, Expr, Operator, TryCast, simplify::SimplifyContext};
 use datafusion_expr_common::casts::{
-    is_date_narrowing_cast, is_supported_type, try_cast_literal_to_type,
+    changes_timestamp_semantics, is_date_narrowing_cast, is_supported_type,
+    try_cast_literal_to_type,
 };
 
 pub(super) fn unwrap_cast_in_comparison_for_binary(
@@ -202,15 +203,6 @@ pub(super) fn is_cast_expr_and_support_unwrap_cast_in_comparison_for_inlist(
     }
 
     true
-}
-
-fn changes_timestamp_semantics(from_type: &DataType, to_type: &DataType) -> bool {
-    // Changing units can truncate or overflow; attaching a timezone can shift values.
-    matches!(
-        (from_type, to_type),
-        (DataType::Timestamp(from_unit, from_tz), DataType::Timestamp(to_unit, to_tz))
-            if from_unit != to_unit || from_tz != to_tz
-    )
 }
 
 ///// Tries to move a cast from an expression (such as column) to the literal other side of a comparison operator./
