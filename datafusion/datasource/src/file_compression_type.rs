@@ -110,6 +110,9 @@ impl FromStr for FileCompressionType {
 
 /// `FileCompressionType` implementation
 impl FileCompressionType {
+    /// Header bytes inspected for ambiguous zlib AUTO detection.
+    pub const AUTO_PROBE_BYTES: usize = 64;
+
     /// Whether this build can decode compressed input or use AUTO detection.
     pub const fn compression_enabled() -> bool {
         cfg!(feature = "compression")
@@ -348,7 +351,7 @@ impl FileCompressionType {
             #[cfg(feature = "compression")]
             AUTO => futures::stream::once(async move {
                 let mut source = s;
-                let mut header = [0_u8; ZLIB_PROBE_BYTES];
+                let mut header = [0_u8; Self::AUTO_PROBE_BYTES];
                 let mut header_len = 0;
                 let mut initial_chunks = Vec::new();
                 while header_len < AUTO_HEADER_BYTES {
@@ -428,7 +431,7 @@ impl FileCompressionType {
             #[cfg(feature = "compression")]
             AUTO => {
                 let mut source = r;
-                let mut header = [0_u8; ZLIB_PROBE_BYTES];
+                let mut header = [0_u8; Self::AUTO_PROBE_BYTES];
                 let mut header_len = 0;
                 while header_len < AUTO_HEADER_BYTES {
                     let read = source.read(&mut header[header_len..])?;
@@ -463,12 +466,12 @@ impl FileCompressionType {
 
 #[cfg(feature = "compression")]
 const AUTO_HEADER_BYTES: usize = 6;
-#[cfg(feature = "compression")]
-const ZLIB_PROBE_BYTES: usize = 64;
-
 impl FileCompressionType {
     /// Identify codecs supported by AUTO from a bounded file prefix.
     /// Headerless codecs such as Brotli and raw Deflate require explicit selection.
+    /// Zlib has no unique magic bytes: printable text takes precedence when its
+    /// header happens to satisfy the RFC 1950 checksum. Explicit DEFLATE avoids
+    /// that ambiguity when the compressed prefix itself resembles plain text.
     pub fn detect_from_header(header: &[u8]) -> Self {
         if header.starts_with(&[0x1f, 0x8b]) {
             Self::GZIP
