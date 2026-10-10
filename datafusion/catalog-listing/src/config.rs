@@ -19,10 +19,10 @@ use crate::options::ListingOptions;
 use arrow::datatypes::{DataType, Schema, SchemaRef};
 use datafusion_catalog::Session;
 use datafusion_common::{config_err, internal_err};
-use datafusion_datasource::ListingTableUrl;
 use datafusion_datasource::file_compression_type::FileCompressionType;
 #[expect(deprecated)]
 use datafusion_datasource::schema_adapter::SchemaAdapterFactory;
+use datafusion_datasource::{ListingTableUrl, PartitionedFile};
 use datafusion_physical_expr_adapter::PhysicalExprAdapterFactory;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -74,6 +74,9 @@ pub struct ListingTableConfig {
     /// Paths on the `ObjectStore` for creating [`crate::ListingTable`].
     /// They should share the same schema and object store.
     pub table_paths: Vec<ListingTableUrl>,
+    /// Optional caller-selected files with known object metadata. When present,
+    /// listing and per-file HEAD requests are skipped during scan planning.
+    pub(crate) prelisted_files: Option<Arc<[PartitionedFile]>>,
     /// Optional `SchemaRef` for the to be created [`crate::ListingTable`].
     ///
     /// See details on [`ListingTableConfig::with_schema`]
@@ -105,6 +108,16 @@ impl ListingTableConfig {
             table_paths,
             ..Default::default()
         }
+    }
+
+    /// Use an already selected set of files for scan planning. The caller is
+    /// responsible for supplying current metadata from the table's object store.
+    /// This mode requires an explicit schema and does not support partition columns,
+    /// declared output partitioning, or inserts into the resulting table.
+    #[must_use]
+    pub fn with_prelisted_files(mut self, files: Vec<PartitionedFile>) -> Self {
+        self.prelisted_files = Some(files.into());
+        self
     }
 
     /// Returns the source of the schema for this configuration
@@ -228,6 +241,7 @@ impl ListingTableConfig {
             Some(options) => {
                 let ListingTableConfig {
                     table_paths,
+                    prelisted_files,
                     file_schema,
                     options: _,
                     schema_source,
@@ -250,6 +264,7 @@ impl ListingTableConfig {
 
                 Ok(Self {
                     table_paths,
+                    prelisted_files,
                     file_schema: Some(schema),
                     options: Some(options),
                     schema_source: new_schema_source,
@@ -290,6 +305,7 @@ impl ListingTableConfig {
                 let options = options.with_table_partition_cols(partitions);
                 Ok(Self {
                     table_paths: self.table_paths,
+                    prelisted_files: self.prelisted_files,
                     file_schema: self.file_schema,
                     options: Some(options),
                     schema_source: self.schema_source,

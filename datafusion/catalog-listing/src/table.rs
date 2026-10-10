@@ -195,6 +195,7 @@ pub struct ListFilesResult {
 #[derive(Debug, Clone)]
 pub struct ListingTable {
     table_paths: Vec<ListingTableUrl>,
+    prelisted_files: Option<Arc<[PartitionedFile]>>,
     /// `file_schema` contains only the columns physically stored in the data files themselves.
     ///     - Represents the actual fields found in files like Parquet, CSV, etc.
     ///     - Used when reading the raw data from files
@@ -240,6 +241,21 @@ impl ListingTable {
             .options
             .ok_or_else(|| internal_datafusion_err!("No ListingOptions provided"))?;
 
+        if config.prelisted_files.is_some()
+            && (schema_source != SchemaSource::Specified
+                || !options.table_partition_cols.is_empty()
+                || options.output_partitioning.is_some())
+        {
+            return plan_err!(
+                "Prelisted files require an explicit schema, no partition columns, and no declared output partitioning"
+            );
+        }
+        if config.prelisted_files.as_ref().is_some_and(|files| {
+            files.iter().any(|file| !file.partition_values.is_empty())
+        }) {
+            return plan_err!("Prelisted files cannot contain partition values");
+        }
+
         // Add the partition columns to the file schema
         let mut builder = SchemaBuilder::from(file_schema.as_ref().to_owned());
         for (part_col_name, part_col_type) in &options.table_partition_cols {
@@ -257,6 +273,7 @@ impl ListingTable {
 
         let table = Self {
             table_paths: config.table_paths,
+            prelisted_files: config.prelisted_files,
             file_schema,
             table_schema,
             schema_source,
@@ -720,6 +737,11 @@ impl TableProvider for ListingTable {
         input: Arc<dyn ExecutionPlan>,
         insert_op: InsertOp,
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+        if self.prelisted_files.is_some() {
+            return plan_err!(
+                "Inserting into a ListingTable with prelisted files is not supported"
+            );
+        }
         // Check that the schema of the plan matches the schema of this table.
         self.schema()
             .logically_equivalent_names_and_types(&input.schema())?;
@@ -824,28 +846,42 @@ impl ListingTable {
         // Bound metadata requests for explicit file lists as well as directories.
         let meta_fetch_concurrency =
             ctx.config_options().execution.meta_fetch_concurrency.get();
-        let mut requests = Vec::with_capacity(self.table_paths.len());
-        for table_path in &self.table_paths {
-            requests.push(pruned_partition_list(
-                ctx,
-                store.as_ref(),
-                table_path,
-                listing_time_filters,
-                &self.options.file_extension,
-                self.options.auto_file_suffixes.as_deref(),
-                &self.options.table_partition_cols,
-            ));
-        }
-        let file_list = bounded_try_join_all(requests, meta_fetch_concurrency).await?;
+        let file_list: stream::BoxStream<'a, datafusion_common::Result<PartitionedFile>> =
+            if let Some(files) = &self.prelisted_files {
+                stream::iter(
+                    files
+                        .iter()
+                        .filter(|file| file.object_meta.size > 0)
+                        .cloned()
+                        .map(Ok),
+                )
+                .boxed()
+            } else {
+                let mut requests = Vec::with_capacity(self.table_paths.len());
+                for table_path in &self.table_paths {
+                    requests.push(pruned_partition_list(
+                        ctx,
+                        store.as_ref(),
+                        table_path,
+                        listing_time_filters,
+                        &self.options.file_extension,
+                        self.options.auto_file_suffixes.as_deref(),
+                        &self.options.table_partition_cols,
+                    ));
+                }
+                let file_list =
+                    bounded_try_join_all(requests, meta_fetch_concurrency).await?;
+                stream::iter(file_list)
+                    .flatten_unordered(meta_fetch_concurrency)
+                    .boxed()
+            };
         // Table paths can overlap, for example when one path is a directory and
         // another names a file inside it. A ListingTable uses one object store,
         // so the object path uniquely identifies a file within this scan.
         let mut seen_files = HashSet::new();
-        let file_list = stream::iter(file_list)
-            .flatten_unordered(meta_fetch_concurrency)
-            .try_filter(move |file| {
-                future::ready(seen_files.insert(file.object_meta.location.clone()))
-            });
+        let file_list = file_list.try_filter(move |file| {
+            future::ready(seen_files.insert(file.object_meta.location.clone()))
+        });
         // collect the statistics and ordering if required by the config
         let files = file_list
             .map(|part_file| async {

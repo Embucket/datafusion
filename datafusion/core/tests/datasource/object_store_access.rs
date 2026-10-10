@@ -25,13 +25,14 @@
 //! [`ListingTable`]: datafusion::datasource::listing::ListingTable
 
 use arrow::array::{ArrayRef, Int32Array, RecordBatch};
+use arrow::datatypes::{DataType, Field, Schema};
 use async_trait::async_trait;
 use bytes::Bytes;
 use datafusion::prelude::{
     CsvReadOptions, JsonReadOptions, ParquetReadOptions, SessionContext,
 };
 use datafusion_catalog_listing::{ListingOptions, ListingTable, ListingTableConfig};
-use datafusion_datasource::ListingTableUrl;
+use datafusion_datasource::{ListingTableUrl, PartitionedFile};
 use datafusion_datasource_csv::CsvFormat;
 use datafusion_datasource_json::JsonFormat;
 use futures::stream::BoxStream;
@@ -49,6 +50,69 @@ use std::fmt::{Display, Formatter};
 use std::ops::Range;
 use std::sync::Arc;
 use url::Url;
+
+#[tokio::test]
+async fn prelisted_files_skip_listing_and_head_requests() {
+    let test = Test::new()
+        .with_bytes("data/a.csv", "id\n1\n")
+        .await
+        .with_bytes("data/b.csv", "id\n2\n")
+        .await;
+    let selected = test
+        .object_store
+        .inner
+        .head(&Path::from("data/a.csv"))
+        .await
+        .unwrap();
+    let config = ListingTableConfig::new(ListingTableUrl::parse("mem:///data/").unwrap())
+        .with_listing_options(ListingOptions::new(Arc::new(
+            CsvFormat::default().with_has_header(true),
+        )))
+        .with_schema(Arc::new(Schema::new(vec![Field::new(
+            "id",
+            DataType::Int32,
+            true,
+        )])))
+        .with_prelisted_files(vec![PartitionedFile::new_from_meta(selected)]);
+    test.session_context
+        .register_table(
+            "selected_files",
+            Arc::new(ListingTable::try_new(config).unwrap()),
+        )
+        .unwrap();
+
+    let batches = test
+        .session_context
+        .sql("SELECT id FROM selected_files")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].num_rows(), 1);
+    assert_eq!(
+        batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .value(0),
+        1
+    );
+    let error = test
+        .session_context
+        .sql("INSERT INTO selected_files VALUES (3)")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("prelisted files"), "{error}");
+    let requests = test.requests();
+    assert!(!requests.contains("LIST"), "{requests}");
+    assert!(!requests.contains("head=true"), "{requests}");
+}
 
 #[tokio::test]
 async fn create_single_csv_file() {
