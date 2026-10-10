@@ -427,6 +427,10 @@ enum CompressionTypeVariant {
   XZ = 2;
   ZSTD = 3;
   UNCOMPRESSED = 4;
+  AUTO = 5;
+  BROTLI = 6;
+  DEFLATE = 7;
+  RAW_DEFLATE = 8;
 }
 
 message JsonWriterOptions {

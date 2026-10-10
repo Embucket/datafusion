@@ -1304,6 +1304,10 @@ impl serde::Serialize for CompressionTypeVariant {
             Self::Xz => "XZ",
             Self::Zstd => "ZSTD",
             Self::Uncompressed => "UNCOMPRESSED",
+            Self::Auto => "AUTO",
+            Self::Brotli => "BROTLI",
+            Self::Deflate => "DEFLATE",
+            Self::RawDeflate => "RAW_DEFLATE",
         };
         serializer.serialize_str(variant)
     }
@@ -1320,6 +1324,10 @@ impl<'de> serde::Deserialize<'de> for CompressionTypeVariant {
             "XZ",
             "ZSTD",
             "UNCOMPRESSED",
+            "AUTO",
+            "BROTLI",
+            "DEFLATE",
+            "RAW_DEFLATE",
         ];
 
         struct GeneratedVisitor;
@@ -1365,6 +1373,10 @@ impl<'de> serde::Deserialize<'de> for CompressionTypeVariant {
                     "XZ" => Ok(CompressionTypeVariant::Xz),
                     "ZSTD" => Ok(CompressionTypeVariant::Zstd),
                     "UNCOMPRESSED" => Ok(CompressionTypeVariant::Uncompressed),
+                    "AUTO" => Ok(CompressionTypeVariant::Auto),
+                    "BROTLI" => Ok(CompressionTypeVariant::Brotli),
+                    "DEFLATE" => Ok(CompressionTypeVariant::Deflate),
+                    "RAW_DEFLATE" => Ok(CompressionTypeVariant::RawDeflate),
                     _ => Err(serde::de::Error::unknown_variant(value, FIELDS)),
                 }
             }

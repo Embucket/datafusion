@@ -948,6 +948,10 @@ impl From<protobuf::CompressionTypeVariant> for CompressionTypeVariant {
             protobuf::CompressionTypeVariant::Xz => Self::XZ,
             protobuf::CompressionTypeVariant::Zstd => Self::ZSTD,
             protobuf::CompressionTypeVariant::Uncompressed => Self::UNCOMPRESSED,
+            protobuf::CompressionTypeVariant::Auto => Self::AUTO,
+            protobuf::CompressionTypeVariant::Brotli => Self::BROTLI,
+            protobuf::CompressionTypeVariant::Deflate => Self::DEFLATE,
+            protobuf::CompressionTypeVariant::RawDeflate => Self::RAW_DEFLATE,
         }
     }
 }
@@ -960,6 +964,35 @@ impl From<CompressionTypeVariant> for protobuf::CompressionTypeVariant {
             CompressionTypeVariant::XZ => Self::Xz,
             CompressionTypeVariant::ZSTD => Self::Zstd,
             CompressionTypeVariant::UNCOMPRESSED => Self::Uncompressed,
+            CompressionTypeVariant::AUTO => Self::Auto,
+            CompressionTypeVariant::BROTLI => Self::Brotli,
+            CompressionTypeVariant::DEFLATE => Self::Deflate,
+            CompressionTypeVariant::RAW_DEFLATE => Self::RawDeflate,
+        }
+    }
+}
+
+#[cfg(test)]
+mod compression_type_tests {
+    use super::*;
+
+    #[test]
+    fn compression_type_wire_values_roundtrip() {
+        for (variant, tag) in [
+            (CompressionTypeVariant::GZIP, 0),
+            (CompressionTypeVariant::BZIP2, 1),
+            (CompressionTypeVariant::XZ, 2),
+            (CompressionTypeVariant::ZSTD, 3),
+            (CompressionTypeVariant::UNCOMPRESSED, 4),
+            (CompressionTypeVariant::AUTO, 5),
+            (CompressionTypeVariant::BROTLI, 6),
+            (CompressionTypeVariant::DEFLATE, 7),
+            (CompressionTypeVariant::RAW_DEFLATE, 8),
+        ] {
+            let protobuf = protobuf::CompressionTypeVariant::from(variant);
+            assert_eq!(protobuf as i32, tag);
+            assert_eq!(CompressionTypeVariant::from(protobuf), variant);
+            assert_eq!(protobuf::CompressionTypeVariant::from(&variant), protobuf);
         }
     }
 }
