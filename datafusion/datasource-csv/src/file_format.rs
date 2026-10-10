@@ -65,6 +65,22 @@ use object_store::{
 };
 use regex::Regex;
 
+async fn is_uncompressed_auto_file(store: &dyn ObjectStore, file: &ObjectMeta) -> bool {
+    if file.size == 0 {
+        return true;
+    }
+    let len = file
+        .size
+        .min(u64::try_from(FileCompressionType::AUTO_PROBE_BYTES).unwrap_or(u64::MAX));
+    store
+        .get_range(&file.location, 0..len)
+        .await
+        .is_ok_and(|header| {
+            FileCompressionType::detect_from_header(&header)
+                == FileCompressionType::UNCOMPRESSED
+        })
+}
+
 #[derive(Default)]
 /// Factory used to create [`CsvFormat`]
 pub struct CsvFormatFactory {
@@ -482,17 +498,7 @@ impl FileFormat for CsvFormat {
                 let plain = futures::future::join_all(files.into_iter().map(|file| {
                     let store = Arc::clone(&store);
                     async move {
-                        if file.object_meta.size == 0 {
-                            return true;
-                        }
-                        let len = file.object_meta.size.min(6);
-                        store
-                            .get_range(&file.object_meta.location, 0..len)
-                            .await
-                            .is_ok_and(|header| {
-                                FileCompressionType::detect_from_header(&header)
-                                    == FileCompressionType::UNCOMPRESSED
-                            })
+                        is_uncompressed_auto_file(store.as_ref(), &file.object_meta).await
                     }
                 }))
                 .await;
@@ -1273,11 +1279,12 @@ impl From<&CsvFormatFactory> for datafusion_proto_models::protobuf::CsvOptions {
 
 #[cfg(test)]
 mod tests {
-    use super::{CsvFormat, build_schema_helper};
+    use super::{CsvFormat, build_schema_helper, is_uncompressed_auto_file};
     use arrow::datatypes::DataType;
     use bytes::Bytes;
     use datafusion_common::DFSchema;
     use datafusion_common::config::TableOptions;
+    use datafusion_datasource::file_compression_type::FileCompressionType;
     use datafusion_execution::TaskContext;
     use datafusion_execution::config::SessionConfig;
     use datafusion_execution::runtime_env::RuntimeEnv;
@@ -1289,10 +1296,48 @@ mod tests {
     use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
     use datafusion_physical_plan::ExecutionPlan;
     use datafusion_session::{CatalogProviderList, EmptyCatalogProviderList, Session};
-    use futures::stream;
+    use futures::{StreamExt, TryStreamExt, stream};
+    use object_store::ObjectStoreExt;
+    use object_store::memory::InMemory;
+    use object_store::path::Path;
     use std::any::Any;
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn auto_repartition_probe_checks_past_printable_zlib_header()
+    -> Result<(), Box<dyn std::error::Error>> {
+        assert!(FileCompressionType::compression_enabled());
+        let store = InMemory::new();
+        // zlib.compress(b"1000,payload\n", level=2): its first six bytes are printable.
+        let zlib: &[u8] = b"x^3400\xd0)H\xac\xcc\xc9OL\xe1\x02\x00\x19\x10\x03\xe2";
+        let decoded = FileCompressionType::DEFLATE
+            .convert_stream(stream::once(async { Ok(Bytes::from_static(zlib)) }).boxed())?
+            .try_collect::<Vec<_>>()
+            .await?
+            .concat();
+        assert_eq!(decoded, b"1000,payload\n");
+        assert_eq!(
+            FileCompressionType::detect_from_header(&zlib[..6]),
+            FileCompressionType::UNCOMPRESSED
+        );
+        for (name, content, expected_plain) in [
+            ("compressed.csv", zlib, false),
+            ("plain.csv", b"80,payload-0\n".as_slice(), true),
+        ] {
+            let path = Path::from(name);
+            store
+                .put(&path, Bytes::copy_from_slice(content).into())
+                .await?;
+            let metadata = store.head(&path).await?;
+            assert_eq!(
+                is_uncompressed_auto_file(&store, &metadata).await,
+                expected_plain,
+                "{name}"
+            );
+        }
+        Ok(())
+    }
 
     struct InferenceSession {
         config: SessionConfig,
