@@ -783,6 +783,61 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "compression")]
+    #[tokio::test]
+    async fn test_multiple_large_plain_csv_auto_preserves_parallel_range_scan() {
+        use crate::prelude::CsvReadOptions;
+        use datafusion_datasource::source::DataSourceExec;
+        use datafusion_datasource_csv::source::CsvSource;
+        use datafusion_physical_plan::ExecutionPlan;
+
+        fn find_scan(plan: &dyn ExecutionPlan) -> Option<&DataSourceExec> {
+            plan.downcast_ref::<DataSourceExec>().or_else(|| {
+                plan.children()
+                    .into_iter()
+                    .find_map(|child| find_scan(child.as_ref()))
+            })
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let contents = "10000000000000000000000000000000\n".repeat(600_000);
+        fs::write(dir.path().join("first.csv"), &contents).unwrap();
+        fs::write(dir.path().join("second.csv"), contents).unwrap();
+        let schema = Schema::new(vec![Field::new("value", DataType::Utf8, true)]);
+        let context = SessionContext::new_with_config(
+            SessionConfig::new()
+                .with_target_partitions(4)
+                .with_repartition_file_scans(true),
+        );
+        let plan = context
+            .read_csv(
+                dir.path().to_str().unwrap(),
+                CsvReadOptions::new()
+                    .has_header(false)
+                    .schema(&schema)
+                    .file_compression_type(FileCompressionType::AUTO),
+            )
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        let scan = find_scan(plan.as_ref()).unwrap();
+        let (config, _) = scan.downcast_to_file_source::<CsvSource>().unwrap();
+        assert_eq!(
+            config.file_compression_type,
+            FileCompressionType::UNCOMPRESSED
+        );
+        assert!(config.file_groups.len() > 2);
+        let batches = datafusion_physical_plan::collect(plan, context.task_ctx())
+            .await
+            .unwrap();
+        assert_eq!(
+            batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+            1_200_000
+        );
+    }
+
     #[cfg(not(feature = "compression"))]
     #[tokio::test]
     async fn test_large_plain_csv_auto_requires_compression_feature() {

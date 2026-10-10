@@ -457,25 +457,46 @@ impl FileFormat for CsvFormat {
             && state.config_options().optimizer.repartition_file_scans
             && state.config_options().execution.target_partitions > 1
         {
-            let mut files = conf.file_groups.iter().flat_map(|group| group.iter());
-            if let Some(file) = files.next().filter(|_| files.next().is_none())
-                && file.range.is_none()
-                && file.object_meta.size
-                    >= u64::try_from(
-                        state
-                            .config_options()
-                            .optimizer
-                            .repartition_file_min_size
-                            .max(16 * 1024 * 1024),
-                    )
-                    .unwrap_or(u64::MAX)
+            let files = conf
+                .file_groups
+                .iter()
+                .flat_map(|group| group.iter())
+                .take(33)
+                .collect::<Vec<_>>();
+            let min_size = u64::try_from(
+                state
+                    .config_options()
+                    .optimizer
+                    .repartition_file_min_size
+                    .max(16 * 1024 * 1024),
+            )
+            .unwrap_or(u64::MAX);
+            if !files.is_empty()
+                && files.len() <= 32
+                && files.iter().all(|file| file.range.is_none())
+                && files.iter().fold(0_u64, |size, file| {
+                    size.saturating_add(file.object_meta.size)
+                }) >= min_size
             {
                 let store = state.runtime_env().object_store(&conf.object_store_url)?;
-                if let Ok(header) =
-                    store.get_range(&file.object_meta.location, 0..6).await
-                    && FileCompressionType::detect_from_header(&header)
-                        == FileCompressionType::UNCOMPRESSED
-                {
+                let plain = futures::future::join_all(files.into_iter().map(|file| {
+                    let store = Arc::clone(&store);
+                    async move {
+                        if file.object_meta.size == 0 {
+                            return true;
+                        }
+                        let len = file.object_meta.size.min(6);
+                        store
+                            .get_range(&file.object_meta.location, 0..len)
+                            .await
+                            .is_ok_and(|header| {
+                                FileCompressionType::detect_from_header(&header)
+                                    == FileCompressionType::UNCOMPRESSED
+                            })
+                    }
+                }))
+                .await;
+                if plain.into_iter().all(|is_plain| is_plain) {
                     compression = FileCompressionType::UNCOMPRESSED;
                 }
             }
