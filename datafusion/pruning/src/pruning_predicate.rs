@@ -2185,7 +2185,7 @@ mod tests {
     use datafusion_physical_expr::utils::collect_columns;
     use insta::assert_snapshot;
 
-    use arrow::array::Decimal128Array;
+    use arrow::array::{Decimal128Array, TimestampMicrosecondArray};
     use arrow::{
         array::{BinaryArray, Int32Array, Int64Array, StringArray, UInt64Array},
         datatypes::TimeUnit,
@@ -3615,6 +3615,48 @@ mod tests {
             test_build_predicate_expression(&expr, &schema, &mut RequiredColumns::new());
         assert_eq!(predicate_expr.to_string(), expected_expr);
 
+        Ok(())
+    }
+
+    #[test]
+    fn row_group_predicate_keeps_timezone_cast_match() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            false,
+        )]));
+        let target_type =
+            DataType::Timestamp(TimeUnit::Microsecond, Some("+01:00".into()));
+        let matching_literal =
+            ScalarValue::TimestampMicrosecond(Some(0), None).cast_to(&target_type)?;
+        let expr = try_cast(col("ts"), target_type).eq(lit(matching_literal));
+        let physical = logical2physical(&expr, &schema);
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(TimestampMicrosecondArray::from(vec![Some(0)]))],
+        )?;
+        let evaluated = physical.evaluate(&batch)?.into_array(1)?;
+        assert!(evaluated.as_boolean().value(0), "test row must match");
+
+        let statistics = TestStatistics::new()
+            .with(
+                "ts",
+                ContainerStats::default()
+                    .with_min(Arc::new(TimestampMicrosecondArray::from(vec![
+                        Some(0),
+                        Some(1),
+                    ])))
+                    .with_max(Arc::new(TimestampMicrosecondArray::from(vec![
+                        Some(0),
+                        Some(1),
+                    ]))),
+            )
+            .with_null_counts("ts", [Some(0), Some(0)])
+            .with_row_counts("ts", [Some(1), Some(1)]);
+        let pruning = PruningPredicateBuilder::new()
+            .with_file_schema(schema)
+            .try_build(physical)?;
+        assert_eq!(pruning.prune(&statistics)?, vec![true, false]);
         Ok(())
     }
 

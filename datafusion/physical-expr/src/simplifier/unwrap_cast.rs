@@ -37,8 +37,7 @@ use arrow::datatypes::{DataType, Schema};
 use datafusion_common::{Result, ScalarValue, tree_node::Transformed};
 use datafusion_expr::Operator;
 use datafusion_expr_common::casts::{
-    is_date_narrowing_cast, is_timestamp_precision_narrowing_cast,
-    try_cast_literal_to_type,
+    changes_timestamp_semantics, is_date_narrowing_cast, try_cast_literal_to_type,
 };
 
 use crate::PhysicalExpr;
@@ -130,7 +129,7 @@ fn try_unwrap_cast_comparison(
     // Get the data type of the inner expression
     let inner_type = inner_expr.data_type(schema)?;
 
-    if is_timestamp_precision_narrowing_cast(&inner_type, cast_type)
+    if changes_timestamp_semantics(&inner_type, cast_type)
         || is_date_narrowing_cast(&inner_type, cast_type)
     {
         return Ok(None);
@@ -249,6 +248,56 @@ mod tests {
 
         let result = unwrap_cast_in_comparison(binary_expr, &schema).unwrap();
         assert!(!result.transformed);
+    }
+
+    #[test]
+    fn test_no_unwrap_timestamp_timezone_or_unit_change() {
+        let source_type = DataType::Timestamp(TimeUnit::Microsecond, None);
+        let schema = Schema::new(vec![Field::new("ts", source_type.clone(), false)]);
+        for target_type in [
+            DataType::Timestamp(TimeUnit::Microsecond, Some("+01:00".into())),
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+        ] {
+            let target_literal = ScalarValue::TimestampMicrosecond(Some(0), None)
+                .cast_to(&target_type)
+                .unwrap();
+            let column = col("ts", &schema).unwrap();
+            for cast in [
+                Arc::new(CastExpr::new(
+                    Arc::clone(&column),
+                    target_type.clone(),
+                    None,
+                )) as Arc<dyn PhysicalExpr>,
+                Arc::new(TryCastExpr::new(Arc::clone(&column), target_type.clone())),
+            ] {
+                let literal = lit(target_literal.clone());
+                for comparison in [
+                    Arc::new(BinaryExpr::new(
+                        Arc::clone(&cast),
+                        Operator::Eq,
+                        Arc::clone(&literal),
+                    )),
+                    Arc::new(BinaryExpr::new(Arc::clone(&literal), Operator::Eq, cast)),
+                ] {
+                    let result = unwrap_cast_in_comparison(comparison, &schema).unwrap();
+                    assert!(!result.transformed, "cast to {target_type:?} was unwrapped");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_unwrap_identity_timestamp_cast() {
+        let ts_type = DataType::Timestamp(TimeUnit::Microsecond, None);
+        let schema = Schema::new(vec![Field::new("ts", ts_type.clone(), false)]);
+        let column = col("ts", &schema).unwrap();
+        let comparison = Arc::new(BinaryExpr::new(
+            Arc::new(CastExpr::new(column, ts_type, None)),
+            Operator::Eq,
+            lit(ScalarValue::TimestampMicrosecond(Some(0), None)),
+        ));
+        let result = unwrap_cast_in_comparison(comparison, &schema).unwrap();
+        assert!(result.transformed);
     }
 
     #[test]
@@ -601,7 +650,7 @@ mod tests {
     }
 
     #[test]
-    fn test_unwrap_timestamp_precision_widening() {
+    fn test_no_unwrap_timestamp_precision_widening() {
         let schema = Schema::new(vec![Field::new(
             "ts",
             DataType::Timestamp(TimeUnit::Millisecond, None),
@@ -620,14 +669,8 @@ mod tests {
 
         let result = unwrap_cast_in_comparison(binary_expr, &schema).unwrap();
 
-        assert!(result.transformed);
-        let optimized_binary = result.data.downcast_ref::<BinaryExpr>().unwrap();
-        assert!(!is_cast_expr(optimized_binary.left()));
-        let right_literal = optimized_binary.right().downcast_ref::<Literal>().unwrap();
-        assert_eq!(
-            right_literal.value(),
-            &ScalarValue::TimestampMillisecond(Some(1), None)
-        );
+        // The literal fits, but other column values may overflow when widened.
+        assert!(!result.transformed);
     }
 
     #[test]
