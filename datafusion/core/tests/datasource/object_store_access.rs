@@ -24,7 +24,7 @@
 //!
 //! [`ListingTable`]: datafusion::datasource::listing::ListingTable
 
-use arrow::array::{ArrayRef, Int32Array, RecordBatch};
+use arrow::array::{ArrayRef, Int32Array, RecordBatch, UInt32Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -32,9 +32,11 @@ use datafusion::prelude::{
     CsvReadOptions, JsonReadOptions, ParquetReadOptions, SessionContext,
 };
 use datafusion_catalog_listing::{ListingOptions, ListingTable, ListingTableConfig};
+use datafusion_common::ScalarValue;
 use datafusion_datasource::{ListingTableUrl, PartitionedFile};
 use datafusion_datasource_csv::CsvFormat;
 use datafusion_datasource_json::JsonFormat;
+use datafusion_datasource_parquet::ParquetFormat;
 use futures::stream::BoxStream;
 use insta::assert_snapshot;
 use object_store::memory::InMemory;
@@ -112,6 +114,318 @@ async fn prelisted_files_skip_listing_and_head_requests() {
     let requests = test.requests();
     assert!(!requests.contains("LIST"), "{requests}");
     assert!(!requests.contains("head=true"), "{requests}");
+}
+
+#[tokio::test]
+async fn prelisted_files_use_explicit_partition_values_without_listing() {
+    let test = Test::new()
+        .with_bytes("data/a.csv", "id\n1\n")
+        .await
+        .with_bytes("data/b.csv", "id\n2\n")
+        .await;
+    let a = test
+        .object_store
+        .inner
+        .head(&Path::from("data/a.csv"))
+        .await
+        .unwrap();
+    let b = test
+        .object_store
+        .inner
+        .head(&Path::from("data/b.csv"))
+        .await
+        .unwrap();
+    let config = ListingTableConfig::new(ListingTableUrl::parse("mem:///data/").unwrap())
+        .with_listing_options(
+            ListingOptions::new(Arc::new(CsvFormat::default().with_has_header(true)))
+                .with_table_partition_cols(vec![(
+                    "file_id".to_owned(),
+                    DataType::UInt32,
+                )]),
+        )
+        .with_schema(Arc::new(Schema::new(vec![Field::new(
+            "id",
+            DataType::Int32,
+            true,
+        )])));
+
+    let invalid = config
+        .clone()
+        .with_prelisted_files(vec![PartitionedFile::new_from_meta(a.clone())]);
+    let error = ListingTable::try_new(invalid).unwrap_err();
+    assert!(error.to_string().contains("expected 1"), "{error}");
+
+    let wrong_type = config.clone().with_prelisted_files(vec![
+        PartitionedFile::new_from_meta(a.clone())
+            .with_partition_values(vec![ScalarValue::Utf8(Some("0".to_owned()))]),
+    ]);
+    let error = ListingTable::try_new(wrong_type).unwrap_err();
+    assert!(error.to_string().contains("non-null UInt32"), "{error}");
+
+    let null_value = config.clone().with_prelisted_files(vec![
+        PartitionedFile::new_from_meta(a.clone())
+            .with_partition_values(vec![ScalarValue::UInt32(None)]),
+    ]);
+    let error = ListingTable::try_new(null_value).unwrap_err();
+    assert!(error.to_string().contains("non-null UInt32"), "{error}");
+
+    let config = config.with_prelisted_files(vec![
+        PartitionedFile::new_from_meta(a)
+            .with_partition_values(vec![ScalarValue::UInt32(Some(0))]),
+        PartitionedFile::new_from_meta(b)
+            .with_partition_values(vec![ScalarValue::UInt32(Some(1))]),
+    ]);
+    test.session_context
+        .register_table(
+            "selected_files",
+            Arc::new(ListingTable::try_new(config).unwrap()),
+        )
+        .unwrap();
+
+    let filtered = test
+        .session_context
+        .sql("SELECT id FROM selected_files WHERE file_id = 1")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let filtered_ids = filtered
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .values()
+                .iter()
+                .copied()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(filtered_ids, vec![2]);
+    let filtered_requests = test.requests();
+    assert!(
+        !filtered_requests.contains("path=data/a.csv"),
+        "{filtered_requests}"
+    );
+    assert!(
+        filtered_requests.contains("path=data/b.csv"),
+        "{filtered_requests}"
+    );
+
+    let batches = test
+        .session_context
+        .sql("SELECT id, file_id FROM selected_files ORDER BY file_id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let mut rows = Vec::new();
+    for batch in &batches {
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let file_ids = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap();
+        for row in 0..batch.num_rows() {
+            rows.push((ids.value(row), file_ids.value(row)));
+        }
+    }
+    assert_eq!(rows, vec![(1, 0), (2, 1)]);
+    let requests = test.requests();
+    assert!(!requests.contains("LIST"), "{requests}");
+    assert!(!requests.contains("head=true"), "{requests}");
+}
+
+#[tokio::test]
+async fn prelisted_duplicate_paths_keep_first_partition_value_under_filters() {
+    let test = Test::new().with_bytes("data/a.csv", "id\n1\n").await;
+    let meta = test
+        .object_store
+        .inner
+        .head(&Path::from("data/a.csv"))
+        .await
+        .unwrap();
+    let config = ListingTableConfig::new(ListingTableUrl::parse("mem:///data/").unwrap())
+        .with_listing_options(
+            ListingOptions::new(Arc::new(CsvFormat::default().with_has_header(true)))
+                .with_table_partition_cols(vec![(
+                    "file_id".to_owned(),
+                    DataType::UInt32,
+                )]),
+        )
+        .with_schema(Arc::new(Schema::new(vec![Field::new(
+            "id",
+            DataType::Int32,
+            true,
+        )])))
+        .with_prelisted_files(vec![
+            PartitionedFile::new_from_meta(meta.clone())
+                .with_partition_values(vec![ScalarValue::UInt32(Some(0))]),
+            PartitionedFile::new_from_meta(meta)
+                .with_partition_values(vec![ScalarValue::UInt32(Some(1))]),
+        ]);
+    test.session_context
+        .register_table(
+            "duplicates",
+            Arc::new(ListingTable::try_new(config).unwrap()),
+        )
+        .unwrap();
+
+    let unfiltered = test
+        .session_context
+        .sql("SELECT file_id FROM duplicates")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        unfiltered.iter().map(RecordBatch::num_rows).sum::<usize>(),
+        1
+    );
+    assert_eq!(
+        unfiltered[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap()
+            .value(0),
+        0
+    );
+
+    let filtered = test
+        .session_context
+        .sql("SELECT id FROM duplicates WHERE file_id = 1")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(filtered.iter().map(RecordBatch::num_rows).sum::<usize>(), 0);
+}
+
+#[tokio::test]
+async fn prelisted_json_file_uses_explicit_partition_value() {
+    let test = Test::new()
+        .with_bytes("data/one.json", "{\"id\":7}\n")
+        .await;
+    let meta = test
+        .object_store
+        .inner
+        .head(&Path::from("data/one.json"))
+        .await
+        .unwrap();
+    let config = ListingTableConfig::new(ListingTableUrl::parse("mem:///data/").unwrap())
+        .with_listing_options(
+            ListingOptions::new(Arc::new(JsonFormat::default()))
+                .with_table_partition_cols(vec![(
+                    "file_id".to_owned(),
+                    DataType::UInt32,
+                )]),
+        )
+        .with_schema(Arc::new(Schema::new(vec![Field::new(
+            "id",
+            DataType::Int32,
+            true,
+        )])))
+        .with_prelisted_files(vec![
+            PartitionedFile::new_from_meta(meta)
+                .with_partition_values(vec![ScalarValue::UInt32(Some(7))]),
+        ]);
+    test.session_context
+        .register_table(
+            "selected_json",
+            Arc::new(ListingTable::try_new(config).unwrap()),
+        )
+        .unwrap();
+    let batches = test
+        .session_context
+        .sql("SELECT id, file_id FROM selected_json")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+    assert_eq!(
+        batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap()
+            .value(0),
+        7
+    );
+    let requests = test.requests();
+    assert!(!requests.contains("LIST"), "{requests}");
+    assert!(!requests.contains("head=true"), "{requests}");
+}
+
+#[tokio::test]
+async fn prelisted_parquet_file_uses_explicit_partition_value() {
+    let test = Test::new().with_single_file_parquet().await;
+    let meta = test
+        .object_store
+        .inner
+        .head(&Path::from("parquet_table.parquet"))
+        .await
+        .unwrap();
+    let config = ListingTableConfig::new(
+        ListingTableUrl::parse("mem:///parquet_table.parquet").unwrap(),
+    )
+    .with_listing_options(
+        ListingOptions::new(Arc::new(ParquetFormat::default()))
+            .with_table_partition_cols(vec![("file_id".to_owned(), DataType::UInt32)]),
+    )
+    .with_schema(Arc::new(Schema::new(vec![
+        Field::new("a", DataType::Int32, false),
+        Field::new("b", DataType::Int32, false),
+    ])))
+    .with_prelisted_files(vec![
+        PartitionedFile::new_from_meta(meta)
+            .with_partition_values(vec![ScalarValue::UInt32(Some(9))]),
+    ]);
+    test.session_context
+        .register_table(
+            "selected_parquet",
+            Arc::new(ListingTable::try_new(config).unwrap()),
+        )
+        .unwrap();
+    let batches = test
+        .session_context
+        .sql("SELECT a, file_id FROM selected_parquet LIMIT 1")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let batch = batches.iter().find(|batch| batch.num_rows() > 0).unwrap();
+    assert_eq!(
+        batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .value(0),
+        0
+    );
+    assert_eq!(
+        batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap()
+            .value(0),
+        9
+    );
 }
 
 #[tokio::test]

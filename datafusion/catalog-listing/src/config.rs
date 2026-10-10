@@ -112,8 +112,9 @@ impl ListingTableConfig {
 
     /// Use an already selected set of files for scan planning. The caller is
     /// responsible for supplying current metadata from the table's object store.
-    /// This mode requires an explicit schema and does not support partition columns,
-    /// declared output partitioning, or inserts into the resulting table.
+    /// This mode requires an explicit schema and does not support declared output
+    /// partitioning or inserts into the resulting table. If partition columns are
+    /// declared, each file must provide their values in the same order.
     #[must_use]
     pub fn with_prelisted_files(mut self, files: Vec<PartitionedFile>) -> Self {
         self.prelisted_files = Some(files.into());
