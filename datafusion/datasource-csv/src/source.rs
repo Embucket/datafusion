@@ -116,13 +116,14 @@ impl CsvSource {
         self
     }
 
-    /// Accept exact numeric Boolean literals (`0` and `1`) while scanning CSV.
+    /// Accept `0`/`1` and Snowflake-style text aliases (`t`/`f`, `yes`/`no`,
+    /// `y`/`n`, `on`/`off`) in Boolean CSV columns.
     pub fn with_numeric_boolean_values(mut self, allow: bool) -> Self {
         self.numeric_boolean_values = allow;
         self
     }
 
-    /// Whether exact `0` and `1` values are accepted in Boolean CSV columns.
+    /// Whether numeric and Snowflake-style text aliases are accepted in Boolean CSV columns.
     pub fn numeric_boolean_values(&self) -> bool {
         self.numeric_boolean_values
     }
