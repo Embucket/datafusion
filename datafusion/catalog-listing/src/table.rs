@@ -57,7 +57,22 @@ use datafusion_physical_plan::empty::EmptyExec;
 use futures::{Stream, StreamExt, TryStreamExt, future, stream};
 use object_store::ObjectStore;
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::sync::Arc;
+
+async fn bounded_try_join_all<I, F, T, E>(
+    futures: I,
+    concurrency: usize,
+) -> Result<Vec<T>, E>
+where
+    I: IntoIterator<Item = F>,
+    F: Future<Output = Result<T, E>>,
+{
+    stream::iter(futures)
+        .buffered(concurrency)
+        .try_collect()
+        .await
+}
 
 /// Result of a file listing operation from [`ListingTable::list_files_for_scan`].
 #[derive(Debug)]
@@ -806,9 +821,12 @@ impl ListingTable {
         listing_time_filters: &'a [Expr],
         file_limit: Option<usize>,
     ) -> datafusion_common::Result<(FileGroup, bool)> {
-        // list files (with partitions)
-        let file_list = future::try_join_all(self.table_paths.iter().map(|table_path| {
-            pruned_partition_list(
+        // Bound metadata requests for explicit file lists as well as directories.
+        let meta_fetch_concurrency =
+            ctx.config_options().execution.meta_fetch_concurrency.get();
+        let mut requests = Vec::with_capacity(self.table_paths.len());
+        for table_path in &self.table_paths {
+            requests.push(pruned_partition_list(
                 ctx,
                 store.as_ref(),
                 table_path,
@@ -816,11 +834,9 @@ impl ListingTable {
                 &self.options.file_extension,
                 self.options.auto_file_suffixes.as_deref(),
                 &self.options.table_partition_cols,
-            )
-        }))
-        .await?;
-        let meta_fetch_concurrency =
-            ctx.config_options().execution.meta_fetch_concurrency.get();
+            ));
+        }
+        let file_list = bounded_try_join_all(requests, meta_fetch_concurrency).await?;
         // Table paths can overlap, for example when one path is a directory and
         // another names a file inside it. A ListingTable uses one object store,
         // so the object path uniquely identifies a file within this scan.
@@ -1132,6 +1148,39 @@ mod tests {
     use arrow::compute::SortOptions;
     use datafusion_physical_expr::expressions::Column;
     use datafusion_physical_expr_common::sort_expr::PhysicalSortExpr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::Poll;
+
+    #[test]
+    fn test_bounded_metadata_requests_keep_order() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let requests = (0..64).map(|index| {
+            let active = Arc::clone(&active);
+            let maximum = Arc::clone(&maximum);
+            async move {
+                let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                maximum.fetch_max(current, Ordering::SeqCst);
+                let mut first_poll = true;
+                future::poll_fn(|cx| {
+                    if first_poll {
+                        first_poll = false;
+                        cx.waker().wake_by_ref();
+                        Poll::Pending
+                    } else {
+                        Poll::Ready(())
+                    }
+                })
+                .await;
+                active.fetch_sub(1, Ordering::SeqCst);
+                Ok::<_, ()>(index)
+            }
+        });
+        let result = futures::executor::block_on(bounded_try_join_all(requests, 8));
+        assert_eq!(result, Ok((0..64).collect()));
+        assert_eq!(maximum.load(Ordering::SeqCst), 8);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+    }
 
     /// Helper to create a PhysicalSortExpr
     fn sort_expr(
