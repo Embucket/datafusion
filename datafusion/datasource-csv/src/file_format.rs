@@ -203,7 +203,8 @@ impl CsvFormat {
         self
     }
 
-    /// Accept exact `0` and `1` values in Boolean CSV columns.
+    /// Accept `0`/`1` and Snowflake-style text aliases (`t`/`f`, `yes`/`no`,
+    /// `y`/`n`, `on`/`off`) in Boolean CSV columns.
     pub fn with_numeric_boolean_values(mut self, allow: bool) -> Self {
         self.numeric_boolean_values = allow;
         self
