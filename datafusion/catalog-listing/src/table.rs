@@ -243,17 +243,38 @@ impl ListingTable {
 
         if config.prelisted_files.is_some()
             && (schema_source != SchemaSource::Specified
-                || !options.table_partition_cols.is_empty()
                 || options.output_partitioning.is_some())
         {
             return plan_err!(
-                "Prelisted files require an explicit schema, no partition columns, and no declared output partitioning"
+                "Prelisted files require an explicit schema and no declared output partitioning"
             );
         }
-        if config.prelisted_files.as_ref().is_some_and(|files| {
-            files.iter().any(|file| !file.partition_values.is_empty())
-        }) {
-            return plan_err!("Prelisted files cannot contain partition values");
+        if let Some(files) = &config.prelisted_files {
+            for file in files.iter() {
+                if file.partition_values.len() != options.table_partition_cols.len() {
+                    return plan_err!(
+                        "Prelisted file {} has {} partition values, expected {}",
+                        file.object_meta.location,
+                        file.partition_values.len(),
+                        options.table_partition_cols.len()
+                    );
+                }
+                for (value, (name, data_type)) in file
+                    .partition_values
+                    .iter()
+                    .zip(&options.table_partition_cols)
+                {
+                    if value.is_null() || value.data_type() != *data_type {
+                        return plan_err!(
+                            "Prelisted file {} partition column {} requires a non-null {:?} value, got {:?}",
+                            file.object_meta.location,
+                            name,
+                            data_type,
+                            value
+                        );
+                    }
+                }
+            }
         }
 
         // Add the partition columns to the file schema
@@ -882,6 +903,30 @@ impl ListingTable {
         let file_list = file_list.try_filter(move |file| {
             future::ready(seen_files.insert(file.object_meta.location.clone()))
         });
+        let file_list: stream::BoxStream<'a, datafusion_common::Result<PartitionedFile>> =
+            if self.prelisted_files.is_some() && !listing_time_filters.is_empty() {
+                let df_schema = DFSchema::from_unqualified_fields(
+                    self.options
+                        .table_partition_cols
+                        .iter()
+                        .map(|(name, data_type)| {
+                            Field::new(name, data_type.clone(), true)
+                        })
+                        .collect(),
+                    Default::default(),
+                )?;
+                file_list
+                    .try_filter_map(move |file| {
+                        future::ready(filter_partitioned_file(
+                            file,
+                            listing_time_filters,
+                            &df_schema,
+                        ))
+                    })
+                    .boxed()
+            } else {
+                file_list.boxed()
+            };
         // collect the statistics and ordering if required by the config
         let files = file_list
             .map(|part_file| async {
