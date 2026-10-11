@@ -154,6 +154,7 @@ pub struct CsvFormat {
     record_error_handler: Option<Arc<dyn CsvRecordErrorHandler>>,
     record_error_handler_factory: Option<Arc<dyn CsvRecordErrorHandlerFactory>>,
     numeric_boolean_values: bool,
+    replace_invalid_utf8: bool,
 }
 
 impl CsvFormat {
@@ -224,6 +225,13 @@ impl CsvFormat {
     /// `y`/`n`, `on`/`off`) in Boolean CSV columns.
     pub fn with_numeric_boolean_values(mut self, allow: bool) -> Self {
         self.numeric_boolean_values = allow;
+        self
+    }
+
+    /// Replace malformed UTF-8 in decoded CSV fields with U+FFFD.
+    /// Disabled by default.
+    pub fn with_replace_invalid_utf8(mut self, replace: bool) -> Self {
+        self.replace_invalid_utf8 = replace;
         self
     }
 
@@ -573,7 +581,8 @@ impl FileFormat for CsvFormat {
         }
         let mut source = CsvSource::new(table_schema)
             .with_csv_options(csv_options)
-            .with_numeric_boolean_values(self.numeric_boolean_values);
+            .with_numeric_boolean_values(self.numeric_boolean_values)
+            .with_replace_invalid_utf8(self.replace_invalid_utf8);
         if let Some(handler) = &self.record_error_handler {
             source = source.with_record_error_handler(Arc::clone(handler));
         } else if let Some(factory) = &self.record_error_handler_factory {
@@ -709,6 +718,7 @@ impl CsvFormat {
                 )
                 .with_delimiter(self.options.delimiter)
                 .with_quote(self.options.quote)
+                .with_replace_invalid_utf8(self.replace_invalid_utf8)
                 .with_preserve_quoted_empty(
                     self.options.preserve_quoted_empty.unwrap_or(false),
                 )
@@ -1555,6 +1565,37 @@ mod tests {
             false,
         );
         assert_eq!(schema.field(0).data_type(), &DataType::Float64);
+    }
+
+    #[tokio::test]
+    async fn test_inference_replaces_invalid_utf8_only_when_enabled() {
+        for preserve_quoted_empty in [false, true] {
+            let csv = Bytes::from_static(b"id,msg\n1,\xff\n");
+            let infer = |replace| {
+                CsvFormat::default()
+                    .with_has_header(true)
+                    .with_preserve_quoted_empty(preserve_quoted_empty)
+                    .with_replace_invalid_utf8(replace)
+            };
+            let strict = infer(false)
+                .infer_schema_from_stream_impl::<_, true, true>(
+                    &InferenceSession::new(),
+                    1,
+                    stream::iter(vec![Ok(csv.clone())]),
+                )
+                .await;
+            assert!(strict.is_err());
+            let (schema, records) = infer(true)
+                .infer_schema_from_stream_impl::<_, true, true>(
+                    &InferenceSession::new(),
+                    1,
+                    stream::iter(vec![Ok(csv)]),
+                )
+                .await
+                .unwrap();
+            assert_eq!(records, 1);
+            assert_eq!(schema.field(1).data_type(), &DataType::Utf8);
+        }
     }
 
     #[tokio::test]
