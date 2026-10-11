@@ -718,6 +718,7 @@ impl CsvFormat {
                 )
                 .with_delimiter(self.options.delimiter)
                 .with_quote(self.options.quote)
+                .with_replace_invalid_utf8(self.replace_invalid_utf8)
                 .with_preserve_quoted_empty(
                     self.options.preserve_quoted_empty.unwrap_or(false),
                 )
@@ -1564,6 +1565,37 @@ mod tests {
             false,
         );
         assert_eq!(schema.field(0).data_type(), &DataType::Float64);
+    }
+
+    #[tokio::test]
+    async fn test_inference_replaces_invalid_utf8_only_when_enabled() {
+        for preserve_quoted_empty in [false, true] {
+            let csv = Bytes::from_static(b"id,msg\n1,\xff\n");
+            let infer = |replace| {
+                CsvFormat::default()
+                    .with_has_header(true)
+                    .with_preserve_quoted_empty(preserve_quoted_empty)
+                    .with_replace_invalid_utf8(replace)
+            };
+            let strict = infer(false)
+                .infer_schema_from_stream_impl::<_, true, true>(
+                    &InferenceSession::new(),
+                    1,
+                    stream::iter(vec![Ok(csv.clone())]),
+                )
+                .await;
+            assert!(strict.is_err());
+            let (schema, records) = infer(true)
+                .infer_schema_from_stream_impl::<_, true, true>(
+                    &InferenceSession::new(),
+                    1,
+                    stream::iter(vec![Ok(csv)]),
+                )
+                .await
+                .unwrap();
+            assert_eq!(records, 1);
+            assert_eq!(schema.field(1).data_type(), &DataType::Utf8);
+        }
     }
 
     #[tokio::test]
