@@ -21,6 +21,7 @@
 #![cfg_attr(not(test), deny(clippy::clone_on_ref_ptr))]
 
 pub mod file_format;
+pub mod recovery;
 pub mod source;
 pub mod utils;
 

@@ -17,12 +17,14 @@
 
 //! Execution plan for reading JSON files (line-delimited and array formats)
 
-use std::io::BufReader;
+use std::io::{BufReader, Read};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use crate::file_format::JsonDecoder;
+pub use crate::recovery::{JsonRecord, JsonRecordHandler, JsonRecordHandlerFactory};
+use crate::recovery::{JsonRecoveryDecoder, RawJsonOptions};
 use crate::utils::{ChannelReader, JsonArrayToNdjsonReader};
 
 use datafusion_common::error::{DataFusionError, Result};
@@ -41,6 +43,7 @@ use datafusion_physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 use arrow::array::RecordBatch;
 use arrow::json::ReaderBuilder;
 use arrow::{datatypes::SchemaRef, json};
+use bytes::Bytes;
 use datafusion_datasource::file::FileSource;
 use datafusion_datasource::file_scan_config::FileScanConfig;
 use datafusion_execution::TaskContext;
@@ -105,6 +108,10 @@ pub struct JsonOpener {
     /// When `true` (default), expects newline-delimited JSON (NDJSON).
     /// When `false`, expects JSON array format `[{...}, {...}]`.
     newline_delimited: bool,
+    raw_records: bool,
+    raw_options: RawJsonOptions,
+    record_handler: Option<Arc<dyn JsonRecordHandler>>,
+    record_handler_factory: Option<Arc<dyn JsonRecordHandlerFactory>>,
 }
 
 impl JsonOpener {
@@ -122,7 +129,30 @@ impl JsonOpener {
             file_compression_type,
             object_store,
             newline_delimited,
+            raw_records: false,
+            raw_options: RawJsonOptions::default(),
+            record_handler: None,
+            record_handler_factory: None,
         }
+    }
+
+    /// Observe raw NDJSON records. Requires `with_raw_records(true)`.
+    pub fn with_record_handler(mut self, handler: Arc<dyn JsonRecordHandler>) -> Self {
+        self.record_handler = Some(handler);
+        self.record_handler_factory = None;
+        self
+    }
+
+    /// Read each non-empty NDJSON line as raw UTF-8.
+    pub fn with_raw_records(mut self, raw_records: bool) -> Self {
+        self.raw_records = raw_records;
+        self
+    }
+
+    /// Configure byte-level handling for opt-in raw records.
+    pub fn with_raw_record_options(mut self, options: RawJsonOptions) -> Self {
+        self.raw_options = options;
+        self
     }
 }
 
@@ -136,6 +166,10 @@ pub struct JsonSource {
     /// When `true` (default), expects newline-delimited JSON (NDJSON).
     /// When `false`, expects JSON array format `[{...}, {...}]`.
     newline_delimited: bool,
+    raw_records: bool,
+    raw_options: RawJsonOptions,
+    record_handler: Option<Arc<dyn JsonRecordHandler>>,
+    record_handler_factory: Option<Arc<dyn JsonRecordHandlerFactory>>,
 }
 
 impl JsonSource {
@@ -148,6 +182,10 @@ impl JsonSource {
             batch_size: None,
             metrics: ExecutionPlanMetricsSet::new(),
             newline_delimited: true,
+            raw_records: false,
+            raw_options: RawJsonOptions::default(),
+            record_handler: None,
+            record_handler_factory: None,
         }
     }
 
@@ -157,6 +195,35 @@ impl JsonSource {
     /// When `false`, expects JSON array format `[{...}, {...}]`.
     pub fn with_newline_delimited(mut self, newline_delimited: bool) -> Self {
         self.newline_delimited = newline_delimited;
+        self
+    }
+
+    /// Read each non-empty NDJSON line as raw UTF-8.
+    pub fn with_raw_records(mut self, raw_records: bool) -> Self {
+        self.raw_records = raw_records;
+        self
+    }
+
+    /// Configure byte-level handling for opt-in raw records.
+    pub fn with_raw_record_options(mut self, options: RawJsonOptions) -> Self {
+        self.raw_options = options;
+        self
+    }
+
+    /// Observe raw NDJSON records. Requires `with_raw_records(true)`.
+    pub fn with_record_handler(mut self, handler: Arc<dyn JsonRecordHandler>) -> Self {
+        self.record_handler = Some(handler);
+        self.record_handler_factory = None;
+        self
+    }
+
+    /// Create a record handler for each opened NDJSON file.
+    pub fn with_record_handler_factory(
+        mut self,
+        factory: Arc<dyn JsonRecordHandlerFactory>,
+    ) -> Self {
+        self.record_handler = None;
+        self.record_handler_factory = Some(factory);
         self
     }
 }
@@ -187,6 +254,10 @@ impl FileSource for JsonSource {
             file_compression_type: base_config.file_compression_type,
             object_store,
             newline_delimited: self.newline_delimited,
+            raw_records: self.raw_records,
+            raw_options: self.raw_options,
+            record_handler: self.record_handler.clone(),
+            record_handler_factory: self.record_handler_factory.clone(),
         }) as Arc<dyn FileOpener>;
 
         // Wrap with ProjectionOpener
@@ -233,6 +304,13 @@ impl FileSource for JsonSource {
         "json"
     }
 
+    fn supports_repartitioning(&self) -> bool {
+        self.newline_delimited
+            && !self.raw_records
+            && self.record_handler.is_none()
+            && self.record_handler_factory.is_none()
+    }
+
     fn apply_expressions(
         &self,
         f: &mut dyn FnMut(
@@ -249,6 +327,14 @@ impl FileSource for JsonSource {
         base: &FileScanConfig,
         ctx: &datafusion_physical_plan::proto::ExecutionPlanEncodeCtx<'_>,
     ) -> Result<Option<datafusion_proto_models::protobuf::PhysicalPlanNode>> {
+        if self.raw_records
+            || self.record_handler.is_some()
+            || self.record_handler_factory.is_some()
+        {
+            return datafusion_common::not_impl_err!(
+                "JSON raw-record scans and record handlers cannot be serialized"
+            );
+        }
         use datafusion_proto_models::protobuf;
         use protobuf::physical_plan_node::PhysicalPlanType;
 
@@ -315,6 +401,24 @@ impl FileOpener for JsonOpener {
         let batch_size = self.batch_size;
         let file_compression_type = self.file_compression_type.to_owned();
         let newline_delimited = self.newline_delimited;
+        let raw_records = self.raw_records;
+        let raw_options = self.raw_options;
+        let record_handler = self
+            .record_handler_factory
+            .as_ref()
+            .map(|factory| factory.for_file(&partitioned_file.object_meta.location))
+            .or_else(|| self.record_handler.clone());
+
+        if record_handler.is_some() && !raw_records {
+            return Err(DataFusionError::NotImplemented(
+                "JSON record handlers require raw-record mode".to_string(),
+            ));
+        }
+        if raw_records && (!newline_delimited || partitioned_file.range.is_some()) {
+            return Err(DataFusionError::NotImplemented(
+                "JSON raw scans require a complete newline-delimited file".to_string(),
+            ));
+        }
 
         // JSON array format requires reading the complete file
         if !newline_delimited && partitioned_file.range.is_some() {
@@ -377,6 +481,34 @@ impl FileOpener for JsonOpener {
                     let bytes = file_compression_type.convert_read(file)?;
 
                     if newline_delimited {
+                        if raw_records {
+                            let decoder = JsonRecoveryDecoder::new_raw(
+                                schema,
+                                record_handler,
+                                batch_size,
+                                raw_options,
+                            )?;
+                            let chunks = futures::stream::try_unfold(
+                                BufReader::new(bytes),
+                                |mut reader| async move {
+                                    let mut chunk = vec![0; 64 * 1024];
+                                    let read = reader
+                                        .read(&mut chunk)
+                                        .map_err(DataFusionError::from)?;
+                                    if read == 0 {
+                                        Ok(None)
+                                    } else {
+                                        chunk.truncate(read);
+                                        Ok(Some((Bytes::from(chunk), reader)))
+                                    }
+                                },
+                            );
+                            let stream = deserialize_stream(
+                                chunks.boxed(),
+                                DecoderDeserializer::new(decoder),
+                            );
+                            return Ok(stream.map_err(Into::into).boxed());
+                        }
                         // NDJSON: use BufReader directly
                         let reader = BufReader::new(bytes);
                         let arrow_reader = ReaderBuilder::new(schema)
@@ -405,11 +537,24 @@ impl FileOpener for JsonOpener {
                     if newline_delimited {
                         // Newline-delimited JSON (NDJSON) streaming reader
                         let s = s.map_err(DataFusionError::from);
+                        let input =
+                            file_compression_type.convert_stream(s.boxed())?.fuse();
+                        if raw_records {
+                            let decoder = JsonRecoveryDecoder::new_raw(
+                                schema,
+                                record_handler,
+                                batch_size,
+                                raw_options,
+                            )?;
+                            let stream = deserialize_stream(
+                                input,
+                                DecoderDeserializer::new(decoder),
+                            );
+                            return Ok(stream.map_err(Into::into).boxed());
+                        }
                         let decoder = ReaderBuilder::new(schema)
                             .with_batch_size(batch_size)
                             .build_decoder()?;
-                        let input =
-                            file_compression_type.convert_stream(s.boxed())?.fuse();
                         let stream = deserialize_stream(
                             input,
                             DecoderDeserializer::new(JsonDecoder::new(decoder)),
@@ -437,9 +582,8 @@ impl FileOpener for JsonOpener {
                         // Uses tokio::sync::mpsc so the async send never blocks a
                         // tokio worker thread; the consumer calls blocking_recv()
                         // inside spawn_blocking.
-                        let (byte_tx, byte_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(
-                            CHANNEL_BUFFER_SIZE,
-                        );
+                        let (byte_tx, byte_rx) =
+                            tokio::sync::mpsc::channel::<Bytes>(CHANNEL_BUFFER_SIZE);
 
                         // Channel for results: sync producer -> async consumer
                         let (result_tx, result_rx) = tokio::sync::mpsc::channel(2);
@@ -590,6 +734,102 @@ mod tests {
     use object_store::memory::InMemory;
     use object_store::path::Path;
     use object_store::{ObjectStoreExt, PutPayload};
+
+    #[derive(Debug, Default)]
+    struct CollectRecordErrors(std::sync::Mutex<Vec<(usize, usize, bool)>>);
+
+    impl JsonRecordHandler for CollectRecordErrors {
+        fn handle(
+            &self,
+            record: &JsonRecord<'_>,
+        ) -> std::result::Result<(), arrow::error::ArrowError> {
+            self.0.lock().unwrap().push((
+                record.line_number,
+                record.byte_offset,
+                record.error.is_some(),
+            ));
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_json_raw_records() -> Result<()> {
+        let input = b"{\"id\":1}\n{\"id\":oops}\n{\"id\":3}\n";
+        let (store, path) = make_chunked_store(input, 3).await;
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Utf8, false)]));
+        let handler = Arc::new(CollectRecordErrors::default());
+        let opener = JsonOpener::new(
+            2,
+            schema,
+            FileCompressionType::UNCOMPRESSED,
+            store.clone(),
+            true,
+        )
+        .with_raw_records(true)
+        .with_record_handler(handler.clone());
+        let meta = store.head(&path).await?;
+        let file = PartitionedFile::new(path.to_string(), meta.size);
+        let batches: Vec<_> = opener.open(file)?.await?.try_collect().await?;
+        let values = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap()
+                    .iter()
+                    .map(|value| value.unwrap().to_owned())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(values, ["{\"id\":1}\n", "{\"id\":oops}\n", "{\"id\":3}\n"]);
+        assert_eq!(
+            *handler.0.lock().unwrap(),
+            vec![(1, 0, false), (2, 9, false), (3, 21, false)]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_json_raw_records_local_file() -> Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "datafusion-json-raw-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root)?;
+        std::fs::write(
+            root.join("rows.json"),
+            b"{\"id\":1}\n{\"id\":oops}\n{\"id\":3}\n",
+        )?;
+        let store = Arc::new(object_store::local::LocalFileSystem::new_with_prefix(
+            &root,
+        )?);
+        let path = Path::from("rows.json");
+        let result = store.get(&path).await?;
+        assert!(matches!(result.payload, GetResultPayload::File(..)));
+        let meta = store.head(&path).await?;
+        let handler = Arc::new(CollectRecordErrors::default());
+        let opener = JsonOpener::new(
+            1,
+            Arc::new(Schema::new(vec![Field::new("v", DataType::Utf8, false)])),
+            FileCompressionType::UNCOMPRESSED,
+            store,
+            true,
+        )
+        .with_raw_records(true)
+        .with_record_handler(handler.clone());
+        let file = PartitionedFile::new(path.to_string(), meta.size);
+        let batches: Vec<_> = opener.open(file)?.await?.try_collect().await?;
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 3);
+        assert_eq!(handler.0.lock().unwrap().len(), 3);
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
 
     /// Helper to create a test schema
     fn test_schema() -> SchemaRef {
