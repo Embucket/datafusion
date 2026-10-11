@@ -96,6 +96,7 @@ pub trait CsvRecordErrorHandlerFactory: fmt::Debug + Send + Sync {
 pub struct CsvSource {
     options: CsvOptions,
     numeric_boolean_values: bool,
+    replace_invalid_utf8: bool,
     record_error_handler: Option<Arc<dyn csv::CsvRecordErrorHandler>>,
     record_error_handler_factory: Option<Arc<dyn CsvRecordErrorHandlerFactory>>,
     batch_size: Option<usize>,
@@ -111,6 +112,7 @@ impl CsvSource {
         Self {
             options: CsvOptions::default(),
             numeric_boolean_values: false,
+            replace_invalid_utf8: false,
             record_error_handler: None,
             record_error_handler_factory: None,
             projection: SplitProjection::unprojected(&table_schema),
@@ -130,6 +132,12 @@ impl CsvSource {
     /// `y`/`n`, `on`/`off`) in Boolean CSV columns.
     pub fn with_numeric_boolean_values(mut self, allow: bool) -> Self {
         self.numeric_boolean_values = allow;
+        self
+    }
+
+    /// Replace malformed UTF-8 in decoded CSV fields with U+FFFD.
+    pub fn with_replace_invalid_utf8(mut self, replace: bool) -> Self {
+        self.replace_invalid_utf8 = replace;
         self
     }
 
@@ -254,6 +262,7 @@ impl CsvSource {
                 .with_header(self.has_header())
                 .with_quote(self.quote())
                 .with_numeric_boolean_values(self.numeric_boolean_values)
+                .with_replace_invalid_utf8(self.replace_invalid_utf8)
                 .with_preserve_quoted_empty(self.preserve_quoted_empty())
                 .with_truncated_rows(self.truncate_rows());
         if let Some(terminator) = self.terminator() {
@@ -412,6 +421,11 @@ impl FileSource for CsvSource {
         {
             return datafusion_common::not_impl_err!(
                 "CSV record error handlers cannot be serialized"
+            );
+        }
+        if self.replace_invalid_utf8 {
+            return datafusion_common::not_impl_err!(
+                "CSV UTF-8 replacement cannot be serialized"
             );
         }
 
@@ -792,6 +806,41 @@ mod tests {
         assert_eq!(
             values.values().iter().collect::<Vec<_>>(),
             [true, true, false, false]
+        );
+    }
+
+    #[test]
+    fn csv_source_utf8_replacement_is_opt_in() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("msg", DataType::Utf8, false),
+        ]));
+        let csv = b"1,ok\n2,\xff\n3,after\n";
+        let mut source = CsvSource::new(schema).with_csv_options(CsvOptions {
+            has_header: Some(false),
+            ..Default::default()
+        });
+        source.batch_size = Some(1024);
+        assert!(
+            source
+                .open(Cursor::new(csv))
+                .unwrap()
+                .next()
+                .unwrap()
+                .is_err()
+        );
+
+        let batches = source
+            .with_replace_invalid_utf8(true)
+            .open(Cursor::new(csv))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(batches[0].num_rows(), 3);
+        let values = batches[0].column(1).as_string::<i32>();
+        assert_eq!(
+            (values.value(0), values.value(1), values.value(2)),
+            ("ok", "�", "after")
         );
     }
 

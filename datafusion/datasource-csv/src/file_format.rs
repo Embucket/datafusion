@@ -154,6 +154,7 @@ pub struct CsvFormat {
     record_error_handler: Option<Arc<dyn CsvRecordErrorHandler>>,
     record_error_handler_factory: Option<Arc<dyn CsvRecordErrorHandlerFactory>>,
     numeric_boolean_values: bool,
+    replace_invalid_utf8: bool,
 }
 
 impl CsvFormat {
@@ -224,6 +225,13 @@ impl CsvFormat {
     /// `y`/`n`, `on`/`off`) in Boolean CSV columns.
     pub fn with_numeric_boolean_values(mut self, allow: bool) -> Self {
         self.numeric_boolean_values = allow;
+        self
+    }
+
+    /// Replace malformed UTF-8 in decoded CSV fields with U+FFFD.
+    /// Disabled by default.
+    pub fn with_replace_invalid_utf8(mut self, replace: bool) -> Self {
+        self.replace_invalid_utf8 = replace;
         self
     }
 
@@ -573,7 +581,8 @@ impl FileFormat for CsvFormat {
         }
         let mut source = CsvSource::new(table_schema)
             .with_csv_options(csv_options)
-            .with_numeric_boolean_values(self.numeric_boolean_values);
+            .with_numeric_boolean_values(self.numeric_boolean_values)
+            .with_replace_invalid_utf8(self.replace_invalid_utf8);
         if let Some(handler) = &self.record_error_handler {
             source = source.with_record_error_handler(Arc::clone(handler));
         } else if let Some(factory) = &self.record_error_handler_factory {
