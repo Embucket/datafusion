@@ -23,6 +23,7 @@ use std::fmt::Debug;
 use std::io::{BufReader, Read};
 use std::sync::Arc;
 
+use crate::recovery::{JsonRecordHandler, JsonRecordHandlerFactory};
 use crate::source::JsonSource;
 
 use arrow::array::RecordBatch;
@@ -151,6 +152,9 @@ impl Debug for JsonFormatFactory {
 #[derive(Debug, Default)]
 pub struct JsonFormat {
     options: JsonOptions,
+    raw_records: bool,
+    record_handler: Option<Arc<dyn JsonRecordHandler>>,
+    record_handler_factory: Option<Arc<dyn JsonRecordHandlerFactory>>,
 }
 
 impl JsonFormat {
@@ -202,6 +206,30 @@ impl JsonFormat {
     /// Returns whether this format expects newline-delimited JSON.
     pub fn is_newline_delimited(&self) -> bool {
         self.options.newline_delimited
+    }
+
+    /// Read each non-empty NDJSON line as raw UTF-8 in a single column.
+    /// JSON parsing and type conversion are left to the consumer.
+    pub fn with_raw_records(mut self, raw_records: bool) -> Self {
+        self.raw_records = raw_records;
+        self
+    }
+
+    /// Observe raw NDJSON records with one shared handler. Requires `with_raw_records(true)`.
+    pub fn with_record_handler(mut self, handler: Arc<dyn JsonRecordHandler>) -> Self {
+        self.record_handler = Some(handler);
+        self.record_handler_factory = None;
+        self
+    }
+
+    /// Observe raw NDJSON records with a handler per file. Requires `with_raw_records(true)`.
+    pub fn with_record_handler_factory(
+        mut self,
+        factory: Arc<dyn JsonRecordHandlerFactory>,
+    ) -> Self {
+        self.record_handler = None;
+        self.record_handler_factory = Some(factory);
+        self
     }
 }
 
@@ -258,6 +286,12 @@ impl FileFormat for JsonFormat {
         store: &Arc<dyn ObjectStore>,
         objects: &[ObjectMeta],
     ) -> Result<SchemaRef> {
+        if self.raw_records
+            || self.record_handler.is_some()
+            || self.record_handler_factory.is_some()
+        {
+            return not_impl_err!("JSON raw/recovery scans require an explicit schema");
+        }
         let mut schemas = Vec::new();
         let mut records_to_read = self
             .options
@@ -373,10 +407,15 @@ impl FileFormat for JsonFormat {
     }
 
     fn file_source(&self, table_schema: TableSchema) -> Arc<dyn FileSource> {
-        Arc::new(
-            JsonSource::new(table_schema)
-                .with_newline_delimited(self.options.newline_delimited),
-        )
+        let mut source = JsonSource::new(table_schema)
+            .with_newline_delimited(self.options.newline_delimited)
+            .with_raw_records(self.raw_records);
+        if let Some(handler) = &self.record_handler {
+            source = source.with_record_handler(Arc::clone(handler));
+        } else if let Some(factory) = &self.record_handler_factory {
+            source = source.with_record_handler_factory(Arc::clone(factory));
+        }
+        Arc::new(source)
     }
 }
 

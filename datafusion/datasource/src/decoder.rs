@@ -177,16 +177,17 @@ pub fn deserialize_stream<'a>(
 ) -> BoxStream<'a, Result<RecordBatch, ArrowError>> {
     futures::stream::poll_fn(move |cx| {
         loop {
-            match ready!(input.poll_next_unpin(cx)).transpose()? {
-                Some(b) => _ = deserializer.digest(b),
-                None => deserializer.finish(),
-            };
-
-            return match deserializer.next()? {
-                DeserializerOutput::RecordBatch(rb) => Poll::Ready(Some(Ok(rb))),
-                DeserializerOutput::InputExhausted => Poll::Ready(None),
-                DeserializerOutput::RequiresMoreData => continue,
-            };
+            match deserializer.next()? {
+                DeserializerOutput::RecordBatch(rb) => return Poll::Ready(Some(Ok(rb))),
+                DeserializerOutput::InputExhausted => return Poll::Ready(None),
+                DeserializerOutput::RequiresMoreData => {
+                    match ready!(input.poll_next_unpin(cx)).transpose()? {
+                        Some(b) => _ = deserializer.digest(b),
+                        None => deserializer.finish(),
+                    }
+                    continue;
+                }
+            }
         }
     })
     .boxed()
