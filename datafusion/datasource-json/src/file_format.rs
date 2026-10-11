@@ -23,6 +23,7 @@ use std::fmt::Debug;
 use std::io::{BufReader, Read};
 use std::sync::Arc;
 
+pub use crate::recovery::RawJsonOptions;
 use crate::recovery::{JsonRecordHandler, JsonRecordHandlerFactory};
 use crate::source::JsonSource;
 
@@ -153,6 +154,7 @@ impl Debug for JsonFormatFactory {
 pub struct JsonFormat {
     options: JsonOptions,
     raw_records: bool,
+    raw_options: RawJsonOptions,
     record_handler: Option<Arc<dyn JsonRecordHandler>>,
     record_handler_factory: Option<Arc<dyn JsonRecordHandlerFactory>>,
 }
@@ -212,6 +214,12 @@ impl JsonFormat {
     /// JSON parsing and type conversion are left to the consumer.
     pub fn with_raw_records(mut self, raw_records: bool) -> Self {
         self.raw_records = raw_records;
+        self
+    }
+
+    /// Configure byte-level handling for opt-in raw records.
+    pub fn with_raw_record_options(mut self, options: RawJsonOptions) -> Self {
+        self.raw_options = options;
         self
     }
 
@@ -409,7 +417,8 @@ impl FileFormat for JsonFormat {
     fn file_source(&self, table_schema: TableSchema) -> Arc<dyn FileSource> {
         let mut source = JsonSource::new(table_schema)
             .with_newline_delimited(self.options.newline_delimited)
-            .with_raw_records(self.raw_records);
+            .with_raw_records(self.raw_records)
+            .with_raw_record_options(self.raw_options);
         if let Some(handler) = &self.record_handler {
             source = source.with_record_handler(Arc::clone(handler));
         } else if let Some(factory) = &self.record_handler_factory {

@@ -23,8 +23,8 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use crate::file_format::JsonDecoder;
-use crate::recovery::JsonRecoveryDecoder;
 pub use crate::recovery::{JsonRecord, JsonRecordHandler, JsonRecordHandlerFactory};
+use crate::recovery::{JsonRecoveryDecoder, RawJsonOptions};
 use crate::utils::{ChannelReader, JsonArrayToNdjsonReader};
 
 use datafusion_common::error::{DataFusionError, Result};
@@ -109,6 +109,7 @@ pub struct JsonOpener {
     /// When `false`, expects JSON array format `[{...}, {...}]`.
     newline_delimited: bool,
     raw_records: bool,
+    raw_options: RawJsonOptions,
     record_handler: Option<Arc<dyn JsonRecordHandler>>,
     record_handler_factory: Option<Arc<dyn JsonRecordHandlerFactory>>,
 }
@@ -129,6 +130,7 @@ impl JsonOpener {
             object_store,
             newline_delimited,
             raw_records: false,
+            raw_options: RawJsonOptions::default(),
             record_handler: None,
             record_handler_factory: None,
         }
@@ -146,6 +148,12 @@ impl JsonOpener {
         self.raw_records = raw_records;
         self
     }
+
+    /// Configure byte-level handling for opt-in raw records.
+    pub fn with_raw_record_options(mut self, options: RawJsonOptions) -> Self {
+        self.raw_options = options;
+        self
+    }
 }
 
 /// JsonSource holds the extra configuration that is necessary for [`JsonOpener`]
@@ -159,6 +167,7 @@ pub struct JsonSource {
     /// When `false`, expects JSON array format `[{...}, {...}]`.
     newline_delimited: bool,
     raw_records: bool,
+    raw_options: RawJsonOptions,
     record_handler: Option<Arc<dyn JsonRecordHandler>>,
     record_handler_factory: Option<Arc<dyn JsonRecordHandlerFactory>>,
 }
@@ -174,6 +183,7 @@ impl JsonSource {
             metrics: ExecutionPlanMetricsSet::new(),
             newline_delimited: true,
             raw_records: false,
+            raw_options: RawJsonOptions::default(),
             record_handler: None,
             record_handler_factory: None,
         }
@@ -191,6 +201,12 @@ impl JsonSource {
     /// Read each non-empty NDJSON line as raw UTF-8.
     pub fn with_raw_records(mut self, raw_records: bool) -> Self {
         self.raw_records = raw_records;
+        self
+    }
+
+    /// Configure byte-level handling for opt-in raw records.
+    pub fn with_raw_record_options(mut self, options: RawJsonOptions) -> Self {
+        self.raw_options = options;
         self
     }
 
@@ -239,6 +255,7 @@ impl FileSource for JsonSource {
             object_store,
             newline_delimited: self.newline_delimited,
             raw_records: self.raw_records,
+            raw_options: self.raw_options,
             record_handler: self.record_handler.clone(),
             record_handler_factory: self.record_handler_factory.clone(),
         }) as Arc<dyn FileOpener>;
@@ -385,6 +402,7 @@ impl FileOpener for JsonOpener {
         let file_compression_type = self.file_compression_type.to_owned();
         let newline_delimited = self.newline_delimited;
         let raw_records = self.raw_records;
+        let raw_options = self.raw_options;
         let record_handler = self
             .record_handler_factory
             .as_ref()
@@ -468,6 +486,7 @@ impl FileOpener for JsonOpener {
                                 schema,
                                 record_handler,
                                 batch_size,
+                                raw_options,
                             )?;
                             let chunks = futures::stream::try_unfold(
                                 BufReader::new(bytes),
@@ -525,6 +544,7 @@ impl FileOpener for JsonOpener {
                                 schema,
                                 record_handler,
                                 batch_size,
+                                raw_options,
                             )?;
                             let stream = deserialize_stream(
                                 input,
