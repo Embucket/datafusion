@@ -340,6 +340,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 iceberg,
                 external_volume,
                 base_location,
+                iceberg_version,
                 catalog,
                 catalog_sync,
                 storage_serialization_policy,
@@ -473,6 +474,9 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 }
                 if base_location.is_some() {
                     return not_impl_err!("Base location not supported");
+                }
+                if iceberg_version.is_some() {
+                    return not_impl_err!("Iceberg version not supported");
                 }
                 if catalog.is_some() {
                     return not_impl_err!("Catalog not supported");
