@@ -155,6 +155,7 @@ pub struct CsvFormat {
     record_error_handler_factory: Option<Arc<dyn CsvRecordErrorHandlerFactory>>,
     numeric_boolean_values: bool,
     replace_invalid_utf8: bool,
+    ignore_extra_fields: bool,
 }
 
 impl CsvFormat {
@@ -232,6 +233,13 @@ impl CsvFormat {
     /// Disabled by default.
     pub fn with_replace_invalid_utf8(mut self, replace: bool) -> Self {
         self.replace_invalid_utf8 = replace;
+        self
+    }
+
+    /// Ignore CSV fields beyond the explicitly supplied schema width.
+    /// Disabled by default.
+    pub fn with_ignore_extra_fields(mut self, ignore: bool) -> Self {
+        self.ignore_extra_fields = ignore;
         self
     }
 
@@ -582,7 +590,8 @@ impl FileFormat for CsvFormat {
         let mut source = CsvSource::new(table_schema)
             .with_csv_options(csv_options)
             .with_numeric_boolean_values(self.numeric_boolean_values)
-            .with_replace_invalid_utf8(self.replace_invalid_utf8);
+            .with_replace_invalid_utf8(self.replace_invalid_utf8)
+            .with_ignore_extra_fields(self.ignore_extra_fields);
         if let Some(handler) = &self.record_error_handler {
             source = source.with_record_error_handler(Arc::clone(handler));
         } else if let Some(factory) = &self.record_error_handler_factory {
