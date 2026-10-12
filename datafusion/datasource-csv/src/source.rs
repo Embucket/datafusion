@@ -97,6 +97,7 @@ pub struct CsvSource {
     options: CsvOptions,
     numeric_boolean_values: bool,
     replace_invalid_utf8: bool,
+    ignore_extra_fields: bool,
     record_error_handler: Option<Arc<dyn csv::CsvRecordErrorHandler>>,
     record_error_handler_factory: Option<Arc<dyn CsvRecordErrorHandlerFactory>>,
     batch_size: Option<usize>,
@@ -113,6 +114,7 @@ impl CsvSource {
             options: CsvOptions::default(),
             numeric_boolean_values: false,
             replace_invalid_utf8: false,
+            ignore_extra_fields: false,
             record_error_handler: None,
             record_error_handler_factory: None,
             projection: SplitProjection::unprojected(&table_schema),
@@ -138,6 +140,12 @@ impl CsvSource {
     /// Replace malformed UTF-8 in decoded CSV fields with U+FFFD.
     pub fn with_replace_invalid_utf8(mut self, replace: bool) -> Self {
         self.replace_invalid_utf8 = replace;
+        self
+    }
+
+    /// Ignore CSV fields beyond the explicitly supplied schema width.
+    pub fn with_ignore_extra_fields(mut self, ignore: bool) -> Self {
+        self.ignore_extra_fields = ignore;
         self
     }
 
@@ -263,6 +271,7 @@ impl CsvSource {
                 .with_quote(self.quote())
                 .with_numeric_boolean_values(self.numeric_boolean_values)
                 .with_replace_invalid_utf8(self.replace_invalid_utf8)
+                .with_ignore_extra_fields(self.ignore_extra_fields)
                 .with_preserve_quoted_empty(self.preserve_quoted_empty())
                 .with_truncated_rows(self.truncate_rows());
         if let Some(terminator) = self.terminator() {
@@ -426,6 +435,11 @@ impl FileSource for CsvSource {
         if self.replace_invalid_utf8 {
             return datafusion_common::not_impl_err!(
                 "CSV UTF-8 replacement cannot be serialized"
+            );
+        }
+        if self.ignore_extra_fields {
+            return datafusion_common::not_impl_err!(
+                "CSV extra-field ignoring cannot be serialized"
             );
         }
 
@@ -762,15 +776,79 @@ impl CsvSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::file_format::CsvFormat;
     use arrow::array::{AsArray, Int64Array, StringArray};
     use arrow::csv::{CsvRecordError, CsvRecordErrorHandler};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::error::ArrowError;
     use bytes::Bytes;
+    use datafusion_datasource::file_format::FileFormat;
     use object_store::ObjectStoreExt;
     use object_store::memory::InMemory;
     use std::io::Cursor;
     use std::sync::Mutex;
+
+    #[test]
+    fn csv_source_ignore_extra_fields_is_opt_in() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "first",
+            DataType::Utf8,
+            false,
+        )]));
+        let mut source = CsvSource::new(schema).with_csv_options(CsvOptions {
+            has_header: Some(false),
+            ..Default::default()
+        });
+        source.batch_size = Some(1024);
+        let csv = b"one,unused\ntwo,also-unused\n";
+        assert!(
+            source
+                .open(Cursor::new(csv))
+                .unwrap()
+                .next()
+                .unwrap()
+                .is_err()
+        );
+
+        let batches = source
+            .with_ignore_extra_fields(true)
+            .open(Cursor::new(csv))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        let values = batches[0].column(0).as_string::<i32>();
+        assert_eq!(
+            values.iter().collect::<Vec<_>>(),
+            [Some("one"), Some("two")]
+        );
+    }
+
+    #[test]
+    fn csv_format_passes_ignore_extra_fields_to_reader() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "first",
+            DataType::Utf8,
+            false,
+        )]));
+        let format = CsvFormat::default()
+            .with_has_header(false)
+            .with_ignore_extra_fields(true);
+        let source = format.file_source(schema.into());
+        let source = source.downcast_ref::<CsvSource>().unwrap();
+        let mut source = source.clone();
+        source.batch_size = Some(1024);
+
+        let batches = source
+            .open(Cursor::new(b"one,unused\ntwo,also-unused\n"))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        let values = batches[0].column(0).as_string::<i32>();
+        assert_eq!(
+            values.iter().collect::<Vec<_>>(),
+            [Some("one"), Some("two")]
+        );
+    }
 
     #[test]
     fn csv_source_numeric_boolean_values_are_opt_in() {
