@@ -145,6 +145,19 @@ impl CsvSource {
         }
     }
 
+    #[cfg(feature = "proto")]
+    fn ensure_serializable(&self) -> Result<()> {
+        if self.blank_record_policy != csv::CsvBlankRecordPolicy::Ignore
+            || self.blank_record_counter_factory.is_some()
+            || self.blank_record_counter.is_some()
+        {
+            return datafusion_common::not_impl_err!(
+                "CSV blank-record handling cannot be serialized"
+            );
+        }
+        Ok(())
+    }
+
     /// Sets the CSV options
     pub fn with_csv_options(mut self, options: CsvOptions) -> Self {
         self.options = options;
@@ -498,6 +511,8 @@ impl FileSource for CsvSource {
     ) -> Result<Option<datafusion_proto_models::protobuf::PhysicalPlanNode>> {
         use datafusion_proto_models::protobuf;
         use protobuf::physical_plan_node::PhysicalPlanType;
+
+        self.ensure_serializable()?;
 
         if self.record_error_handler.is_some()
             || self.record_error_handler_factory.is_some()
@@ -920,6 +935,37 @@ mod tests {
         fn for_file(&self, location: &Path) -> Option<Arc<AtomicU64>> {
             self.0.get(location).cloned()
         }
+    }
+
+    #[cfg(feature = "proto")]
+    #[test]
+    fn blank_record_policy_rejects_lossy_plan_serialization() {
+        let schema =
+            Arc::new(Schema::new(vec![Field::new("value", DataType::Utf8, true)]));
+        assert!(
+            CsvSource::new(Arc::clone(&schema))
+                .ensure_serializable()
+                .is_ok()
+        );
+        for policy in [
+            csv::CsvBlankRecordPolicy::Reject,
+            csv::CsvBlankRecordPolicy::EmitNullRow,
+            csv::CsvBlankRecordPolicy::Skip,
+        ] {
+            let source =
+                CsvSource::new(Arc::clone(&schema)).with_blank_record_policy(policy);
+            assert!(
+                source
+                    .ensure_serializable()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("blank-record handling cannot be serialized")
+            );
+        }
+        let source = CsvSource::new(schema).with_blank_record_counter_factory(Arc::new(
+            TestBlankCounters(HashMap::new()),
+        ));
+        assert!(source.ensure_serializable().is_err());
     }
 
     #[tokio::test]
