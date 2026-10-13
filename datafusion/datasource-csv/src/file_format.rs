@@ -147,10 +147,129 @@ impl GetExt for CsvFormatFactory {
     }
 }
 
+#[derive(Debug)]
+pub(crate) struct PhysicalLineSkip {
+    remaining: usize,
+    skipped_lines: usize,
+    skipped_bytes: usize,
+    pending_lf: bool,
+    terminator: Option<u8>,
+}
+
+impl PhysicalLineSkip {
+    pub(crate) fn new(lines: usize, terminator: Option<u8>) -> Self {
+        Self {
+            remaining: lines,
+            skipped_lines: 0,
+            skipped_bytes: 0,
+            pending_lf: false,
+            terminator,
+        }
+    }
+
+    pub(crate) fn advance(&mut self, bytes: &[u8]) -> usize {
+        let mut offset = 0;
+        if self.pending_lf && !bytes.is_empty() {
+            if bytes[0] == b'\n' {
+                offset = 1;
+            }
+            self.pending_lf = false;
+        }
+        while self.remaining > 0 && offset < bytes.len() {
+            let next = match self.terminator {
+                Some(terminator) => {
+                    bytes[offset..].iter().position(|byte| *byte == terminator)
+                }
+                None => bytes[offset..]
+                    .iter()
+                    .position(|byte| matches!(*byte, b'\r' | b'\n')),
+            };
+            let Some(next) = next else {
+                offset = bytes.len();
+                break;
+            };
+            offset += next + 1;
+            self.remaining -= 1;
+            self.skipped_lines += 1;
+            if self.terminator.is_none() && bytes[offset - 1] == b'\r' {
+                self.pending_lf = true;
+                if offset < bytes.len() {
+                    if bytes[offset] == b'\n' {
+                        offset += 1;
+                    }
+                    self.pending_lf = false;
+                }
+            }
+        }
+        self.skipped_bytes = self.skipped_bytes.saturating_add(offset);
+        offset
+    }
+
+    pub(crate) fn is_done(&self) -> bool {
+        self.remaining == 0 && !self.pending_lf
+    }
+
+    pub(crate) fn skipped_lines(&self) -> usize {
+        self.skipped_lines
+    }
+
+    pub(crate) fn skipped_bytes(&self) -> usize {
+        self.skipped_bytes
+    }
+}
+
+pub(crate) fn skip_physical_lines_stream<'a, E: Send + 'a>(
+    stream: BoxStream<'a, std::result::Result<Bytes, E>>,
+    lines: usize,
+    terminator: Option<u8>,
+) -> BoxStream<'a, std::result::Result<Bytes, E>> {
+    futures::stream::try_unfold(
+        (stream, PhysicalLineSkip::new(lines, terminator)),
+        move |(mut stream, mut skip)| async move {
+            loop {
+                let Some(bytes) = stream.try_next().await? else {
+                    return Ok(None);
+                };
+                let offset = skip.advance(&bytes);
+                if skip.is_done() && offset < bytes.len() {
+                    return Ok(Some((bytes.slice(offset..), (stream, skip))));
+                }
+            }
+        },
+    )
+    .boxed()
+}
+
+pub(crate) async fn skip_physical_lines_stream_prefix<'a, E: Send + 'a>(
+    mut stream: BoxStream<'a, std::result::Result<Bytes, E>>,
+    lines: usize,
+    terminator: Option<u8>,
+) -> std::result::Result<
+    (
+        BoxStream<'a, std::result::Result<Bytes, E>>,
+        PhysicalLineSkip,
+    ),
+    E,
+> {
+    let mut skip = PhysicalLineSkip::new(lines, terminator);
+    while let Some(bytes) = stream.try_next().await? {
+        let offset = skip.advance(&bytes);
+        if skip.is_done() && offset < bytes.len() {
+            let remaining = bytes.slice(offset..);
+            let stream = futures::stream::once(async move { Ok(remaining) })
+                .chain(stream)
+                .boxed();
+            return Ok((stream, skip));
+        }
+    }
+    Ok((stream, skip))
+}
+
 /// Character Separated Value [`FileFormat`] implementation.
 #[derive(Debug, Default)]
 pub struct CsvFormat {
     options: CsvOptions,
+    skip_physical_lines: usize,
     record_error_handler: Option<Arc<dyn CsvRecordErrorHandler>>,
     record_error_handler_factory: Option<Arc<dyn CsvRecordErrorHandlerFactory>>,
     numeric_boolean_values: bool,
@@ -197,23 +316,32 @@ impl CsvFormat {
     ) -> BoxStream<'a, Result<Bytes>> {
         let file_compression_type: FileCompressionType = self.options.compression.into();
         let decoder = file_compression_type.convert_stream(stream);
-        let stream = match decoder {
+        match decoder {
             Ok(decoded_stream) => {
-                newline_delimited_stream(decoded_stream.map_err(|e| match e {
+                let decoded_stream = decoded_stream.map_err(|e| match e {
                     DataFusionError::ObjectStore(e) => *e,
                     err => object_store::Error::Generic {
                         store: "read to delimited chunks failed",
                         source: Box::new(err),
                     },
-                }))
-                .map_err(DataFusionError::from)
-                .left_stream()
+                });
+                if self.skip_physical_lines == 0 {
+                    newline_delimited_stream(decoded_stream)
+                        .map_err(DataFusionError::from)
+                        .boxed()
+                } else {
+                    let decoded_stream = skip_physical_lines_stream(
+                        decoded_stream.boxed(),
+                        self.skip_physical_lines,
+                        self.options.terminator,
+                    );
+                    newline_delimited_stream(decoded_stream)
+                        .map_err(DataFusionError::from)
+                        .boxed()
+                }
             }
-            Err(e) => {
-                futures::stream::once(futures::future::ready(Err(e))).right_stream()
-            }
-        };
-        stream.boxed()
+            Err(e) => futures::stream::once(futures::future::ready(Err(e))).boxed(),
+        }
     }
 
     /// Set the csv options
@@ -288,6 +416,13 @@ impl CsvFormat {
     /// - default to true
     pub fn with_has_header(mut self, has_header: bool) -> Self {
         self.options.has_header = Some(has_header);
+        self
+    }
+
+    /// Skip physical lines before parsing CSV records. Quoted newlines do
+    /// not extend a skipped line.
+    pub fn with_skip_physical_lines(mut self, lines: usize) -> Self {
+        self.skip_physical_lines = lines;
         self
     }
 
@@ -493,7 +628,12 @@ impl FileFormat for CsvFormat {
             .file_source
             .downcast_ref::<CsvSource>()
             .expect("file_source should be a CsvSource");
-        let source = Arc::new(csv_source.clone().with_csv_options(csv_options));
+        let source = Arc::new(
+            csv_source
+                .clone()
+                .with_csv_options(csv_options)
+                .with_skip_physical_lines(self.skip_physical_lines),
+        );
 
         let mut compression: FileCompressionType = self.options.compression.into();
         if compression == FileCompressionType::AUTO
@@ -589,6 +729,7 @@ impl FileFormat for CsvFormat {
         }
         let mut source = CsvSource::new(table_schema)
             .with_csv_options(csv_options)
+            .with_skip_physical_lines(self.skip_physical_lines)
             .with_numeric_boolean_values(self.numeric_boolean_values)
             .with_replace_invalid_utf8(self.replace_invalid_utf8)
             .with_ignore_extra_fields(self.ignore_extra_fields);
@@ -1313,7 +1454,10 @@ impl From<&CsvFormatFactory> for datafusion_proto_models::protobuf::CsvOptions {
 
 #[cfg(test)]
 mod tests {
-    use super::{CsvFormat, build_schema_helper, is_uncompressed_auto_file};
+    use super::{
+        CsvFormat, build_schema_helper, is_uncompressed_auto_file,
+        skip_physical_lines_stream, skip_physical_lines_stream_prefix,
+    };
     use arrow::datatypes::DataType;
     use bytes::Bytes;
     use datafusion_common::DFSchema;
@@ -1337,6 +1481,54 @@ mod tests {
     use std::any::Any;
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn physical_header_skip_stream_handles_chunk_boundaries_and_crlf()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let chunks: Vec<std::io::Result<Bytes>> = vec![
+            Ok(Bytes::from_static(b"\"unfinished\r")),
+            Ok(Bytes::from_static(b"\n1,ok\r")),
+            Ok(Bytes::from_static(b"\n2,good\r\n")),
+        ];
+        let bytes = skip_physical_lines_stream(stream::iter(chunks).boxed(), 1, None)
+            .try_collect::<Vec<_>>()
+            .await?
+            .concat();
+        assert_eq!(bytes, b"1,ok\r\n2,good\r\n");
+
+        let header_only: Vec<std::io::Result<Bytes>> =
+            vec![Ok(Bytes::from_static(b"header\r\n"))];
+        let bytes =
+            skip_physical_lines_stream(stream::iter(header_only).boxed(), 2, None)
+                .try_collect::<Vec<_>>()
+                .await?;
+        assert!(bytes.is_empty());
+
+        let cr_only: Vec<std::io::Result<Bytes>> = vec![
+            Ok(Bytes::from_static(b"header\r")),
+            Ok(Bytes::from_static(b"1,ok\r")),
+        ];
+        let (remaining, skipped) =
+            skip_physical_lines_stream_prefix(stream::iter(cr_only).boxed(), 1, None)
+                .await?;
+        assert_eq!(skipped.skipped_lines(), 1);
+        assert_eq!(skipped.skipped_bytes(), 7);
+        assert_eq!(remaining.try_collect::<Vec<_>>().await?.concat(), b"1,ok\r");
+
+        let split_crlf: Vec<std::io::Result<Bytes>> = vec![
+            Ok(Bytes::from_static(b"header\r")),
+            Ok(Bytes::from_static(b"\n1,ok\r\n")),
+        ];
+        let (remaining, skipped) =
+            skip_physical_lines_stream_prefix(stream::iter(split_crlf).boxed(), 1, None)
+                .await?;
+        assert_eq!(skipped.skipped_bytes(), 8);
+        assert_eq!(
+            remaining.try_collect::<Vec<_>>().await?.concat(),
+            b"1,ok\r\n"
+        );
+        Ok(())
+    }
 
     #[tokio::test]
     async fn auto_repartition_probe_checks_past_printable_zlib_header()

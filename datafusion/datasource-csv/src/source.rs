@@ -21,7 +21,7 @@ use datafusion_datasource::boundary_stream::AlignedBoundaryStream;
 use datafusion_datasource::projection::{ProjectionOpener, SplitProjection};
 use datafusion_physical_plan::projection::ProjectionExprs;
 use std::fmt;
-use std::io::Read;
+use std::io::{BufRead, BufReader, Read};
 use std::sync::Arc;
 
 use datafusion_datasource::decoder::{DecoderDeserializer, deserialize_stream};
@@ -44,7 +44,9 @@ use datafusion_physical_plan::{
     DisplayFormatType, ExecutionPlan, ExecutionPlanProperties,
 };
 
-use crate::file_format::CsvDecoder;
+use crate::file_format::{
+    CsvDecoder, PhysicalLineSkip, skip_physical_lines_stream_prefix,
+};
 use futures::{StreamExt, TryStreamExt};
 use object_store::buffered::BufWriter;
 use object_store::path::Path;
@@ -95,6 +97,9 @@ pub trait CsvRecordErrorHandlerFactory: fmt::Debug + Send + Sync {
 #[derive(Debug, Clone)]
 pub struct CsvSource {
     options: CsvOptions,
+    skip_physical_lines: usize,
+    initial_source_lines: usize,
+    initial_source_bytes: usize,
     numeric_boolean_values: bool,
     replace_invalid_utf8: bool,
     ignore_extra_fields: bool,
@@ -112,6 +117,9 @@ impl CsvSource {
         let table_schema = table_schema.into();
         Self {
             options: CsvOptions::default(),
+            skip_physical_lines: 0,
+            initial_source_lines: 0,
+            initial_source_bytes: 0,
             numeric_boolean_values: false,
             replace_invalid_utf8: false,
             ignore_extra_fields: false,
@@ -127,6 +135,12 @@ impl CsvSource {
     /// Sets the CSV options
     pub fn with_csv_options(mut self, options: CsvOptions) -> Self {
         self.options = options;
+        self
+    }
+
+    /// Skip physical lines before CSV record parsing.
+    pub fn with_skip_physical_lines(mut self, lines: usize) -> Self {
+        self.skip_physical_lines = lines;
         self
     }
 
@@ -254,6 +268,24 @@ impl CsvSource {
     }
 }
 
+fn skip_physical_lines_reader<R: Read>(
+    source: R,
+    lines: usize,
+    terminator: Option<u8>,
+) -> std::io::Result<(BufReader<R>, PhysicalLineSkip)> {
+    let mut reader = BufReader::new(source);
+    let mut skip = PhysicalLineSkip::new(lines, terminator);
+    while !skip.is_done() {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            break;
+        }
+        let consumed = skip.advance(available);
+        reader.consume(consumed);
+    }
+    Ok((reader, skip))
+}
+
 impl CsvSource {
     fn open<R: Read>(&self, reader: R) -> Result<csv::Reader<R>> {
         Ok(self.builder()?.build(reader)?)
@@ -268,6 +300,10 @@ impl CsvSource {
                         .expect("Batch size must be set before initializing builder"),
                 )
                 .with_header(self.has_header())
+                .with_initial_source_position(
+                    self.initial_source_lines,
+                    self.initial_source_bytes,
+                )
                 .with_quote(self.quote())
                 .with_numeric_boolean_values(self.numeric_boolean_values)
                 .with_replace_invalid_utf8(self.replace_invalid_utf8)
@@ -394,13 +430,18 @@ impl FileSource for CsvSource {
         // boundaries cannot be determined by byte offset alone
         self.record_error_handler.is_none()
             && self.record_error_handler_factory.is_none()
+            && self.skip_physical_lines == 0
             && !self.options.newlines_in_values.unwrap_or(false)
     }
 
     fn fmt_extra(&self, t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                write!(f, ", has_header={}", self.has_header())
+                write!(f, ", has_header={}", self.has_header())?;
+                if self.skip_physical_lines > 0 {
+                    write!(f, ", skip_physical_lines={}", self.skip_physical_lines)?;
+                }
+                Ok(())
             }
             DisplayFormatType::TreeRender => Ok(()),
         }
@@ -440,6 +481,11 @@ impl FileSource for CsvSource {
         if self.ignore_extra_fields {
             return datafusion_common::not_impl_err!(
                 "CSV extra-field ignoring cannot be serialized"
+            );
+        }
+        if self.skip_physical_lines > 0 {
+            return datafusion_common::not_impl_err!(
+                "CSV physical-line skipping cannot be serialized"
             );
         }
 
@@ -505,6 +551,11 @@ impl FileOpener for CsvOpener {
     ///  A},1,2,3,4,5,6,7,8,9\n
     ///  The lines read would be: [1, 2]
     fn open(&self, partitioned_file: PartitionedFile) -> Result<FileOpenFuture> {
+        if self.config.skip_physical_lines > 0 && partitioned_file.range.is_some() {
+            return datafusion_common::not_impl_err!(
+                "CSV physical-line skipping cannot be combined with byte-range scans"
+            );
+        }
         // `self.config.has_header` controls whether to skip reading the 1st line header
         // If the .csv file is read in parallel and this `CsvOpener` is only reading some middle
         // partition, then don't skip first line
@@ -568,10 +619,10 @@ impl FileOpener for CsvOpener {
                 .await?
                 .map_err(DataFusionError::from);
 
-                let decoder = config.builder()?.build_decoder();
                 let input = file_compression_type
                     .convert_stream(aligned_stream.boxed())?
                     .fuse();
+                let decoder = config.builder()?.build_decoder();
                 let stream = deserialize_stream(
                     input,
                     DecoderDeserializer::new(CsvDecoder::new(decoder)),
@@ -586,7 +637,18 @@ impl FileOpener for CsvOpener {
             match result.payload {
                 #[cfg(not(target_arch = "wasm32"))]
                 GetResultPayload::File(file, _) => {
-                    let decoder = file_compression_type.convert_read(file)?;
+                    let mut decoder = file_compression_type.convert_read(file)?;
+                    if config.skip_physical_lines > 0 {
+                        let (reader, skipped) = skip_physical_lines_reader(
+                            decoder,
+                            config.skip_physical_lines,
+                            terminator,
+                        )
+                        .map_err(|error| DataFusionError::External(Box::new(error)))?;
+                        config.initial_source_lines = skipped.skipped_lines();
+                        config.initial_source_bytes = skipped.skipped_bytes();
+                        decoder = Box::new(reader);
+                    }
                     let mut reader = config.open(decoder)?;
 
                     // Use std::iter::from_fn to wrap execution of iterator's next() method.
@@ -602,15 +664,31 @@ impl FileOpener for CsvOpener {
                         .boxed())
                 }
                 GetResultPayload::Stream(s) => {
-                    let decoder = config.builder()?.build_decoder();
                     let s = s.map_err(DataFusionError::from);
                     let input = file_compression_type.convert_stream(s.boxed())?.fuse();
-
-                    let stream = deserialize_stream(
-                        input,
-                        DecoderDeserializer::new(CsvDecoder::new(decoder)),
-                    );
-                    Ok(stream.map_err(Into::into).boxed())
+                    if config.skip_physical_lines == 0 {
+                        let decoder = config.builder()?.build_decoder();
+                        let stream = deserialize_stream(
+                            input,
+                            DecoderDeserializer::new(CsvDecoder::new(decoder)),
+                        );
+                        Ok(stream.map_err(Into::into).boxed())
+                    } else {
+                        let (input, skipped) = skip_physical_lines_stream_prefix(
+                            input.boxed(),
+                            config.skip_physical_lines,
+                            terminator,
+                        )
+                        .await?;
+                        config.initial_source_lines = skipped.skipped_lines();
+                        config.initial_source_bytes = skipped.skipped_bytes();
+                        let decoder = config.builder()?.build_decoder();
+                        let stream = deserialize_stream(
+                            input,
+                            DecoderDeserializer::new(CsvDecoder::new(decoder)),
+                        );
+                        Ok(stream.map_err(Into::into).boxed())
+                    }
                 }
             }
         }))
@@ -787,6 +865,149 @@ mod tests {
     use object_store::memory::InMemory;
     use std::io::Cursor;
     use std::sync::Mutex;
+
+    #[derive(Debug, Default)]
+    struct HeaderPositions(Mutex<Vec<(usize, usize, usize)>>);
+
+    impl CsvRecordErrorHandler for HeaderPositions {
+        fn handle(&self, error: &CsvRecordError<'_>) -> Result<(), ArrowError> {
+            self.0.lock().unwrap().push((
+                error.line_number,
+                error.source_line_number,
+                error.byte_offset,
+            ));
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn physical_header_skip_keeps_file_relative_error_positions()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let store = Arc::new(InMemory::new());
+        let path = Path::from("positions.csv");
+        store
+            .put(
+                &path,
+                Bytes::from_static(b"\"unclosed\n1,ok\n2,extra,ignored\n").into(),
+            )
+            .await?;
+        let errors = Arc::new(HeaderPositions::default());
+        let mut source = CsvSource::new(Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Utf8, false),
+        ])))
+        .with_csv_options(CsvOptions {
+            has_header: Some(false),
+            ..Default::default()
+        })
+        .with_skip_physical_lines(1)
+        .with_record_error_handler(errors.clone());
+        source.batch_size = Some(1024);
+        let opener = CsvOpener::new(
+            Arc::new(source),
+            FileCompressionType::UNCOMPRESSED,
+            store.clone(),
+        );
+        let batches = opener
+            .open(PartitionedFile::new_from_meta(store.head(&path).await?))?
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+        assert_eq!(
+            batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+            1
+        );
+        assert_eq!(
+            *errors.0.lock().unwrap(),
+            [(2, 3, b"\"unclosed\n1,ok\n".len())]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn physical_header_skip_reader_handles_crlf_and_header_only_input() {
+        let input = b"\"unfinished\r\nsecond header\r\n1,ok\r\n";
+        let (mut reader, skipped) =
+            skip_physical_lines_reader(Cursor::new(input), 2, None).unwrap();
+        assert_eq!(skipped.skipped_lines(), 2);
+        assert_eq!(
+            skipped.skipped_bytes(),
+            b"\"unfinished\r\nsecond header\r\n".len()
+        );
+        let mut data = String::new();
+        reader.read_to_string(&mut data).unwrap();
+        assert_eq!(data, "1,ok\r\n");
+
+        let (mut reader, _) =
+            skip_physical_lines_reader(Cursor::new(b"header\r\n"), 2, None).unwrap();
+        data.clear();
+        reader.read_to_string(&mut data).unwrap();
+        assert!(data.is_empty());
+
+        let (mut reader, skipped) =
+            skip_physical_lines_reader(Cursor::new(b"header\r1,ok\r"), 1, None).unwrap();
+        data.clear();
+        reader.read_to_string(&mut data).unwrap();
+        assert_eq!(data, "1,ok\r");
+        assert_eq!(skipped.skipped_bytes(), b"header\r".len());
+    }
+
+    #[tokio::test]
+    async fn physical_header_skip_precedes_csv_record_parsing()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let store = Arc::new(InMemory::new());
+        let path = Path::from("header.csv");
+        store
+            .put(
+                &path,
+                Bytes::from_static(b"\"unfinished\r\n1,ok\r\n2,good\r\n").into(),
+            )
+            .await?;
+        let mut source = CsvSource::new(Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Utf8, false),
+        ])))
+        .with_csv_options(CsvOptions {
+            has_header: Some(false),
+            ..Default::default()
+        })
+        .with_skip_physical_lines(1);
+        source.batch_size = Some(1024);
+        assert!(!source.supports_repartitioning());
+        let opener = CsvOpener::new(
+            Arc::new(source),
+            FileCompressionType::UNCOMPRESSED,
+            store.clone(),
+        );
+        let batches = opener
+            .open(PartitionedFile::new_from_meta(store.head(&path).await?))?
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+        let ids = batches[0]
+            .column(0)
+            .as_primitive::<arrow::datatypes::Int64Type>();
+        assert_eq!(ids.values(), &[1, 2]);
+
+        let mut ranged = PartitionedFile::new_from_meta(store.head(&path).await?);
+        ranged.range = Some(FileRange { start: 0, end: 12 });
+        assert!(opener.open(ranged).is_err());
+
+        let cr_path = Path::from("header-cr.csv");
+        store
+            .put(&cr_path, Bytes::from_static(b"\"unfinished\r1,ok\r").into())
+            .await?;
+        let batches = opener
+            .open(PartitionedFile::new_from_meta(store.head(&cr_path).await?))?
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+        let ids = batches[0]
+            .column(0)
+            .as_primitive::<arrow::datatypes::Int64Type>();
+        assert_eq!(ids.values(), &[1]);
+        Ok(())
+    }
 
     #[test]
     fn csv_source_ignore_extra_fields_is_opt_in() {
