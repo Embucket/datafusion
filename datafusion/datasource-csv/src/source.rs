@@ -1027,6 +1027,103 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    #[ignore = "focused single-file strict CSV repartition benchmark"]
+    #[allow(clippy::print_stdout, clippy::as_conversions)]
+    async fn bench_strict_blank_policy_single_file_ranges()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const ROWS: usize = 4_000_000;
+        const PARTITIONS: usize = 8;
+        const REPETITIONS: usize = 3;
+        const ROW: &[u8] = b"some-long-value\n";
+
+        async fn count_rows(opener: &CsvOpener, file: PartitionedFile) -> Result<usize> {
+            opener
+                .open(file)?
+                .await?
+                .try_fold(0, |rows, batch| async move { Ok(rows + batch.num_rows()) })
+                .await
+        }
+
+        let mut content = Vec::with_capacity(ROWS * ROW.len());
+        for _ in 0..ROWS {
+            content.extend_from_slice(ROW);
+        }
+        let bytes = content.len();
+        let store = Arc::new(InMemory::new());
+        let path = Path::from("benchmark.csv");
+        store.put(&path, Bytes::from(content).into()).await?;
+        let file = PartitionedFile::new_from_meta(store.head(&path).await?);
+        let mut source = CsvSource::new(Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Utf8,
+            true,
+        )])))
+        .with_csv_options(CsvOptions {
+            has_header: Some(false),
+            ..Default::default()
+        })
+        .with_blank_record_policy(csv::CsvBlankRecordPolicy::Reject);
+        source.batch_size = Some(8192);
+        assert!(!source.supports_repartitioning());
+        let opener = Arc::new(CsvOpener::new(
+            Arc::new(source),
+            FileCompressionType::UNCOMPRESSED,
+            store,
+        ));
+
+        let mut serial = Vec::with_capacity(REPETITIONS);
+        let mut ranged = Vec::with_capacity(REPETITIONS);
+        let size = i64::try_from(bytes)?;
+        let partitions = i64::try_from(PARTITIONS)?;
+        for _ in 0..REPETITIONS {
+            let started = std::time::Instant::now();
+            assert_eq!(count_rows(&opener, file.clone()).await?, ROWS);
+            serial.push(started.elapsed());
+
+            let started = std::time::Instant::now();
+            let counts = std::thread::scope(|scope| {
+                let scans = (0..PARTITIONS)
+                    .map(|index| {
+                        let index =
+                            i64::try_from(index).expect("bounded partition index");
+                        let mut range_file = file.clone();
+                        range_file.range = Some(FileRange {
+                            start: size * index / partitions,
+                            end: size * (index + 1) / partitions,
+                        });
+                        let opener = Arc::clone(&opener);
+                        scope.spawn(move || {
+                            tokio::runtime::Builder::new_current_thread()
+                                .enable_all()
+                                .build()
+                                .expect("worker runtime")
+                                .block_on(count_rows(&opener, range_file))
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                scans
+                    .into_iter()
+                    .map(|scan| scan.join().expect("worker thread"))
+                    .collect::<Result<Vec<_>>>()
+            })?;
+            assert_eq!(counts.into_iter().sum::<usize>(), ROWS);
+            ranged.push(started.elapsed());
+        }
+        serial.sort_unstable();
+        ranged.sort_unstable();
+        for (mode, elapsed) in [
+            ("serial", serial[REPETITIONS / 2]),
+            ("eight_ranges", ranged[REPETITIONS / 2]),
+        ] {
+            println!(
+                "strict CSV {mode}: {:.1} MiB/s ({elapsed:?}, {bytes} bytes)",
+                bytes as f64 / elapsed.as_secs_f64() / (1024.0 * 1024.0)
+            );
+        }
+        Ok(())
+    }
+
     #[derive(Debug, Default)]
     struct HeaderPositions(Mutex<Vec<(usize, usize, usize)>>);
 
