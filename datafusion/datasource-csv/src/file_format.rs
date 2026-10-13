@@ -153,6 +153,7 @@ pub(crate) struct PhysicalLineSkip {
     skipped_lines: usize,
     skipped_bytes: usize,
     pending_lf: bool,
+    source_pending_cr: bool,
     terminator: Option<u8>,
 }
 
@@ -163,6 +164,7 @@ impl PhysicalLineSkip {
             skipped_lines: 0,
             skipped_bytes: 0,
             pending_lf: false,
+            source_pending_cr: false,
             terminator,
         }
     }
@@ -190,8 +192,7 @@ impl PhysicalLineSkip {
             };
             offset += next + 1;
             self.remaining -= 1;
-            self.skipped_lines += 1;
-            if self.terminator.is_none() && bytes[offset - 1] == b'\r' {
+            if bytes[offset - 1] == b'\r' {
                 self.pending_lf = true;
                 if offset < bytes.len() {
                     if bytes[offset] == b'\n' {
@@ -199,6 +200,17 @@ impl PhysicalLineSkip {
                     }
                     self.pending_lf = false;
                 }
+            }
+        }
+        for byte in &bytes[..offset] {
+            match *byte {
+                b'\r' => {
+                    self.skipped_lines += 1;
+                    self.source_pending_cr = true;
+                }
+                b'\n' if self.source_pending_cr => self.source_pending_cr = false,
+                b'\n' => self.skipped_lines += 1,
+                _ => self.source_pending_cr = false,
             }
         }
         self.skipped_bytes = self.skipped_bytes.saturating_add(offset);

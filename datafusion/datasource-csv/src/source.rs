@@ -924,6 +924,51 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn custom_terminator_skip_uses_physical_line_offset()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let store = Arc::new(InMemory::new());
+        let path = Path::from("custom-terminator.csv");
+        store
+            .put(
+                &path,
+                Bytes::from_static(b"meta\r\ncontinued#1,ok#2,extra,ignored#").into(),
+            )
+            .await?;
+        let errors = Arc::new(HeaderPositions::default());
+        let mut source = CsvSource::new(Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Utf8, false),
+        ])))
+        .with_csv_options(CsvOptions {
+            has_header: Some(false),
+            ..Default::default()
+        })
+        .with_terminator(Some(b'#'))
+        .with_skip_physical_lines(1)
+        .with_record_error_handler(errors.clone());
+        source.batch_size = Some(1024);
+        let opener = CsvOpener::new(
+            Arc::new(source),
+            FileCompressionType::UNCOMPRESSED,
+            store.clone(),
+        );
+        let batches = opener
+            .open(PartitionedFile::new_from_meta(store.head(&path).await?))?
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+        assert_eq!(
+            batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+            1
+        );
+        assert_eq!(
+            *errors.0.lock().unwrap(),
+            [(2, 2, b"meta\r\ncontinued#1,ok#".len())]
+        );
+        Ok(())
+    }
+
     #[test]
     fn physical_header_skip_reader_handles_crlf_and_header_only_input() {
         let input = b"\"unfinished\r\nsecond header\r\n1,ok\r\n";
