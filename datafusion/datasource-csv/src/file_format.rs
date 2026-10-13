@@ -21,11 +21,13 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Debug};
 use std::sync::Arc;
 
-use crate::source::{CsvRecordErrorHandlerFactory, CsvSource};
+use crate::source::{
+    CsvBlankRecordCounterFactory, CsvRecordErrorHandlerFactory, CsvSource,
+};
 
 use arrow::array::RecordBatch;
 use arrow::csv::reader::SnowflakeCsvTypeState;
-use arrow::csv::{CsvRecordErrorHandler, WriterBuilder};
+use arrow::csv::{CsvBlankRecordPolicy, CsvRecordErrorHandler, WriterBuilder};
 use arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef};
 use arrow::error::ArrowError;
 use datafusion_common::config::{ConfigField, ConfigFileType, CsvOptions};
@@ -284,6 +286,8 @@ pub struct CsvFormat {
     skip_physical_lines: usize,
     record_error_handler: Option<Arc<dyn CsvRecordErrorHandler>>,
     record_error_handler_factory: Option<Arc<dyn CsvRecordErrorHandlerFactory>>,
+    blank_record_policy: CsvBlankRecordPolicy,
+    blank_record_counter_factory: Option<Arc<dyn CsvBlankRecordCounterFactory>>,
     numeric_boolean_values: bool,
     replace_invalid_utf8: bool,
     ignore_extra_fields: bool,
@@ -404,6 +408,21 @@ impl CsvFormat {
     ) -> Self {
         self.record_error_handler = None;
         self.record_error_handler_factory = Some(factory);
+        self
+    }
+
+    /// Select opt-in strict handling of physical blank CSV records.
+    pub fn with_blank_record_policy(mut self, policy: CsvBlankRecordPolicy) -> Self {
+        self.blank_record_policy = policy;
+        self
+    }
+
+    /// Provide a per-file counter for skipped physical blank records.
+    pub fn with_blank_record_counter_factory(
+        mut self,
+        factory: Arc<dyn CsvBlankRecordCounterFactory>,
+    ) -> Self {
+        self.blank_record_counter_factory = Some(factory);
         self
     }
 
@@ -640,12 +659,15 @@ impl FileFormat for CsvFormat {
             .file_source
             .downcast_ref::<CsvSource>()
             .expect("file_source should be a CsvSource");
-        let source = Arc::new(
-            csv_source
-                .clone()
-                .with_csv_options(csv_options)
-                .with_skip_physical_lines(self.skip_physical_lines),
-        );
+        let mut source = csv_source
+            .clone()
+            .with_csv_options(csv_options)
+            .with_skip_physical_lines(self.skip_physical_lines)
+            .with_blank_record_policy(self.blank_record_policy);
+        if let Some(factory) = &self.blank_record_counter_factory {
+            source = source.with_blank_record_counter_factory(Arc::clone(factory));
+        }
+        let source = Arc::new(source);
 
         let mut compression: FileCompressionType = self.options.compression.into();
         if compression == FileCompressionType::AUTO
@@ -745,6 +767,10 @@ impl FileFormat for CsvFormat {
             .with_numeric_boolean_values(self.numeric_boolean_values)
             .with_replace_invalid_utf8(self.replace_invalid_utf8)
             .with_ignore_extra_fields(self.ignore_extra_fields);
+        source = source.with_blank_record_policy(self.blank_record_policy);
+        if let Some(factory) = &self.blank_record_counter_factory {
+            source = source.with_blank_record_counter_factory(Arc::clone(factory));
+        }
         if let Some(handler) = &self.record_error_handler {
             source = source.with_record_error_handler(Arc::clone(handler));
         } else if let Some(factory) = &self.record_error_handler_factory {

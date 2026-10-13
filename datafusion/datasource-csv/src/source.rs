@@ -23,6 +23,7 @@ use datafusion_physical_plan::projection::ProjectionExprs;
 use std::fmt;
 use std::io::{BufRead, BufReader, Read};
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 
 use datafusion_datasource::decoder::{DecoderDeserializer, deserialize_stream};
 use datafusion_datasource::file_compression_type::FileCompressionType;
@@ -59,6 +60,12 @@ pub trait CsvRecordErrorHandlerFactory: fmt::Debug + Send + Sync {
     /// Return the handler for `location`. The location is the object-store path
     /// of one file, before its CSV reader is created.
     fn for_file(&self, location: &Path) -> Arc<dyn csv::CsvRecordErrorHandler>;
+}
+
+/// Provides a per-file counter for physical blank CSV records skipped by the reader.
+pub trait CsvBlankRecordCounterFactory: fmt::Debug + Send + Sync {
+    /// Return the counter for an object-store file path.
+    fn for_file(&self, location: &Path) -> Option<Arc<AtomicU64>>;
 }
 
 /// A Config for [`CsvOpener`]
@@ -105,6 +112,9 @@ pub struct CsvSource {
     ignore_extra_fields: bool,
     record_error_handler: Option<Arc<dyn csv::CsvRecordErrorHandler>>,
     record_error_handler_factory: Option<Arc<dyn CsvRecordErrorHandlerFactory>>,
+    blank_record_policy: csv::CsvBlankRecordPolicy,
+    blank_record_counter_factory: Option<Arc<dyn CsvBlankRecordCounterFactory>>,
+    blank_record_counter: Option<Arc<AtomicU64>>,
     batch_size: Option<usize>,
     table_schema: TableSchema,
     projection: SplitProjection,
@@ -125,6 +135,9 @@ impl CsvSource {
             ignore_extra_fields: false,
             record_error_handler: None,
             record_error_handler_factory: None,
+            blank_record_policy: csv::CsvBlankRecordPolicy::Ignore,
+            blank_record_counter_factory: None,
+            blank_record_counter: None,
             projection: SplitProjection::unprojected(&table_schema),
             table_schema,
             batch_size: None,
@@ -186,6 +199,21 @@ impl CsvSource {
     ) -> Self {
         self.record_error_handler = None;
         self.record_error_handler_factory = Some(factory);
+        self
+    }
+
+    /// Select opt-in strict handling for physical blank CSV records.
+    pub fn with_blank_record_policy(mut self, policy: csv::CsvBlankRecordPolicy) -> Self {
+        self.blank_record_policy = policy;
+        self
+    }
+
+    /// Select a per-file counter for skipped blank records.
+    pub fn with_blank_record_counter_factory(
+        mut self,
+        factory: Arc<dyn CsvBlankRecordCounterFactory>,
+    ) -> Self {
+        self.blank_record_counter_factory = Some(factory);
         self
     }
 
@@ -310,6 +338,10 @@ impl CsvSource {
                 .with_ignore_extra_fields(self.ignore_extra_fields)
                 .with_preserve_quoted_empty(self.preserve_quoted_empty())
                 .with_truncated_rows(self.truncate_rows());
+        builder = builder.with_blank_record_policy(self.blank_record_policy);
+        if let Some(counter) = &self.blank_record_counter {
+            builder = builder.with_skipped_blank_records_counter(Arc::clone(counter));
+        }
         if let Some(terminator) = self.terminator() {
             builder = builder.with_terminator(terminator);
         }
@@ -430,6 +462,7 @@ impl FileSource for CsvSource {
         // boundaries cannot be determined by byte offset alone
         self.record_error_handler.is_none()
             && self.record_error_handler_factory.is_none()
+            && self.blank_record_policy == csv::CsvBlankRecordPolicy::Ignore
             && self.skip_physical_lines == 0
             && !self.options.newlines_in_values.unwrap_or(false)
     }
@@ -570,6 +603,18 @@ impl FileOpener for CsvOpener {
         if let Some(factory) = &config.record_error_handler_factory {
             config.record_error_handler =
                 Some(factory.for_file(&partitioned_file.object_meta.location));
+        }
+        if let Some(factory) = &config.blank_record_counter_factory {
+            config.blank_record_counter = Some(
+                factory
+                    .for_file(&partitioned_file.object_meta.location)
+                    .ok_or_else(|| {
+                        DataFusionError::Execution(format!(
+                            "CSV blank-record counter is missing for '{}'",
+                            partitioned_file.object_meta.location
+                        ))
+                    })?,
+            );
         }
         config.options.has_header = Some(csv_has_header);
         config.options.truncated_rows = Some(config.truncate_rows());
@@ -863,8 +908,78 @@ mod tests {
     use datafusion_datasource::file_format::FileFormat;
     use object_store::ObjectStoreExt;
     use object_store::memory::InMemory;
+    use std::collections::HashMap;
     use std::io::Cursor;
     use std::sync::Mutex;
+    use std::sync::atomic::Ordering;
+
+    #[derive(Debug)]
+    struct TestBlankCounters(HashMap<Path, Arc<AtomicU64>>);
+
+    impl CsvBlankRecordCounterFactory for TestBlankCounters {
+        fn for_file(&self, location: &Path) -> Option<Arc<AtomicU64>> {
+            self.0.get(location).cloned()
+        }
+    }
+
+    #[tokio::test]
+    async fn skipped_blank_record_counters_are_scoped_to_opened_file()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let store = Arc::new(InMemory::new());
+        let counters = ["first.csv", "second.csv"]
+            .into_iter()
+            .map(|name| (Path::from(name), Arc::new(AtomicU64::new(0))))
+            .collect::<HashMap<_, _>>();
+        let mut source = CsvSource::new(Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Utf8,
+            true,
+        )])))
+        .with_csv_options(CsvOptions {
+            has_header: Some(false),
+            ..Default::default()
+        })
+        .with_blank_record_policy(csv::CsvBlankRecordPolicy::Skip)
+        .with_blank_record_counter_factory(Arc::new(TestBlankCounters(counters.clone())));
+        source.batch_size = Some(1024);
+        assert!(!source.supports_repartitioning());
+        let opener = CsvOpener::new(
+            Arc::new(source),
+            FileCompressionType::UNCOMPRESSED,
+            store.clone(),
+        );
+        for (name, content) in
+            [("first.csv", "first\n\n"), ("second.csv", "\nsecond\n\n")]
+        {
+            let path = Path::from(name);
+            store.put(&path, Bytes::from(content).into()).await?;
+            let meta = store.head(&path).await?;
+            let batches = opener
+                .open(PartitionedFile::new_from_meta(meta))?
+                .await?
+                .try_collect::<Vec<_>>()
+                .await?;
+            assert_eq!(
+                batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+                1
+            );
+        }
+        assert_eq!(
+            counters[&Path::from("first.csv")].load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            counters[&Path::from("second.csv")].load(Ordering::Relaxed),
+            2
+        );
+        let missing = Path::from("unregistered.csv");
+        store
+            .put(&missing, Bytes::from_static(b"value\n").into())
+            .await?;
+        let meta = store.head(&missing).await?;
+        assert!(opener.open(PartitionedFile::new_from_meta(meta)).is_err());
+        Ok(())
+    }
 
     #[derive(Debug, Default)]
     struct HeaderPositions(Mutex<Vec<(usize, usize, usize)>>);
