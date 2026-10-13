@@ -33,6 +33,7 @@ use datafusion_datasource::{
 };
 
 use arrow::csv;
+use arrow::error::ArrowError;
 use datafusion_common::config::CsvOptions;
 use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_common::{DataFusionError, Result, exec_datafusion_err};
@@ -475,7 +476,6 @@ impl FileSource for CsvSource {
         // boundaries cannot be determined by byte offset alone
         self.record_error_handler.is_none()
             && self.record_error_handler_factory.is_none()
-            && self.blank_record_policy == csv::CsvBlankRecordPolicy::Ignore
             && self.skip_physical_lines == 0
             && !self.options.newlines_in_values.unwrap_or(false)
     }
@@ -574,6 +574,65 @@ impl FileSource for CsvSource {
     }
 }
 
+fn is_csv_decode_error(error: &ArrowError) -> bool {
+    matches!(
+        error,
+        ArrowError::CsvError(_)
+            | ArrowError::ParseError(_)
+            | ArrowError::CastError(_)
+            | ArrowError::SchemaError(_)
+    )
+}
+
+async fn replay_ranged_csv_error(
+    store: Arc<dyn ObjectStore>,
+    location: Path,
+    e_tag: Option<String>,
+    config: Arc<CsvSource>,
+    ranged_error: ArrowError,
+) -> ArrowError {
+    // A non-first range cannot know the number of physical lines before it.
+    // Replaying only on a decoder failure keeps successful range scans parallel.
+    let replay: Result<Option<ArrowError>> = async {
+        let input = store
+            .get_opts(
+                &location,
+                GetOptions {
+                    if_match: e_tag,
+                    ..Default::default()
+                },
+            )
+            .await?
+            .into_stream()
+            .map_err(DataFusionError::from)
+            .boxed();
+        let decoder = config.builder()?.build_decoder();
+        let mut batches =
+            deserialize_stream(input, DecoderDeserializer::new(CsvDecoder::new(decoder)));
+        while let Some(batch) = batches.next().await {
+            match batch {
+                Ok(_) => {}
+                Err(error) if is_csv_decode_error(&error) => return Ok(Some(error)),
+                Err(error) => return Err(DataFusionError::from(error)),
+            }
+        }
+        Ok(None)
+    }
+    .await;
+    match replay {
+        Ok(Some(error)) => error,
+        Ok(None) => {
+            ArrowError::ExternalError(Box::new(DataFusionError::Execution(format!(
+                "CSV ranged decoder error was not reproduced by full-file replay: {ranged_error}"
+            ))))
+        }
+        Err(error) => ArrowError::ExternalError(Box::new(DataFusionError::Context(
+            format!("CSV ranged decoder error could not be replayed: {ranged_error}"),
+            Box::new(error),
+        ))),
+    }
+}
+
 impl FileOpener for CsvOpener {
     /// Open a partitioned CSV file.
     ///
@@ -645,6 +704,19 @@ impl FileOpener for CsvOpener {
 
         let store = Arc::clone(&self.object_store);
         let terminator = self.config.terminator();
+        let replay_config = (partitioned_file
+            .range
+            .as_ref()
+            .is_some_and(|range| range.start > 0)
+            && self.config.blank_record_policy != csv::CsvBlankRecordPolicy::Ignore
+            && self.config.record_error_handler.is_none()
+            && self.config.record_error_handler_factory.is_none())
+        .then(|| {
+            let mut config = (*self.config).clone();
+            config.blank_record_counter_factory = None;
+            config.blank_record_counter = None;
+            Arc::new(config)
+        });
 
         let baseline_metrics =
             BaselineMetrics::new(&self.config.metrics, self.partition_index);
@@ -652,6 +724,7 @@ impl FileOpener for CsvOpener {
         Ok(Box::pin(async move {
             // Current partition contains bytes [start_byte, end_byte) (might contain incomplete lines at boundaries)
             let file_size = partitioned_file.object_meta.size;
+            let e_tag = partitioned_file.object_meta.e_tag;
             let location = partitioned_file.object_meta.location;
 
             if let Some(file_range) = partitioned_file.range.as_ref() {
@@ -687,6 +760,30 @@ impl FileOpener for CsvOpener {
                     input,
                     DecoderDeserializer::new(CsvDecoder::new(decoder)),
                 );
+                if let Some(replay_config) = replay_config {
+                    let replay_store = Arc::clone(&store);
+                    let replay_location = location.clone();
+                    return Ok(stream
+                        .or_else(move |error| {
+                            let store = Arc::clone(&replay_store);
+                            let location = replay_location.clone();
+                            let e_tag = e_tag.clone();
+                            let config = Arc::clone(&replay_config);
+                            async move {
+                                let error = if is_csv_decode_error(&error) {
+                                    replay_ranged_csv_error(
+                                        store, location, e_tag, config, error,
+                                    )
+                                    .await
+                                } else {
+                                    error
+                                };
+                                Err::<_, ArrowError>(error)
+                            }
+                        })
+                        .map_err(Into::into)
+                        .boxed());
+                }
                 return Ok(stream.map_err(Into::into).boxed());
             }
 
@@ -915,10 +1012,11 @@ impl CsvSource {
 mod tests {
     use super::*;
     use crate::file_format::CsvFormat;
-    use arrow::array::{AsArray, Int64Array, StringArray};
+    use arrow::array::{Array, AsArray, Int64Array, StringArray};
     use arrow::csv::{CsvRecordError, CsvRecordErrorHandler};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::error::ArrowError;
+    use arrow::record_batch::RecordBatch;
     use bytes::Bytes;
     use datafusion_datasource::file_format::FileFormat;
     use object_store::ObjectStoreExt;
@@ -988,7 +1086,7 @@ mod tests {
         .with_blank_record_policy(csv::CsvBlankRecordPolicy::Skip)
         .with_blank_record_counter_factory(Arc::new(TestBlankCounters(counters.clone())));
         source.batch_size = Some(1024);
-        assert!(!source.supports_repartitioning());
+        assert!(source.supports_repartitioning());
         let opener = CsvOpener::new(
             Arc::new(source),
             FileCompressionType::UNCOMPRESSED,
@@ -1029,7 +1127,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "focused single-file strict CSV repartition benchmark"]
-    #[allow(clippy::print_stdout, clippy::as_conversions)]
+    #[expect(clippy::print_stdout, clippy::as_conversions)]
     async fn bench_strict_blank_policy_single_file_ranges()
     -> Result<(), Box<dyn std::error::Error>> {
         const ROWS: usize = 4_000_000;
@@ -1065,7 +1163,7 @@ mod tests {
         })
         .with_blank_record_policy(csv::CsvBlankRecordPolicy::Reject);
         source.batch_size = Some(8192);
-        assert!(!source.supports_repartitioning());
+        assert!(source.supports_repartitioning());
         let opener = Arc::new(CsvOpener::new(
             Arc::new(source),
             FileCompressionType::UNCOMPRESSED,
@@ -1077,11 +1175,11 @@ mod tests {
         let size = i64::try_from(bytes)?;
         let partitions = i64::try_from(PARTITIONS)?;
         for _ in 0..REPETITIONS {
-            let started = std::time::Instant::now();
+            let started = datafusion_common::instant::Instant::now();
             assert_eq!(count_rows(&opener, file.clone()).await?, ROWS);
             serial.push(started.elapsed());
 
-            let started = std::time::Instant::now();
+            let started = datafusion_common::instant::Instant::now();
             let counts = std::thread::scope(|scope| {
                 let scans = (0..PARTITIONS)
                     .map(|index| {
@@ -1121,6 +1219,225 @@ mod tests {
                 bytes as f64 / elapsed.as_secs_f64() / (1024.0 * 1024.0)
             );
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn strict_ranged_csv_replays_file_relative_error()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let store = Arc::new(InMemory::new());
+        for (name, content, range_start) in [
+            (
+                "later.csv",
+                b"id,msg\n1,ok\n2,good\n\n3,last\n".as_slice(),
+                12,
+            ),
+            ("earlier.csv", b"id,msg\n1,ok\n\n2,good\n\n".as_slice(), 14),
+        ] {
+            let path = Path::from(name);
+            store
+                .put(&path, Bytes::copy_from_slice(content).into())
+                .await?;
+            let file = PartitionedFile::new_from_meta(store.head(&path).await?);
+            let mut source = CsvSource::new(Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, true),
+                Field::new("msg", DataType::Utf8, true),
+            ])))
+            .with_csv_options(CsvOptions {
+                has_header: Some(true),
+                ..Default::default()
+            })
+            .with_blank_record_policy(csv::CsvBlankRecordPolicy::Reject);
+            source.batch_size = Some(2);
+            assert!(source.supports_repartitioning());
+            let opener = CsvOpener::new(
+                Arc::new(source),
+                FileCompressionType::UNCOMPRESSED,
+                store.clone(),
+            );
+            let full_error = opener
+                .open(file.clone())?
+                .await?
+                .try_collect::<Vec<_>>()
+                .await
+                .expect_err("full-file blank record must fail")
+                .to_string();
+            let mut ranged_file = file;
+            ranged_file.range = Some(FileRange {
+                start: range_start,
+                end: i64::try_from(content.len())?,
+            });
+            let ranged_error = opener
+                .open(ranged_file)?
+                .await?
+                .try_collect::<Vec<_>>()
+                .await
+                .expect_err("ranged blank record must fail")
+                .to_string();
+            assert_eq!(ranged_error, full_error, "{name}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ranged_skip_counts_each_blank_once_even_after_error_replay()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let store = Arc::new(InMemory::new());
+        for (name, content, expected_rows, expected_blanks) in [
+            (
+                "valid.csv",
+                b"id,msg\n1,a\n\n2,b\n\n3,c\n".as_slice(),
+                Some(3),
+                2,
+            ),
+            (
+                "invalid.csv",
+                b"id,msg\n1,a\n\n2,b\nbad\n".as_slice(),
+                None,
+                1,
+            ),
+        ] {
+            let path = Path::from(name);
+            store
+                .put(&path, Bytes::copy_from_slice(content).into())
+                .await?;
+            let counter = Arc::new(AtomicU64::new(0));
+            let mut source = CsvSource::new(Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, true),
+                Field::new("msg", DataType::Utf8, true),
+            ])))
+            .with_csv_options(CsvOptions {
+                has_header: Some(true),
+                ..Default::default()
+            })
+            .with_blank_record_policy(csv::CsvBlankRecordPolicy::Skip)
+            .with_blank_record_counter_factory(Arc::new(
+                TestBlankCounters(HashMap::from([(path.clone(), Arc::clone(&counter))])),
+            ));
+            source.batch_size = Some(2);
+            assert!(source.supports_repartitioning());
+            let opener = CsvOpener::new(
+                Arc::new(source),
+                FileCompressionType::UNCOMPRESSED,
+                store.clone(),
+            );
+            let file = PartitionedFile::new_from_meta(store.head(&path).await?);
+            let mut rows = 0;
+            for (start, end) in [(0, 11), (11, i64::try_from(content.len())?)] {
+                let mut ranged_file = file.clone();
+                ranged_file.range = Some(FileRange { start, end });
+                let result = opener
+                    .open(ranged_file)?
+                    .await?
+                    .try_collect::<Vec<_>>()
+                    .await;
+                if expected_rows.is_none() && start > 0 {
+                    assert!(result.is_err(), "{name} must fail on malformed row");
+                } else {
+                    rows += result?.iter().map(|batch| batch.num_rows()).sum::<usize>();
+                }
+            }
+            if let Some(expected_rows) = expected_rows {
+                assert_eq!(rows, expected_rows, "{name}");
+            }
+            assert_eq!(counter.load(Ordering::Relaxed), expected_blanks, "{name}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ranged_emit_null_row_matches_full_file_for_lf_and_crlf()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let store = Arc::new(InMemory::new());
+        for (name, content) in [
+            ("lf.csv", b"value\nx\n\ny\n".as_slice()),
+            ("crlf.csv", b"value\r\nx\r\n\r\ny\r\n".as_slice()),
+        ] {
+            let path = Path::from(name);
+            store
+                .put(&path, Bytes::copy_from_slice(content).into())
+                .await?;
+            let file = PartitionedFile::new_from_meta(store.head(&path).await?);
+            let mut source = CsvSource::new(Arc::new(Schema::new(vec![Field::new(
+                "value",
+                DataType::Utf8,
+                true,
+            )])))
+            .with_csv_options(CsvOptions {
+                has_header: Some(true),
+                ..Default::default()
+            })
+            .with_blank_record_policy(csv::CsvBlankRecordPolicy::EmitNullRow);
+            source.batch_size = Some(2);
+            assert!(source.supports_repartitioning());
+            let opener = CsvOpener::new(
+                Arc::new(source),
+                FileCompressionType::UNCOMPRESSED,
+                store.clone(),
+            );
+            let values = |batches: Vec<RecordBatch>| {
+                batches
+                    .iter()
+                    .flat_map(|batch| {
+                        let column =
+                            batch.column(0).as_any().downcast_ref::<StringArray>();
+                        let column = column.expect("UTF-8 column");
+                        (0..column.len()).map(move |index| {
+                            (!column.is_null(index))
+                                .then(|| column.value(index).to_owned())
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let full = values(opener.open(file.clone())?.await?.try_collect().await?);
+            assert_eq!(full, vec![Some("x".to_owned()), None, Some("y".to_owned())]);
+            for split in 1..content.len() {
+                let split = i64::try_from(split)?;
+                let mut actual = Vec::new();
+                for (start, end) in [(0, split), (split, i64::try_from(content.len())?)] {
+                    let mut ranged = file.clone();
+                    ranged.range = Some(FileRange { start, end });
+                    actual
+                        .extend(values(opener.open(ranged)?.await?.try_collect().await?));
+                }
+                assert_eq!(actual, full, "{name} split at {split}");
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ranged_error_replay_rejects_replaced_object()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let store = Arc::new(InMemory::new());
+        let path = Path::from("replaced.csv");
+        store
+            .put(&path, Bytes::from_static(b"value\n\n").into())
+            .await?;
+        let original_etag = store.head(&path).await?.e_tag;
+        assert!(original_etag.is_some());
+        store
+            .put(&path, Bytes::from_static(b"value\nnew\n").into())
+            .await?;
+        let mut source = CsvSource::new(Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Utf8,
+            true,
+        )])))
+        .with_blank_record_policy(csv::CsvBlankRecordPolicy::Reject);
+        source.batch_size = Some(2);
+        let error = replay_ranged_csv_error(
+            store,
+            path,
+            original_etag,
+            Arc::new(source),
+            ArrowError::CsvError("ranged parse failure".to_owned()),
+        )
+        .await;
+        assert!(
+            error.to_string().contains("could not be replayed"),
+            "{error}"
+        );
         Ok(())
     }
 
