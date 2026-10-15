@@ -253,11 +253,13 @@ impl TreeNode for Expr {
             Expr::TryCast(TryCast { expr, field }) => expr
                 .map_elements(f)?
                 .update_data(|be| Expr::TryCast(TryCast::new_from_field(be, field))),
-            Expr::ScalarFunction(ScalarFunction { func, args }) => {
+            Expr::ScalarFunction(ScalarFunction { func, args, spans }) => {
                 args.map_elements(f)?.map_data(|new_args| {
-                    Ok(Expr::ScalarFunction(ScalarFunction::new_udf(
-                        func, new_args,
-                    )))
+                    Ok(Expr::ScalarFunction(ScalarFunction {
+                        func,
+                        args: new_args,
+                        spans,
+                    }))
                 })?
             }
             Expr::WindowFunction(window_fun) => {

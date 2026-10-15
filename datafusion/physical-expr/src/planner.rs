@@ -452,7 +452,7 @@ pub fn create_physical_expr(
             execution_props,
             planning_ctx,
         )?),
-        Expr::ScalarFunction(ScalarFunction { func, args }) => {
+        Expr::ScalarFunction(ScalarFunction { func, args, .. }) => {
             let physical_args = create_physical_exprs(
                 args,
                 input_dfschema,

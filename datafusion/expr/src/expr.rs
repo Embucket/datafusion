@@ -945,12 +945,44 @@ impl Between {
 /// Invoke a [`ScalarUDF`] with a set of arguments
 ///
 /// [`ScalarUDF`]: crate::ScalarUDF
-#[derive(Clone, PartialEq, Eq, PartialOrd, Hash, Debug)]
+#[derive(Clone)]
 pub struct ScalarFunction {
     /// The function
     pub func: Arc<crate::ScalarUDF>,
     /// List of expressions to feed to the functions as arguments
     pub args: Vec<Expr>,
+    /// SQL source locations of this invocation, if known.
+    pub spans: Spans,
+}
+
+impl PartialEq for ScalarFunction {
+    fn eq(&self, other: &Self) -> bool {
+        self.func == other.func && self.args == other.args
+    }
+}
+
+impl Eq for ScalarFunction {}
+
+impl PartialOrd for ScalarFunction {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        (&self.func, &self.args).partial_cmp(&(&other.func, &other.args))
+    }
+}
+
+impl Hash for ScalarFunction {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.func.hash(state);
+        self.args.hash(state);
+    }
+}
+
+impl fmt::Debug for ScalarFunction {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ScalarFunction")
+            .field("func", &self.func)
+            .field("args", &self.args)
+            .finish()
+    }
 }
 
 impl ScalarFunction {
@@ -965,7 +997,11 @@ impl ScalarFunction {
     ///
     /// [`ScalarUDF`]: crate::ScalarUDF
     pub fn new_udf(udf: Arc<crate::ScalarUDF>, args: Vec<Expr>) -> Self {
-        Self { func: udf, args }
+        Self {
+            func: udf,
+            args,
+            spans: Spans::new(),
+        }
     }
 }
 
@@ -2304,6 +2340,7 @@ impl Expr {
     pub fn spans(&self) -> Option<&Spans> {
         match self {
             Expr::Column(col) => Some(&col.spans),
+            Expr::ScalarFunction(function) => Some(&function.spans),
             Expr::Not(inner) | Expr::Negative(inner) => inner.spans(),
             _ => None,
         }
@@ -2508,10 +2545,12 @@ impl NormalizeEq for Expr {
                 Expr::ScalarFunction(ScalarFunction {
                     func: self_func,
                     args: self_args,
+                    ..
                 }),
                 Expr::ScalarFunction(ScalarFunction {
                     func: other_func,
                     args: other_args,
+                    ..
                 }),
             ) => {
                 self_func.name() == other_func.name()
@@ -2823,7 +2862,9 @@ impl HashNode for Expr {
             | Expr::TryCast(TryCast { expr: _expr, field }) => {
                 field.hash(state);
             }
-            Expr::ScalarFunction(ScalarFunction { func, args: _args }) => {
+            Expr::ScalarFunction(ScalarFunction {
+                func, args: _args, ..
+            }) => {
                 func.hash(state);
             }
             Expr::AggregateFunction(AggregateFunction {
@@ -3158,7 +3199,7 @@ impl Display for SchemaDisplay<'_> {
                 let name = if *outer { "UNNEST_OUTER" } else { "UNNEST" };
                 write!(f, "{name}({})", SchemaDisplay(expr))
             }
-            Expr::ScalarFunction(ScalarFunction { func, args }) => {
+            Expr::ScalarFunction(ScalarFunction { func, args, .. }) => {
                 match func.schema_name(args) {
                     Ok(name) => {
                         write!(f, "{name}")
@@ -4555,6 +4596,7 @@ mod test {
         let udf = Expr::ScalarFunction(ScalarFunction {
             func: Arc::new(ScalarUDF::new_from_impl(TestUDF {})),
             args: vec![expr(), expr()],
+            spans: Spans::new(),
         });
         let Expr::ScalarFunction(scalar) = &udf else {
             unreachable!()
@@ -4589,6 +4631,61 @@ mod test {
                 unimplemented!()
             }
         }
+    }
+
+    #[test]
+    fn scalar_function_source_spans_do_not_change_identity() {
+        use datafusion_common::{Location, Span};
+        use std::collections::hash_map::DefaultHasher;
+
+        #[derive(Debug, PartialEq, Eq, Hash)]
+        struct TestUdf {
+            signature: Signature,
+        }
+
+        impl ScalarUDFImpl for TestUdf {
+            fn name(&self) -> &str {
+                "test_scalar_udf"
+            }
+
+            fn signature(&self) -> &Signature {
+                &self.signature
+            }
+
+            fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
+                Ok(DataType::Int32)
+            }
+
+            fn invoke_with_args(
+                &self,
+                _args: ScalarFunctionArgs,
+            ) -> Result<ColumnarValue> {
+                unimplemented!()
+            }
+        }
+
+        let udf = Arc::new(ScalarUDF::new_from_impl(TestUdf {
+            signature: Signature::exact(vec![DataType::Int32], Volatility::Immutable),
+        }));
+        let plain = ScalarFunction::new_udf(Arc::clone(&udf), vec![lit(1)]);
+        let mut located = ScalarFunction::new_udf(udf, vec![lit(1)]);
+        located.spans.add_span(Span::new(
+            Location { line: 1, column: 8 },
+            Location {
+                line: 1,
+                column: 23,
+            },
+        ));
+
+        assert_eq!(plain, located);
+        assert_eq!(plain.partial_cmp(&located), Some(Ordering::Equal));
+        assert_eq!(format!("{plain:?}"), format!("{located:?}"));
+        let hash = |function: &ScalarFunction| {
+            let mut hasher = DefaultHasher::new();
+            function.hash(&mut hasher);
+            hasher.finish()
+        };
+        assert_eq!(hash(&plain), hash(&located));
     }
 
     mod intersect_metadata_tests {
