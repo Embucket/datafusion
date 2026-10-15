@@ -372,7 +372,7 @@ impl ScalarUDFImpl for LogFunc {
                     &info.get_data_type(&base)?,
                 )?)))
             }
-            Expr::ScalarFunction(ScalarFunction { func, mut args })
+            Expr::ScalarFunction(ScalarFunction { func, mut args, .. })
                 if is_pow(&func)
                     && args.len() == 2
                     && base == args[0]

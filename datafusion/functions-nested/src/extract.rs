@@ -1181,6 +1181,7 @@ mod tests {
                 Expr::Column(Column::new_unqualified("my_array")),
                 Expr::Column(Column::new_unqualified("my_index")),
             ],
+            spans: Default::default(),
         });
         assert_eq!(
             ExprSchemable::get_type(&udf_expr, &schema).unwrap(),

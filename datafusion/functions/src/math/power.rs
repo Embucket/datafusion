@@ -179,7 +179,7 @@ impl ScalarUDFImpl for PowerFunc {
                     base, &base_type,
                 )))
             }
-            Expr::ScalarFunction(ScalarFunction { func, mut args })
+            Expr::ScalarFunction(ScalarFunction { func, mut args, .. })
                 if is_log(&func)
                     && args.len() == 2
                     && base == args[0]

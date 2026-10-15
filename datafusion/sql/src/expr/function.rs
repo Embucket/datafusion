@@ -393,7 +393,10 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             }
 
             let RawScalarExpr { func, args } = scalar_expr;
-            let inner = ScalarFunction::new_udf(func, args);
+            let mut inner = ScalarFunction::new_udf(func, args);
+            if let Some(span) = Span::try_from_sqlparser_span(sql_parser_span) {
+                inner.spans.add_span(span);
+            }
 
             if name.eq_ignore_ascii_case(inner.name()) {
                 return Ok(Expr::ScalarFunction(inner));

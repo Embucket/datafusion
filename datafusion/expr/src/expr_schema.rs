@@ -35,8 +35,8 @@ use arrow_schema::extension::{EXTENSION_TYPE_METADATA_KEY, EXTENSION_TYPE_NAME_K
 use datafusion_common::datatype::FieldExt;
 use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion_common::{
-    Column, DataFusionError, ExprSchema, Result, ScalarValue, Spans, TableReference,
-    internal_err, not_impl_err, plan_datafusion_err, plan_err,
+    Column, DataFusionError, Diagnostic, ExprSchema, Result, ScalarValue, Spans,
+    TableReference, internal_err, not_impl_err, plan_datafusion_err, plan_err,
 };
 use datafusion_expr_common::type_coercion::binary::BinaryTypeCoercer;
 use datafusion_functions_window_common::field::WindowUDFFieldArgs;
@@ -811,12 +811,25 @@ impl ExprSchemable for Expr {
                 let new_fields = verify_function_arguments(func.as_ref(), &fields)?;
                 func.return_field(&new_fields)
             }
-            Expr::ScalarFunction(ScalarFunction { func, args }) => {
+            Expr::ScalarFunction(ScalarFunction { func, args, spans }) => {
                 let fields = args
                     .iter()
                     .map(|e| e.to_field(schema).map(|(_, f)| f))
                     .collect::<Result<Vec<_>>>()?;
-                let new_fields = verify_function_arguments(func.as_ref(), &fields)?;
+                let with_span = |error: DataFusionError| {
+                    if error.diagnostic().is_some() {
+                        error
+                    } else if let Some(span) = spans.first() {
+                        error.with_diagnostic(Diagnostic::new_error(
+                            format!("Invalid function '{}'", func.name()),
+                            Some(span),
+                        ))
+                    } else {
+                        error
+                    }
+                };
+                let new_fields = verify_function_arguments(func.as_ref(), &fields)
+                    .map_err(&with_span)?;
 
                 let arguments = args
                     .iter()
@@ -830,7 +843,7 @@ impl ExprSchemable for Expr {
                     scalar_arguments: &arguments,
                 };
 
-                func.return_field_from_args(args)
+                func.return_field_from_args(args).map_err(with_span)
             }
             // _ => Ok((self.get_type(schema)?, self.nullable(schema)?)),
             Expr::Cast(Cast { expr, field }) => expr
@@ -1067,6 +1080,80 @@ mod tests {
 
     use arrow::datatypes::Schema;
     use datafusion_common::{DFSchema, assert_or_internal_err};
+
+    #[test]
+    fn scalar_function_preserves_udf_supplied_diagnostic() {
+        use datafusion_common::{Location, Span};
+
+        #[derive(Debug, PartialEq, Eq, Hash)]
+        struct DiagnosticUdf {
+            signature: crate::Signature,
+        }
+
+        impl crate::ScalarUDFImpl for DiagnosticUdf {
+            fn name(&self) -> &str {
+                "diagnostic_udf"
+            }
+
+            fn signature(&self) -> &crate::Signature {
+                &self.signature
+            }
+
+            fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
+                Ok(DataType::Int32)
+            }
+
+            fn return_field_from_args(&self, _args: ReturnFieldArgs) -> Result<FieldRef> {
+                Err(
+                    DataFusionError::Plan("bad input".to_string()).with_diagnostic(
+                        Diagnostic::new_error(
+                            "UDF-specific error",
+                            Some(Span::new(
+                                Location {
+                                    line: 1,
+                                    column: 20,
+                                },
+                                Location {
+                                    line: 1,
+                                    column: 21,
+                                },
+                            )),
+                        ),
+                    ),
+                )
+            }
+
+            fn invoke_with_args(
+                &self,
+                _args: crate::ScalarFunctionArgs,
+            ) -> Result<crate::ColumnarValue> {
+                unreachable!("planning must fail before invocation")
+            }
+        }
+
+        let udf = Arc::new(crate::ScalarUDF::new_from_impl(DiagnosticUdf {
+            signature: crate::Signature::exact(
+                vec![DataType::Int32],
+                crate::Volatility::Immutable,
+            ),
+        }));
+        let mut function = ScalarFunction::new_udf(udf, vec![lit(1i32)]);
+        function.spans.add_span(Span::new(
+            Location { line: 1, column: 8 },
+            Location {
+                line: 1,
+                column: 22,
+            },
+        ));
+        let error = Expr::ScalarFunction(function)
+            .to_field(&DFSchema::empty())
+            .unwrap_err();
+        let diagnostic = error
+            .diagnostic()
+            .expect("UDF diagnostic must be preserved");
+        assert_eq!(diagnostic.message, "UDF-specific error");
+        assert_eq!(diagnostic.span.map(|span| span.start.column), Some(20));
+    }
 
     macro_rules! test_is_expr_nullable {
         ($EXPR_TYPE:ident) => {{

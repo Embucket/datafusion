@@ -394,6 +394,7 @@ pub(crate) fn simplify_concat(args: Vec<Expr>) -> Result<ExprSimplifyResult> {
             ScalarFunction {
                 func: concat(),
                 args: new_args,
+                spans: Default::default(),
             },
         )))
     } else {

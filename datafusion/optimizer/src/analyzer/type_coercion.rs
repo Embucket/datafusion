@@ -30,9 +30,9 @@ use arrow::temporal_conversions::SECONDS_IN_DAY;
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::tree_node::{Transformed, TreeNode, TreeNodeRewriter};
 use datafusion_common::{
-    Column, DFSchema, DFSchemaRef, DataFusionError, Result, ScalarValue, TableReference,
-    exec_err, internal_datafusion_err, internal_err, not_impl_err, plan_datafusion_err,
-    plan_err,
+    Column, DFSchema, DFSchemaRef, DataFusionError, Diagnostic, Result, ScalarValue,
+    TableReference, exec_err, internal_datafusion_err, internal_err, not_impl_err,
+    plan_datafusion_err, plan_err,
 };
 use datafusion_expr::expr::{
     self, AggregateFunctionParams, Alias, Between, BinaryExpr, Case, Exists,
@@ -843,12 +843,26 @@ impl TreeNodeRewriter for TypeCoercionRewriter<'_> {
                 let case = coerce_case_expression(case, self.schema)?;
                 Ok(Transformed::yes(Expr::Case(case)))
             }
-            Expr::ScalarFunction(ScalarFunction { func, args }) => {
+            Expr::ScalarFunction(ScalarFunction { func, args, spans }) => {
                 let new_expr =
-                    coerce_arguments_for_signature(args, self.schema, func.as_ref())?;
-                Ok(Transformed::yes(Expr::ScalarFunction(
-                    ScalarFunction::new_udf(func, new_expr),
-                )))
+                    coerce_arguments_for_signature(args, self.schema, func.as_ref())
+                        .map_err(|error| {
+                            if error.diagnostic().is_some() {
+                                error
+                            } else if let Some(span) = spans.first() {
+                                error.with_diagnostic(Diagnostic::new_error(
+                                    format!("Invalid function '{}'", func.name()),
+                                    Some(span),
+                                ))
+                            } else {
+                                error
+                            }
+                        })?;
+                Ok(Transformed::yes(Expr::ScalarFunction(ScalarFunction {
+                    func,
+                    args: new_expr,
+                    spans,
+                })))
             }
             Expr::AggregateFunction(expr::AggregateFunction {
                 func,
@@ -1468,9 +1482,9 @@ mod test {
     };
     use crate::assert_analyzed_plan_with_config_eq_snapshot;
     use datafusion_common::config::ConfigOptions;
-    use datafusion_common::tree_node::{TransformedResult, TreeNode};
+    use datafusion_common::tree_node::{TransformedResult, TreeNode, TreeNodeRewriter};
     use datafusion_common::{
-        DFSchema, DFSchemaRef, Result, ScalarValue, Spans, TableReference,
+        DFSchema, DFSchemaRef, Location, Result, ScalarValue, Span, Spans, TableReference,
     };
     use datafusion_expr::expr::{self, InSubquery, Like, ScalarFunction};
     use datafusion_expr::logical_plan::{EmptyRelation, Projection, Sort};
@@ -2092,6 +2106,62 @@ mod test {
           EmptyRelation: rows=0
         "
         )
+    }
+
+    #[test]
+    fn scalar_function_source_span_survives_type_coercion() -> Result<()> {
+        let schema = Arc::new(DFSchema::empty());
+        let fun = ScalarUDF::new_from_impl(TestScalarUDF {
+            signature: Signature::uniform(1, vec![DataType::Float32], Volatility::Stable),
+        });
+        let span = Span::new(
+            Location { line: 2, column: 4 },
+            Location {
+                line: 2,
+                column: 21,
+            },
+        );
+        let mut function = ScalarFunction::new_udf(Arc::new(fun), vec![lit(10i64)]);
+        function.spans.add_span(span);
+
+        let result = Expr::ScalarFunction(function)
+            .rewrite(&mut TypeCoercionRewriter { schema: &schema })
+            .data()?;
+        assert_eq!(result.spans().and_then(Spans::first), Some(span));
+        Ok(())
+    }
+
+    #[test]
+    fn nested_scalar_function_error_keeps_inner_span() {
+        let schema = Arc::new(DFSchema::empty());
+        let fun = Arc::new(ScalarUDF::new_from_impl(TestScalarUDF {
+            signature: Signature::uniform(1, vec![DataType::Float32], Volatility::Stable),
+        }));
+        let inner_span = Span::new(
+            Location {
+                line: 1,
+                column: 18,
+            },
+            Location {
+                line: 1,
+                column: 35,
+            },
+        );
+        let mut inner = ScalarFunction::new_udf(Arc::clone(&fun), vec![lit("Apple")]);
+        inner.spans.add_span(inner_span);
+        let mut outer = ScalarFunction::new_udf(fun, vec![Expr::ScalarFunction(inner)]);
+        outer.spans.add_span(Span::new(
+            Location { line: 1, column: 8 },
+            Location {
+                line: 1,
+                column: 42,
+            },
+        ));
+
+        let error = TypeCoercionRewriter { schema: &schema }
+            .f_up(Expr::ScalarFunction(outer))
+            .unwrap_err();
+        assert_eq!(error.diagnostic().and_then(|d| d.span), Some(inner_span));
     }
 
     #[test]

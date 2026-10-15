@@ -1613,17 +1613,27 @@ impl TreeNodeRewriter for Simplifier<'_> {
                     .not(),
                 )
             }
-            Expr::ScalarFunction(ScalarFunction { func: udf, args }) => {
-                match udf.simplify(args, info)? {
-                    ExprSimplifyResult::Original(args) => {
-                        Transformed::no(Expr::ScalarFunction(ScalarFunction {
-                            func: udf,
-                            args,
-                        }))
-                    }
-                    ExprSimplifyResult::Simplified(expr) => Transformed::yes(expr),
+            Expr::ScalarFunction(ScalarFunction {
+                func: udf,
+                args,
+                spans,
+            }) => match udf.simplify(args, info)? {
+                ExprSimplifyResult::Original(args) => {
+                    Transformed::no(Expr::ScalarFunction(ScalarFunction {
+                        func: udf,
+                        args,
+                        spans,
+                    }))
                 }
-            }
+                ExprSimplifyResult::Simplified(mut expr) => {
+                    if let Expr::ScalarFunction(function) = &mut expr
+                        && function.spans.get_spans().is_empty()
+                    {
+                        function.spans = spans;
+                    }
+                    Transformed::yes(expr)
+                }
+            },
 
             Expr::AggregateFunction(datafusion_expr::expr::AggregateFunction {
                 ref func,
@@ -2113,7 +2123,7 @@ fn get_preimage(
     right_expr: &Expr,
     info: &SimplifyContext,
 ) -> Result<PreimageResult> {
-    let Expr::ScalarFunction(ScalarFunction { func, args }) = left_expr else {
+    let Expr::ScalarFunction(ScalarFunction { func, args, .. }) = left_expr else {
         return Ok(PreimageResult::None);
     };
     if !is_literal_or_literal_cast(right_expr) {

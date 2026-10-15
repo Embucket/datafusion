@@ -403,6 +403,7 @@ fn simplify_concat_ws(delimiter: &Expr, args: &[Expr]) -> Result<ExprSimplifyRes
                                 ScalarFunction {
                                     func: concat(),
                                     args: args.to_vec(),
+                                    spans: Default::default(),
                                 },
                             )))
                         }
@@ -460,6 +461,7 @@ fn simplify_concat_ws(delimiter: &Expr, args: &[Expr]) -> Result<ExprSimplifyRes
                         ScalarFunction {
                             func: concat_ws(),
                             args: new_args,
+                            spans: Default::default(),
                         },
                     )))
                 }

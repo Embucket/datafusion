@@ -951,6 +951,8 @@ pub struct ScalarFunction {
     pub func: Arc<crate::ScalarUDF>,
     /// List of expressions to feed to the functions as arguments
     pub args: Vec<Expr>,
+    /// SQL source locations of this invocation, if known.
+    pub spans: Spans,
 }
 
 impl ScalarFunction {
@@ -965,7 +967,11 @@ impl ScalarFunction {
     ///
     /// [`ScalarUDF`]: crate::ScalarUDF
     pub fn new_udf(udf: Arc<crate::ScalarUDF>, args: Vec<Expr>) -> Self {
-        Self { func: udf, args }
+        Self {
+            func: udf,
+            args,
+            spans: Spans::new(),
+        }
     }
 }
 
@@ -2304,6 +2310,7 @@ impl Expr {
     pub fn spans(&self) -> Option<&Spans> {
         match self {
             Expr::Column(col) => Some(&col.spans),
+            Expr::ScalarFunction(function) => Some(&function.spans),
             Expr::Not(inner) | Expr::Negative(inner) => inner.spans(),
             _ => None,
         }
@@ -2508,10 +2515,12 @@ impl NormalizeEq for Expr {
                 Expr::ScalarFunction(ScalarFunction {
                     func: self_func,
                     args: self_args,
+                    ..
                 }),
                 Expr::ScalarFunction(ScalarFunction {
                     func: other_func,
                     args: other_args,
+                    ..
                 }),
             ) => {
                 self_func.name() == other_func.name()
@@ -2823,7 +2832,9 @@ impl HashNode for Expr {
             | Expr::TryCast(TryCast { expr: _expr, field }) => {
                 field.hash(state);
             }
-            Expr::ScalarFunction(ScalarFunction { func, args: _args }) => {
+            Expr::ScalarFunction(ScalarFunction {
+                func, args: _args, ..
+            }) => {
                 func.hash(state);
             }
             Expr::AggregateFunction(AggregateFunction {
@@ -3158,7 +3169,7 @@ impl Display for SchemaDisplay<'_> {
                 let name = if *outer { "UNNEST_OUTER" } else { "UNNEST" };
                 write!(f, "{name}({})", SchemaDisplay(expr))
             }
-            Expr::ScalarFunction(ScalarFunction { func, args }) => {
+            Expr::ScalarFunction(ScalarFunction { func, args, .. }) => {
                 match func.schema_name(args) {
                     Ok(name) => {
                         write!(f, "{name}")
@@ -4555,6 +4566,7 @@ mod test {
         let udf = Expr::ScalarFunction(ScalarFunction {
             func: Arc::new(ScalarUDF::new_from_impl(TestUDF {})),
             args: vec![expr(), expr()],
+            spans: Spans::new(),
         });
         let Expr::ScalarFunction(scalar) = &udf else {
             unreachable!()

@@ -2413,6 +2413,61 @@ fn scalar_udf_keeps_precedence_over_same_arity_aggregate_udf() {
 }
 
 #[test]
+fn scalar_udf_type_error_identifies_the_failing_invocation() {
+    let udf = Arc::new(make_udf(
+        "exact_int",
+        vec![DataType::Int32],
+        DataType::Int32,
+    ));
+    for (sql, failing_call) in [
+        (
+            "SELECT exact_int(age), exact_int(first_name) FROM person",
+            "exact_int(first_name)",
+        ),
+        (
+            "SELECT exact_int(first_name), exact_int(age) FROM person",
+            "exact_int(first_name)",
+        ),
+        (
+            "SELECT exact_int(exact_int(first_name)) FROM person",
+            "exact_int(first_name)",
+        ),
+        (
+            "SELECT exact_int(age),\n exact_int(first_name) FROM person",
+            "exact_int(first_name)",
+        ),
+    ] {
+        let state = mock_session_state().with_scalar_function(Arc::clone(&udf));
+        let error = logical_plan_from_state(
+            sql,
+            &GenericDialect {},
+            ParserOptions::default(),
+            state,
+        )
+        .unwrap_err();
+        let span = error
+            .diagnostic()
+            .and_then(|diagnostic| diagnostic.span)
+            .expect("UDF type error should carry its SQL source span");
+        let prefix = &sql[..sql.find(failing_call).unwrap()];
+        assert_eq!(
+            usize::try_from(span.start.line).unwrap_or(0),
+            prefix.matches('\n').count() + 1,
+            "{sql}"
+        );
+        assert_eq!(
+            usize::try_from(span.start.column).unwrap_or(0),
+            prefix
+                .rsplit_once('\n')
+                .map_or(prefix, |(_, line)| line)
+                .len()
+                + 1,
+            "{sql}"
+        );
+    }
+}
+
+#[test]
 fn aggregate_expr_planner_can_resolve_qualified_wildcard_from_schema() {
     let state =
         mock_session_state().with_expr_planner(Arc::new(QualifiedWildcardCountPlanner));
