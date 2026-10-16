@@ -2021,10 +2021,18 @@ impl ContextProvider for SessionContextProvider<'_> {
         let args = args
             .into_iter()
             .map(|(arg, name)| {
-                simplifier
-                    .coerce(arg, &schema)
-                    .and_then(|e| simplifier.simplify(e))
-                    .map(|expr| (expr, name))
+                // Expressions referencing columns (e.g. correlated arguments
+                // of lateral table functions) cannot be type-coerced or
+                // simplified against an empty schema; pass them through
+                // unchanged. Column-free expressions keep constant folding.
+                if arg.column_refs().is_empty() {
+                    simplifier
+                        .coerce(arg, &schema)
+                        .and_then(|e| simplifier.simplify(e))
+                        .map(|expr| (expr, name))
+                } else {
+                    Ok((arg, name))
+                }
             })
             .collect::<datafusion_common::Result<Vec<_>>>()?;
         let (exprs, names): (Vec<_>, Vec<_>) = args.into_iter().unzip();
