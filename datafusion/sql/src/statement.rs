@@ -43,6 +43,7 @@ use datafusion_common::{
 use datafusion_expr::dml::{
     CopyTo, InsertOp, MergeIntoAction, MergeIntoClause, MergeIntoClauseKind, MergeIntoOp,
 };
+use datafusion_expr::expr::ScalarFunction;
 use datafusion_expr::expr_rewriter::normalize_col_with_schemas_and_ambiguity_check;
 use datafusion_expr::logical_plan::DdlStatement;
 use datafusion_expr::logical_plan::builder::project;
@@ -2956,8 +2957,34 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 let target_field = table_schema.field(i);
                 let expr = match value_index {
                     Some(v) => {
-                        Expr::Column(Column::from(source.schema().qualified_field(v)))
-                            .cast_to(target_field.data_type(), source.schema())?
+                        let source_field = source.schema().field(v);
+                        let expr =
+                            Expr::Column(Column::from(source.schema().qualified_field(v)));
+                        let expr = if source_field
+                            .metadata()
+                            .get("embucket.snowflake_logical_type")
+                            .is_some_and(|value| value == "ARRAY")
+                            && target_field.extension_type_name()
+                                == Some("arrow.parquet.variant")
+                            && source_field.data_type() != target_field.data_type()
+                        {
+                            let to_variant = self
+                                .context_provider
+                                .get_function_meta("to_variant")
+                                .ok_or_else(|| {
+                                    DataFusionError::Plan(
+                                        "TO_VARIANT is required to insert ARRAY into VARIANT storage"
+                                            .to_string(),
+                                    )
+                                })?;
+                            Expr::ScalarFunction(ScalarFunction::new_udf(
+                                to_variant,
+                                vec![expr],
+                            ))
+                        } else {
+                            expr
+                        };
+                        expr.cast_to(target_field.data_type(), source.schema())?
                     }
                     // The value is not specified. Fill in the default value for the column.
                     None => table_source

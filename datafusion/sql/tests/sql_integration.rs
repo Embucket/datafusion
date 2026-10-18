@@ -25,7 +25,7 @@ use std::sync::Arc;
 use std::vec;
 
 use arrow::datatypes::{TimeUnit::Nanosecond, *};
-use common::MockContextProvider;
+use common::{MockContextProvider, variant_storage_type};
 use datafusion_common::{
     DFSchema, DataFusionError, Result, ScalarValue, assert_contains,
 };
@@ -840,6 +840,45 @@ fn plan_insert_does_not_promise_ordinary_target_field_metadata() {
     };
 
     assert!(dml.input.schema().field(0).metadata().is_empty());
+}
+
+#[test]
+fn plan_insert_converts_tagged_array_to_variant_storage() -> Result<()> {
+    let state = mock_session_state().with_scalar_function(Arc::new(make_udf(
+        "to_variant",
+        vec![DataType::Utf8],
+        variant_storage_type(),
+    )));
+    let plan = logical_plan_from_state(
+        "INSERT INTO variant_array_target SELECT items FROM untyped_array_source",
+        &SnowflakeDialect {},
+        ParserOptions::default(),
+        state,
+    )?;
+    assert_contains!(plan.display_indent().to_string(), "to_variant(");
+    let LogicalPlan::Dml(dml) = &plan else {
+        panic!("expected DML plan");
+    };
+    assert_eq!(
+        dml.input.schema().field(0).extension_type_name(),
+        Some("arrow.parquet.variant")
+    );
+    Ok(())
+}
+
+#[test]
+fn plan_insert_does_not_convert_plain_string_to_array() {
+    let error = logical_plan_from_state(
+        "INSERT INTO variant_array_target SELECT items FROM plain_string_source",
+        &SnowflakeDialect {},
+        ParserOptions::default(),
+        mock_session_state(),
+    )
+    .unwrap_err();
+    assert_contains!(
+        error.to_string(),
+        "Cannot automatically convert Utf8 to Struct"
+    );
 }
 
 #[rstest]
