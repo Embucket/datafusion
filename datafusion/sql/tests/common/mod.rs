@@ -114,6 +114,13 @@ impl MockSessionState {
     }
 }
 
+pub(crate) fn variant_storage_type() -> DataType {
+    DataType::Struct(Fields::from(vec![
+        Field::new("metadata", DataType::Binary, false),
+        Field::new("value", DataType::Binary, false),
+    ]))
+}
+
 pub(crate) struct MockContextProvider {
     pub(crate) state: MockSessionState,
 }
@@ -193,6 +200,33 @@ impl ContextProvider for MockContextProvider {
                         "ARROW:extension:name".to_string(),
                         "example.string".to_string(),
                     )]
+                    .into(),
+                ),
+            ])),
+            "untyped_array_source" => Ok(Schema::new(vec![
+                Field::new("items", DataType::Utf8, true).with_metadata(
+                    [(
+                        "embucket.snowflake_logical_type".to_string(),
+                        "ARRAY".to_string(),
+                    )]
+                    .into(),
+                ),
+            ])),
+            "plain_string_source" => {
+                Ok(Schema::new(vec![Field::new("items", DataType::Utf8, true)]))
+            }
+            "variant_array_target" => Ok(Schema::new(vec![
+                Field::new("items", variant_storage_type(), true).with_metadata(
+                    [
+                        (
+                            "ARROW:extension:name".to_string(),
+                            "arrow.parquet.variant".to_string(),
+                        ),
+                        (
+                            "embucket.snowflake_logical_type".to_string(),
+                            "ARRAY".to_string(),
+                        ),
+                    ]
                     .into(),
                 ),
             ])),
