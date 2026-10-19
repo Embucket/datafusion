@@ -2941,34 +2941,21 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         let mut planner_context =
             PlannerContext::new().with_prepare_param_data_types(prepare_param_data_types);
         if source_is_values {
-            let is_native_array = |field: &Field| {
+            let has_native_array_target = fields.iter().any(|field| {
                 field.extension_type_name() == Some("arrow.parquet.variant")
                     && field
                         .metadata()
                         .get("embucket.snowflake_logical_type")
                         .is_some_and(|value| value == "ARRAY")
-            };
-            let values_fields = if fields.iter().any(|field| is_native_array(field)) {
-                fields
-                    .iter()
-                    .map(|field| {
-                        if is_native_array(field) {
-                            Arc::new(Field::new(
-                                field.name(),
-                                arrow::datatypes::DataType::Utf8,
-                                field.is_nullable(),
-                            ))
-                        } else {
-                            Arc::clone(field)
-                        }
-                    })
-                    .collect::<Fields>()
-            } else {
-                fields.clone()
-            };
-            planner_context.set_table_schema(Some(DFSchemaRef::new(
-                DFSchema::from_unqualified_fields(values_fields, Default::default())?,
-            )));
+            });
+            if !has_native_array_target {
+                planner_context.set_table_schema(Some(DFSchemaRef::new(
+                    DFSchema::from_unqualified_fields(
+                        fields.clone(),
+                        Default::default(),
+                    )?,
+                )));
+            }
         }
         let source = self.query_to_plan(*source, &mut planner_context)?;
         if fields.len() != source.schema().fields().len() {
@@ -2999,12 +2986,20 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                                 | arrow::datatypes::DataType::Utf8View
                                 | arrow::datatypes::DataType::LargeUtf8
                         );
+                        let source_is_list = matches!(
+                            source_field.data_type(),
+                            arrow::datatypes::DataType::List(_)
+                                | arrow::datatypes::DataType::LargeList(_)
+                                | arrow::datatypes::DataType::FixedSizeList(_, _)
+                        );
                         let expr = if target_field.extension_type_name()
                             == Some("arrow.parquet.variant")
                             && source_field.data_type() != target_field.data_type()
-                            && (source_is_array || (target_is_array && source_is_text))
+                            && (source_is_array
+                                || source_is_list
+                                || (target_is_array && source_is_text))
                         {
-                            let function_name = if source_is_array {
+                            let function_name = if source_is_array || source_is_list {
                                 "to_variant"
                             } else {
                                 "__rustice_array_to_variant"
