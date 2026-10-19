@@ -215,6 +215,17 @@ impl ContextProvider for MockContextProvider {
             "plain_string_source" => {
                 Ok(Schema::new(vec![Field::new("items", DataType::Utf8, true)]))
             }
+            "structured_array_source" => Ok(Schema::new(vec![
+                Field::new(
+                    "items",
+                    DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+                    true,
+                )
+                .with_metadata(
+                    [("snowflake.structured_array".to_string(), "true".to_string())]
+                        .into(),
+                ),
+            ])),
             "variant_array_target" => Ok(Schema::new(vec![
                 Field::new("items", variant_storage_type(), true).with_metadata(
                     [

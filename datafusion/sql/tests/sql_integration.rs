@@ -1071,6 +1071,36 @@ fn plan_insert_values_accepts_native_array_scalar_subquery() -> Result<()> {
 }
 
 #[test]
+fn plan_insert_values_converts_structured_array_before_values_execution() -> Result<()> {
+    let state = mock_session_state().with_scalar_function(Arc::new(make_udf(
+        "to_variant",
+        vec![DataType::List(Arc::new(Field::new(
+            "item",
+            DataType::Utf8,
+            true,
+        )))],
+        variant_storage_type(),
+    )));
+    let plan = logical_plan_from_state(
+        "INSERT INTO variant_array_target VALUES ((SELECT items FROM structured_array_source LIMIT 1))",
+        &SnowflakeDialect {},
+        ParserOptions::default(),
+        state,
+    )?;
+    let LogicalPlan::Dml(dml) = &plan else {
+        panic!("expected DML plan");
+    };
+    let LogicalPlan::Projection(projection) = dml.input.as_ref() else {
+        panic!("expected INSERT projection");
+    };
+    assert_eq!(
+        projection.input.schema().field(0).data_type(),
+        &variant_storage_type()
+    );
+    Ok(())
+}
+
+#[test]
 fn plan_insert_does_not_convert_plain_string_to_unmarked_variant() {
     let error = logical_plan_from_state(
         "INSERT INTO plain_variant_target SELECT items FROM plain_string_source",

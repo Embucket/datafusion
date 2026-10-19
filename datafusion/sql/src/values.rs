@@ -70,6 +70,13 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 .then_some(index)
             })
             .collect::<Vec<_>>();
+        if array_columns.is_empty() {
+            return if schema.fields().is_empty() {
+                LogicalPlanBuilder::values(values)?.build()
+            } else {
+                LogicalPlanBuilder::values_with_schema(values, &schema)?.build()
+            };
+        }
         let mut value_fields = schema.fields().to_vec();
         let mut per_row_columns = Vec::new();
         for index in array_columns.iter().copied() {
@@ -80,7 +87,16 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     mixed = true;
                     break;
                 };
-                let data_type = expr.get_type(&schema)?;
+                let (_, source_field) = expr.to_field(&schema)?;
+                if source_field
+                    .metadata()
+                    .get("snowflake.structured_array")
+                    .is_some_and(|value| value == "true")
+                {
+                    mixed = true;
+                    break;
+                }
+                let data_type = source_field.data_type().clone();
                 if data_type == DataType::Null {
                     continue;
                 }
