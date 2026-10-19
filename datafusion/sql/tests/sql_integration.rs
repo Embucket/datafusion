@@ -1043,60 +1043,27 @@ fn plan_insert_values_validates_array_placeholder() -> Result<()> {
 
 #[test]
 fn plan_insert_values_does_not_type_nested_values_as_insert_target() -> Result<()> {
-    let state = mock_session_state().with_scalar_function(Arc::new(make_udf(
-        "__rustice_array_to_variant",
-        vec![DataType::Utf8],
-        variant_storage_type(),
-    )));
-    let plan = logical_plan_from_state(
+    let error = logical_plan_from_state(
         "INSERT INTO mixed_variant_array_target VALUES (7, (SELECT '[]' FROM (VALUES (1)) AS v))",
         &SnowflakeDialect {},
         ParserOptions::default(),
-        state,
-    )?;
-    assert!(matches!(plan, LogicalPlan::Dml(_)));
+        mock_session_state(),
+    )
+    .unwrap_err();
+    assert_contains!(error.to_string(), "use INSERT ... SELECT");
     Ok(())
 }
 
 #[test]
-fn plan_insert_values_accepts_native_array_scalar_subquery() -> Result<()> {
-    let plan = logical_plan_from_state(
+fn plan_insert_values_rejects_native_array_scalar_subquery() -> Result<()> {
+    let error = logical_plan_from_state(
         "INSERT INTO variant_array_target VALUES ((SELECT items FROM variant_array_target LIMIT 1))",
         &SnowflakeDialect {},
         ParserOptions::default(),
         mock_session_state(),
-    )?;
-    assert!(matches!(plan, LogicalPlan::Dml(_)));
-    Ok(())
-}
-
-#[test]
-fn plan_insert_values_converts_structured_array_before_values_execution() -> Result<()> {
-    let state = mock_session_state().with_scalar_function(Arc::new(make_udf(
-        "to_variant",
-        vec![DataType::List(Arc::new(Field::new(
-            "item",
-            DataType::Utf8,
-            true,
-        )))],
-        variant_storage_type(),
-    )));
-    let plan = logical_plan_from_state(
-        "INSERT INTO variant_array_target VALUES ((SELECT items FROM structured_array_source LIMIT 1))",
-        &SnowflakeDialect {},
-        ParserOptions::default(),
-        state,
-    )?;
-    let LogicalPlan::Dml(dml) = &plan else {
-        panic!("expected DML plan");
-    };
-    let LogicalPlan::Projection(projection) = dml.input.as_ref() else {
-        panic!("expected INSERT projection");
-    };
-    assert_eq!(
-        projection.input.schema().field(0).data_type(),
-        &variant_storage_type()
-    );
+    )
+    .unwrap_err();
+    assert_contains!(error.to_string(), "use INSERT ... SELECT");
     Ok(())
 }
 

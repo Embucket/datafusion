@@ -20,7 +20,8 @@ use std::sync::Arc;
 
 use crate::planner::{ContextProvider, PlannerContext, SqlToRel};
 use arrow::datatypes::DataType;
-use datafusion_common::{DFSchema, DataFusionError, Result, not_impl_err};
+use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
+use datafusion_common::{DFSchema, DataFusionError, Result, not_impl_err, plan_err};
 use datafusion_expr::expr::ScalarFunction;
 use datafusion_expr::{Expr, ExprSchemable, LogicalPlan, LogicalPlanBuilder, ScalarUDF};
 use sqlparser::ast::Values as SQLValues;
@@ -76,6 +77,27 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             } else {
                 LogicalPlanBuilder::values_with_schema(values, &schema)?.build()
             };
+        }
+        for row in &values {
+            for expr in row {
+                let mut has_subquery = false;
+                expr.apply(|node| {
+                    if matches!(
+                        node,
+                        Expr::ScalarSubquery(_) | Expr::Exists(_) | Expr::InSubquery(_)
+                    ) {
+                        has_subquery = true;
+                        Ok(TreeNodeRecursion::Stop)
+                    } else {
+                        Ok(TreeNodeRecursion::Continue)
+                    }
+                })?;
+                if has_subquery {
+                    return plan_err!(
+                        "Subqueries in ARRAY INSERT VALUES are not supported; use INSERT ... SELECT"
+                    );
+                }
+            }
         }
         let mut value_fields = schema.fields().to_vec();
         let mut per_row_columns = Vec::new();
