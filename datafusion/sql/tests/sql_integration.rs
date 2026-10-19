@@ -867,9 +867,29 @@ fn plan_insert_converts_tagged_array_to_variant_storage() -> Result<()> {
 }
 
 #[test]
-fn plan_insert_does_not_convert_plain_string_to_array() {
-    let error = logical_plan_from_state(
+fn plan_insert_uses_explicit_array_conversion_for_untagged_text() -> Result<()> {
+    let state = mock_session_state().with_scalar_function(Arc::new(make_udf(
+        "__rustice_array_to_variant",
+        vec![DataType::Utf8],
+        variant_storage_type(),
+    )));
+    let plan = logical_plan_from_state(
         "INSERT INTO variant_array_target SELECT items FROM plain_string_source",
+        &SnowflakeDialect {},
+        ParserOptions::default(),
+        state,
+    )?;
+    assert_contains!(
+        plan.display_indent().to_string(),
+        "__rustice_array_to_variant(plain_string_source.items)"
+    );
+    Ok(())
+}
+
+#[test]
+fn plan_insert_does_not_convert_plain_string_to_unmarked_variant() {
+    let error = logical_plan_from_state(
+        "INSERT INTO plain_variant_target SELECT items FROM plain_string_source",
         &SnowflakeDialect {},
         ParserOptions::default(),
         mock_session_state(),
