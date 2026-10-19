@@ -2941,8 +2941,33 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         let mut planner_context =
             PlannerContext::new().with_prepare_param_data_types(prepare_param_data_types);
         if source_is_values {
+            let is_native_array = |field: &Field| {
+                field.extension_type_name() == Some("arrow.parquet.variant")
+                    && field
+                        .metadata()
+                        .get("embucket.snowflake_logical_type")
+                        .is_some_and(|value| value == "ARRAY")
+            };
+            let values_fields = if fields.iter().any(|field| is_native_array(field)) {
+                fields
+                    .iter()
+                    .map(|field| {
+                        if is_native_array(field) {
+                            Arc::new(Field::new(
+                                field.name(),
+                                arrow::datatypes::DataType::Utf8,
+                                field.is_nullable(),
+                            ))
+                        } else {
+                            Arc::clone(field)
+                        }
+                    })
+                    .collect::<Fields>()
+            } else {
+                fields.clone()
+            };
             planner_context.set_table_schema(Some(DFSchemaRef::new(
-                DFSchema::from_unqualified_fields(fields.clone(), Default::default())?,
+                DFSchema::from_unqualified_fields(values_fields, Default::default())?,
             )));
         }
         let source = self.query_to_plan(*source, &mut planner_context)?;
