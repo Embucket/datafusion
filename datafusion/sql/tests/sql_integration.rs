@@ -845,7 +845,7 @@ fn plan_insert_does_not_promise_ordinary_target_field_metadata() {
 #[test]
 fn plan_insert_converts_tagged_array_to_variant_storage() -> Result<()> {
     let state = mock_session_state().with_scalar_function(Arc::new(make_udf(
-        "to_variant",
+        "__rustice_array_to_variant",
         vec![DataType::Utf8],
         variant_storage_type(),
     )));
@@ -855,7 +855,10 @@ fn plan_insert_converts_tagged_array_to_variant_storage() -> Result<()> {
         ParserOptions::default(),
         state,
     )?;
-    assert_contains!(plan.display_indent().to_string(), "to_variant(");
+    assert_contains!(
+        plan.display_indent().to_string(),
+        "__rustice_array_to_variant(untyped_array_source.items)"
+    );
     let LogicalPlan::Dml(dml) = &plan else {
         panic!("expected DML plan");
     };

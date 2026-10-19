@@ -2987,10 +2987,10 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                                 || source_is_list
                                 || (target_is_array && source_is_text))
                         {
-                            let function_name = if source_is_array || source_is_list {
-                                "to_variant"
-                            } else {
+                            let function_name = if target_is_array && source_is_text {
                                 "__rustice_array_to_variant"
+                            } else {
+                                "to_variant"
                             };
                             let to_variant = self
                                 .context_provider
