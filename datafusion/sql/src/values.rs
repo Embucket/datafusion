@@ -15,11 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::planner::{ContextProvider, PlannerContext, SqlToRel};
-use datafusion_common::{DFSchema, Result, not_impl_err};
-use datafusion_expr::{LogicalPlan, LogicalPlanBuilder};
+use arrow::datatypes::DataType;
+use datafusion_common::{DFSchema, DataFusionError, Result, not_impl_err};
+use datafusion_expr::expr::ScalarFunction;
+use datafusion_expr::{Expr, ExprSchemable, LogicalPlan, LogicalPlanBuilder, ScalarUDF};
 use sqlparser::ast::Values as SQLValues;
 
 impl<S: ContextProvider> SqlToRel<'_, S> {
@@ -40,7 +43,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         }
 
         let empty_schema = Arc::new(DFSchema::empty());
-        let values = rows
+        let mut values = rows
             .into_iter()
             .map(|row| {
                 row.content
@@ -51,6 +54,62 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             .collect::<Result<Vec<_>>>()?;
 
         let schema = planner_context.table_schema().unwrap_or(empty_schema);
+        let array_columns = schema
+            .fields()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, field)| {
+                (field.extension_type_name() == Some("arrow.parquet.variant")
+                    && field
+                        .metadata()
+                        .get("embucket.snowflake_logical_type")
+                        .is_some_and(|value| value == "ARRAY"))
+                .then_some(index)
+            })
+            .collect::<Vec<_>>();
+        if !array_columns.is_empty() {
+            let mut conversions: HashMap<&'static str, Arc<ScalarUDF>> = HashMap::new();
+            for row in &mut values {
+                for &index in &array_columns {
+                    let Some(expr) = row.get_mut(index) else {
+                        continue;
+                    };
+                    let function_name = match expr.get_type(&schema)? {
+                        DataType::List(_)
+                        | DataType::LargeList(_)
+                        | DataType::FixedSizeList(_, _) => "to_variant",
+                        DataType::Utf8 | DataType::Utf8View | DataType::LargeUtf8 => {
+                            "__rustice_array_to_variant"
+                        }
+                        _ if matches!(expr, Expr::Placeholder(_)) => {
+                            "__rustice_array_to_variant"
+                        }
+                        _ => continue,
+                    };
+                    let conversion = if let Some(conversion) =
+                        conversions.get(function_name)
+                    {
+                        Arc::clone(conversion)
+                    } else {
+                        let conversion = self
+                            .context_provider
+                            .get_function_meta(function_name)
+                            .ok_or_else(|| {
+                                DataFusionError::Plan(format!(
+                                    "{function_name} is required to insert ARRAY into VARIANT storage"
+                                ))
+                            })?;
+                        conversions.insert(function_name, Arc::clone(&conversion));
+                        conversion
+                    };
+                    let input = std::mem::take(expr);
+                    *expr = Expr::ScalarFunction(ScalarFunction::new_udf(
+                        conversion,
+                        vec![input],
+                    ));
+                }
+            }
+        }
         if schema.fields().is_empty() {
             LogicalPlanBuilder::values(values)?.build()
         } else {

@@ -938,10 +938,109 @@ fn plan_insert_values_keeps_list_elements_typed() -> Result<()> {
     let LogicalPlan::Projection(projection) = dml.input.as_ref() else {
         panic!("expected INSERT projection");
     };
-    assert!(matches!(
+    assert_eq!(
         projection.input.schema().field(0).data_type(),
-        DataType::List(_)
-    ));
+        &variant_storage_type()
+    );
+    assert_contains!(
+        projection.input.display_indent().to_string(),
+        "to_variant(make_array("
+    );
+    Ok(())
+}
+
+#[test]
+fn plan_insert_values_keeps_mixed_array_rows_independent() -> Result<()> {
+    let state = mock_session_state()
+        .with_scalar_function(make_array_udf())
+        .with_scalar_function(Arc::new(make_udf(
+            "array_construct",
+            vec![DataType::Int64],
+            DataType::Utf8,
+        )))
+        .with_scalar_function(Arc::new(make_udf(
+            "to_variant",
+            vec![DataType::List(Arc::new(Field::new(
+                "item",
+                DataType::Utf8,
+                true,
+            )))],
+            variant_storage_type(),
+        )))
+        .with_scalar_function(Arc::new(make_udf(
+            "__rustice_array_to_variant",
+            vec![DataType::Utf8],
+            variant_storage_type(),
+        )));
+    let plan = logical_plan_from_state(
+        "INSERT INTO variant_array_target VALUES (make_array('1')), (make_array(2)), (ARRAY_CONSTRUCT(3))",
+        &SnowflakeDialect {},
+        ParserOptions::default(),
+        state,
+    )?;
+    let formatted = plan.display_indent().to_string();
+    assert!(formatted.contains("to_variant(make_array("), "{formatted}");
+    assert!(
+        formatted.contains("__rustice_array_to_variant(array_construct("),
+        "{formatted}"
+    );
+    assert!(!formatted.contains("CAST(make_array("));
+    Ok(())
+}
+
+#[test]
+fn plan_insert_values_preserves_other_target_column_types() -> Result<()> {
+    let state = mock_session_state()
+        .with_scalar_function(make_array_udf())
+        .with_scalar_function(Arc::new(make_udf(
+            "to_variant",
+            vec![DataType::List(Arc::new(Field::new(
+                "item",
+                DataType::Utf8,
+                true,
+            )))],
+            variant_storage_type(),
+        )));
+    let plan = logical_plan_from_state(
+        "INSERT INTO mixed_variant_array_target VALUES ('7', make_array('x'))",
+        &SnowflakeDialect {},
+        ParserOptions::default(),
+        state,
+    )?;
+    let LogicalPlan::Dml(dml) = &plan else {
+        panic!("expected DML plan");
+    };
+    let LogicalPlan::Projection(projection) = dml.input.as_ref() else {
+        panic!("expected INSERT projection");
+    };
+    assert_eq!(
+        projection.input.schema().field(0).data_type(),
+        &DataType::Int64
+    );
+    assert_eq!(
+        projection.input.schema().field(1).data_type(),
+        &variant_storage_type()
+    );
+    Ok(())
+}
+
+#[test]
+fn plan_insert_values_validates_array_placeholder() -> Result<()> {
+    let state = mock_session_state().with_scalar_function(Arc::new(make_udf(
+        "__rustice_array_to_variant",
+        vec![variant_storage_type()],
+        variant_storage_type(),
+    )));
+    let plan = logical_plan_from_state(
+        "INSERT INTO variant_array_target VALUES ($1)",
+        &SnowflakeDialect {},
+        ParserOptions::default(),
+        state,
+    )?;
+    assert_contains!(
+        plan.display_indent().to_string(),
+        "__rustice_array_to_variant($1)"
+    );
     Ok(())
 }
 

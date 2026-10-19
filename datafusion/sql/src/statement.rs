@@ -2941,21 +2941,9 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         let mut planner_context =
             PlannerContext::new().with_prepare_param_data_types(prepare_param_data_types);
         if source_is_values {
-            let has_native_array_target = fields.iter().any(|field| {
-                field.extension_type_name() == Some("arrow.parquet.variant")
-                    && field
-                        .metadata()
-                        .get("embucket.snowflake_logical_type")
-                        .is_some_and(|value| value == "ARRAY")
-            });
-            if !has_native_array_target {
-                planner_context.set_table_schema(Some(DFSchemaRef::new(
-                    DFSchema::from_unqualified_fields(
-                        fields.clone(),
-                        Default::default(),
-                    )?,
-                )));
-            }
+            planner_context.set_table_schema(Some(DFSchemaRef::new(
+                DFSchema::from_unqualified_fields(fields.clone(), Default::default())?,
+            )));
         }
         let source = self.query_to_plan(*source, &mut planner_context)?;
         if fields.len() != source.schema().fields().len() {
