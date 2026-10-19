@@ -230,6 +230,31 @@ impl ContextProvider for MockContextProvider {
                     .into(),
                 ),
             ])),
+            "mixed_variant_array_target" => Ok(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("items", variant_storage_type(), true).with_metadata(
+                    [
+                        (
+                            "ARROW:extension:name".to_string(),
+                            "arrow.parquet.variant".to_string(),
+                        ),
+                        (
+                            "embucket.snowflake_logical_type".to_string(),
+                            "ARRAY".to_string(),
+                        ),
+                    ]
+                    .into(),
+                ),
+            ])),
+            "plain_variant_target" => Ok(Schema::new(vec![
+                Field::new("items", variant_storage_type(), true).with_metadata(
+                    [(
+                        "ARROW:extension:name".to_string(),
+                        "arrow.parquet.variant".to_string(),
+                    )]
+                    .into(),
+                ),
+            ])),
             "orders" => Ok(Schema::new(vec![
                 Field::new("order_id", DataType::UInt32, false),
                 Field::new("o_orderkey", DataType::UInt32, false),

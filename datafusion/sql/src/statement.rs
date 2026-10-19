@@ -2960,27 +2960,47 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                         let source_field = source.schema().field(v);
                         let expr =
                             Expr::Column(Column::from(source.schema().qualified_field(v)));
-                        let expr = if source_field
+                        let source_is_array = source_field
                             .metadata()
                             .get("embucket.snowflake_logical_type")
-                            .is_some_and(|value| value == "ARRAY")
-                            && target_field.extension_type_name()
-                                == Some("arrow.parquet.variant")
+                            .is_some_and(|value| value == "ARRAY");
+                        let target_is_array = target_field
+                            .metadata()
+                            .get("embucket.snowflake_logical_type")
+                            .is_some_and(|value| value == "ARRAY");
+                        let source_is_text = matches!(
+                            source_field.data_type(),
+                            arrow::datatypes::DataType::Utf8
+                                | arrow::datatypes::DataType::Utf8View
+                                | arrow::datatypes::DataType::LargeUtf8
+                        );
+                        let source_is_list = matches!(
+                            source_field.data_type(),
+                            arrow::datatypes::DataType::List(_)
+                                | arrow::datatypes::DataType::LargeList(_)
+                                | arrow::datatypes::DataType::FixedSizeList(_, _)
+                        );
+                        let expr = if target_field.extension_type_name()
+                            == Some("arrow.parquet.variant")
                             && source_field.data_type() != target_field.data_type()
+                            && (source_is_array
+                                || source_is_list
+                                || (target_is_array && source_is_text))
                         {
+                            let function_name = if target_is_array && source_is_text {
+                                "__rustice_array_to_variant"
+                            } else {
+                                "to_variant"
+                            };
                             let to_variant = self
                                 .context_provider
-                                .get_function_meta("to_variant")
+                                .get_function_meta(function_name)
                                 .ok_or_else(|| {
-                                    DataFusionError::Plan(
-                                        "TO_VARIANT is required to insert ARRAY into VARIANT storage"
-                                            .to_string(),
-                                    )
+                                    DataFusionError::Plan(format!(
+                                        "{function_name} is required to insert ARRAY into VARIANT storage"
+                                    ))
                                 })?;
-                            Expr::ScalarFunction(ScalarFunction::new_udf(
-                                to_variant,
-                                vec![expr],
-                            ))
+                            Expr::ScalarFunction(ScalarFunction::new_udf(to_variant, vec![expr]))
                         } else {
                             expr
                         };
