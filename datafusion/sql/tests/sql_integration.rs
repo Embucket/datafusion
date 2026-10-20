@@ -890,11 +890,41 @@ fn plan_insert_converts_variant_to_untyped_object_storage() -> Result<()> {
 }
 
 #[test]
-fn plan_insert_keeps_untyped_object_text_fast_path() -> Result<()> {
+fn plan_insert_keeps_untyped_object_fast_path() -> Result<()> {
     let plan = logical_plan(
-        "INSERT INTO untyped_object_target SELECT items FROM plain_string_source",
+        "INSERT INTO untyped_object_target SELECT items FROM untyped_object_target",
     )?;
     assert!(!plan.display_indent().to_string().contains("to_object("));
+    Ok(())
+}
+
+#[test]
+fn plan_insert_rejects_plain_text_into_untyped_object() {
+    let err = logical_plan(
+        "INSERT INTO untyped_object_target SELECT items FROM plain_string_source",
+    )
+    .expect_err("plain text needs an explicit OBJECT conversion");
+    assert_contains!(err.to_string(), "Cannot implicitly convert text to OBJECT");
+}
+
+#[test]
+fn plan_insert_values_rejects_plain_text_into_untyped_object() {
+    let err = logical_plan("INSERT INTO untyped_object_target VALUES ('{\"a\":1}')")
+        .expect_err("plain text VALUES needs an explicit OBJECT conversion");
+    assert_contains!(err.to_string(), "Cannot implicitly convert text to OBJECT");
+}
+
+#[test]
+fn plan_insert_values_rejects_mixed_null_and_plain_text_into_untyped_object() {
+    let err =
+        logical_plan("INSERT INTO untyped_object_target VALUES (NULL), ('{\"a\":1}')")
+            .expect_err("a mixed VALUES list still needs explicit OBJECT conversion");
+    assert_contains!(err.to_string(), "Cannot implicitly convert text to OBJECT");
+}
+
+#[test]
+fn plan_insert_values_accepts_null_for_untyped_object() -> Result<()> {
+    logical_plan("INSERT INTO untyped_object_target VALUES (NULL)")?;
     Ok(())
 }
 

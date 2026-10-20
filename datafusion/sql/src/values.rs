@@ -58,6 +58,39 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         let mut values = values?;
 
         let schema = table_schema.unwrap_or(empty_schema);
+        let object_columns = schema
+            .fields()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, field)| {
+                (field.data_type() == &DataType::Utf8
+                    && field
+                        .metadata()
+                        .get("embucket.snowflake_logical_type")
+                        .is_some_and(|value| value == "OBJECT"))
+                .then_some(index)
+            })
+            .collect::<Vec<_>>();
+        for row in &values {
+            for &index in &object_columns {
+                let Some(expr) = row.get(index) else {
+                    continue;
+                };
+                let (_, source_field) = expr.to_field(&schema)?;
+                if matches!(
+                    source_field.data_type(),
+                    DataType::Utf8 | DataType::Utf8View | DataType::LargeUtf8
+                ) && !source_field
+                    .metadata()
+                    .get("embucket.snowflake_logical_type")
+                    .is_some_and(|value| value == "OBJECT")
+                {
+                    plan_err!(
+                        "Cannot implicitly convert text to OBJECT during INSERT; use TO_OBJECT"
+                    )?;
+                }
+            }
+        }
         let array_columns = schema
             .fields()
             .iter()

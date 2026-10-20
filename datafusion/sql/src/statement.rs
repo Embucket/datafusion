@@ -2984,6 +2984,19 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                                 | arrow::datatypes::DataType::LargeList(_)
                                 | arrow::datatypes::DataType::FixedSizeList(_, _)
                         );
+                        if target_is_object
+                            && target_field.data_type() == &arrow::datatypes::DataType::Utf8
+                            && !source_is_values
+                            && source_is_text
+                            && !source_field
+                                .metadata()
+                                .get("embucket.snowflake_logical_type")
+                                .is_some_and(|value| value == "OBJECT")
+                        {
+                            plan_err!(
+                                "Cannot implicitly convert text to OBJECT during INSERT; use TO_OBJECT"
+                            )?;
+                        }
                         let expr = if target_is_object
                             && target_field.data_type() == &arrow::datatypes::DataType::Utf8
                             && source_field.extension_type_name()
