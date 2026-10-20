@@ -255,6 +255,15 @@ impl ContextProvider for MockContextProvider {
                     .into(),
                 ),
             ])),
+            "untyped_object_target" => Ok(Schema::new(vec![
+                Field::new("items", DataType::Utf8, true).with_metadata(
+                    [(
+                        "embucket.snowflake_logical_type".to_string(),
+                        "OBJECT".to_string(),
+                    )]
+                    .into(),
+                ),
+            ])),
             "orders" => Ok(Schema::new(vec![
                 Field::new("order_id", DataType::UInt32, false),
                 Field::new("o_orderkey", DataType::UInt32, false),

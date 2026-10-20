@@ -40,7 +40,7 @@ use datafusion_expr::{
     logical_plan::LogicalPlan,
     test::function_stub::sum_udaf,
 };
-use datafusion_functions::{string, unicode};
+use datafusion_functions::{core as df_core, string, unicode};
 use datafusion_sql::{
     parser::DFParser,
     planner::{NullOrdering, ParserOptions, PlannerContext, SqlToRel},
@@ -866,6 +866,309 @@ fn plan_insert_converts_tagged_array_to_variant_storage() -> Result<()> {
         dml.input.schema().field(0).extension_type_name(),
         Some("arrow.parquet.variant")
     );
+    Ok(())
+}
+
+#[test]
+fn plan_insert_converts_variant_to_untyped_object_storage() -> Result<()> {
+    let state = mock_session_state().with_scalar_function(Arc::new(make_udf(
+        "to_object",
+        vec![variant_storage_type()],
+        DataType::Utf8,
+    )));
+    let plan = logical_plan_from_state(
+        "INSERT INTO untyped_object_target SELECT items FROM plain_variant_target",
+        &SnowflakeDialect {},
+        ParserOptions::default(),
+        state,
+    )?;
+    assert_contains!(
+        plan.display_indent().to_string(),
+        "to_object(plain_variant_target.items)"
+    );
+    Ok(())
+}
+
+#[test]
+fn plan_insert_converts_object_variant_union_to_untyped_object() -> Result<()> {
+    for sql in [
+        "INSERT INTO untyped_object_target SELECT items FROM untyped_object_target UNION ALL SELECT items FROM plain_variant_target",
+        "INSERT INTO untyped_object_target SELECT item FROM (SELECT items AS item FROM untyped_object_target UNION ALL SELECT items AS item FROM plain_variant_target)",
+        "INSERT INTO untyped_object_target SELECT item FROM (SELECT items AS item FROM untyped_object_target UNION ALL SELECT items AS item FROM plain_variant_target) UNION ALL SELECT NULL",
+    ] {
+        let state = mock_session_state().with_scalar_function(Arc::new(make_udf(
+            "to_object",
+            vec![DataType::Utf8],
+            DataType::Utf8,
+        )));
+        let plan = logical_plan_from_state(
+            sql,
+            &SnowflakeDialect {},
+            ParserOptions::default(),
+            state,
+        )?;
+        assert_contains!(plan.display_indent().to_string(), "to_object(");
+    }
+    Ok(())
+}
+
+#[test]
+fn plan_insert_rejects_text_outside_object_variant_union() {
+    let error = logical_plan(
+        "INSERT INTO untyped_object_target SELECT item FROM (SELECT items AS item FROM untyped_object_target UNION ALL SELECT items AS item FROM plain_variant_target) UNION ALL SELECT '{\"z\":3}'",
+    )
+    .expect_err("an outer text branch must not inherit the inner OBJECT/VARIANT conversion");
+    assert_contains!(
+        error.to_string(),
+        "Cannot implicitly convert Utf8 to OBJECT"
+    );
+}
+
+#[test]
+fn plan_insert_keeps_untyped_object_fast_path() -> Result<()> {
+    let plan = logical_plan(
+        "INSERT INTO untyped_object_target SELECT items FROM untyped_object_target",
+    )?;
+    assert!(!plan.display_indent().to_string().contains("to_object("));
+    Ok(())
+}
+
+#[test]
+fn plan_insert_rejects_plain_text_into_untyped_object() {
+    let err = logical_plan(
+        "INSERT INTO untyped_object_target SELECT items FROM plain_string_source",
+    )
+    .expect_err("plain text needs an explicit OBJECT conversion");
+    assert_contains!(err.to_string(), "Cannot implicitly convert Utf8 to OBJECT");
+}
+
+#[test]
+fn plan_insert_values_rejects_plain_text_into_untyped_object() {
+    let err = logical_plan("INSERT INTO untyped_object_target VALUES ('{\"a\":1}')")
+        .expect_err("plain text VALUES needs an explicit OBJECT conversion");
+    assert_contains!(err.to_string(), "Cannot implicitly convert Utf8 to OBJECT");
+}
+
+#[test]
+fn plan_insert_values_rejects_mixed_null_and_plain_text_into_untyped_object() {
+    let err =
+        logical_plan("INSERT INTO untyped_object_target VALUES (NULL), ('{\"a\":1}')")
+            .expect_err("a mixed VALUES list still needs explicit OBJECT conversion");
+    assert_contains!(err.to_string(), "Cannot implicitly convert Utf8 to OBJECT");
+}
+
+#[test]
+fn plan_insert_values_accepts_null_for_untyped_object() -> Result<()> {
+    logical_plan("INSERT INTO untyped_object_target VALUES (NULL)")?;
+    Ok(())
+}
+
+#[test]
+fn plan_insert_select_accepts_null_for_untyped_object() -> Result<()> {
+    logical_plan("INSERT INTO untyped_object_target SELECT NULL")?;
+    Ok(())
+}
+
+#[test]
+fn plan_insert_rejects_numeric_and_boolean_for_untyped_object() {
+    for sql in [
+        "INSERT INTO untyped_object_target SELECT 42",
+        "INSERT INTO untyped_object_target SELECT TRUE",
+        "INSERT INTO untyped_object_target VALUES (42)",
+        "INSERT INTO untyped_object_target VALUES (TRUE)",
+    ] {
+        let err =
+            logical_plan(sql).expect_err("scalar needs an explicit OBJECT conversion");
+        assert_contains!(err.to_string(), "to OBJECT during INSERT");
+    }
+}
+
+#[test]
+fn plan_insert_values_validates_bound_object_source() -> Result<()> {
+    let plan = logical_plan_from_state(
+        "INSERT INTO untyped_object_target VALUES ($1)",
+        &SnowflakeDialect {},
+        ParserOptions::default(),
+        mock_session_state(),
+    )?;
+    for value in [
+        ScalarValue::Utf8(Some("{\"a\":1}".to_string())),
+        ScalarValue::Int64(Some(42)),
+        ScalarValue::Boolean(Some(true)),
+    ] {
+        let err = plan
+            .clone()
+            .with_param_values(vec![value])
+            .expect_err("bound scalar needs an explicit OBJECT conversion");
+        assert_contains!(err.to_string(), "to OBJECT; use TO_OBJECT");
+    }
+    plan.clone().with_param_values(vec![ScalarValue::Null])?;
+    plan.with_param_values(vec![ScalarValue::Utf8(None)])?;
+    Ok(())
+}
+
+#[test]
+fn plan_insert_select_rejects_direct_object_placeholder() {
+    for sql in [
+        "INSERT INTO untyped_object_target SELECT $1",
+        "INSERT INTO untyped_object_target SELECT $1 LIMIT 1",
+        "INSERT INTO untyped_object_target SELECT $1 AS item ORDER BY item LIMIT 1",
+        "INSERT INTO untyped_object_target SELECT item FROM (SELECT $1 AS item)",
+        "INSERT INTO untyped_object_target SELECT v.item FROM (SELECT $1 AS item) v CROSS JOIN (SELECT 1) x",
+        "INSERT INTO untyped_object_target SELECT v.item FROM (SELECT $1 AS item) v GROUP BY v.item",
+        "INSERT INTO untyped_object_target SELECT (SELECT $1)",
+        "INSERT INTO untyped_object_target SELECT COALESCE($1, NULL)",
+    ] {
+        let error = logical_plan_from_state(
+            sql,
+            &SnowflakeDialect {},
+            ParserOptions::default(),
+            mock_session_state()
+                .with_scalar_function(Arc::new(df_core::coalesce().as_ref().clone())),
+        )
+        .expect_err("bound SELECT cannot infer OBJECT");
+        assert_contains!(error.to_string(), "untyped bound parameter into OBJECT");
+    }
+}
+
+#[test]
+fn plan_insert_select_allows_placeholder_outside_object_output() -> Result<()> {
+    for sql in [
+        "INSERT INTO untyped_object_target SELECT NULL WHERE $1",
+        "INSERT INTO untyped_object_target SELECT CASE WHEN $1 THEN NULL ELSE NULL END",
+        "INSERT INTO untyped_object_target VALUES (CASE WHEN $1 THEN NULL ELSE NULL END)",
+    ] {
+        logical_plan_from_state(
+            sql,
+            &SnowflakeDialect {},
+            ParserOptions::default(),
+            mock_session_state(),
+        )?;
+    }
+    Ok(())
+}
+
+#[test]
+fn plan_insert_values_rejects_nested_object_placeholder() {
+    let error = logical_plan_from_state(
+        "INSERT INTO untyped_object_target VALUES (COALESCE($1, NULL))",
+        &SnowflakeDialect {},
+        ParserOptions::default(),
+        mock_session_state()
+            .with_scalar_function(Arc::new(df_core::coalesce().as_ref().clone())),
+    )
+    .expect_err("nested bound VALUES expression cannot infer OBJECT");
+    assert_contains!(error.to_string(), "untyped bound expression into OBJECT");
+}
+
+#[test]
+fn plan_insert_select_from_values_checks_bound_object_value() -> Result<()> {
+    for sql in [
+        "INSERT INTO untyped_object_target SELECT column1 FROM (VALUES ($1)) AS v(column1)",
+        "INSERT INTO untyped_object_target SELECT DISTINCT column1 FROM (VALUES ($1)) AS v(column1)",
+        "INSERT INTO untyped_object_target SELECT column1 FROM (VALUES ($1)) AS v(column1) UNION ALL SELECT NULL",
+    ] {
+        let plan = logical_plan_from_state(
+            sql,
+            &SnowflakeDialect {},
+            ParserOptions::default(),
+            mock_session_state(),
+        )?;
+        let error = plan
+            .clone()
+            .with_param_values(vec![ScalarValue::Utf8(Some("{\"a\":1}".into()))])
+            .expect_err("bound text cannot be inserted into OBJECT");
+        assert_contains!(
+            error.to_string(),
+            "Cannot implicitly convert Utf8 to OBJECT"
+        );
+        plan.clone().with_param_values(vec![ScalarValue::Null])?;
+        plan.with_param_values(vec![ScalarValue::Utf8(None)])?;
+    }
+    Ok(())
+}
+
+#[test]
+fn plan_insert_object_union_checks_bound_scalar_branch() -> Result<()> {
+    for sql in [
+        "INSERT INTO untyped_object_target SELECT items FROM untyped_object_target UNION ALL SELECT $1",
+        "INSERT INTO untyped_object_target SELECT item FROM (SELECT items AS item FROM untyped_object_target UNION ALL SELECT $1 AS item)",
+    ] {
+        let plan = logical_plan_from_state(
+            sql,
+            &SnowflakeDialect {},
+            ParserOptions::default(),
+            mock_session_state(),
+        )?;
+        let error = plan
+            .clone()
+            .with_param_values(vec![ScalarValue::Utf8(Some("{\"a\":1}".into()))])
+            .expect_err("a TEXT bind cannot enter an OBJECT union branch");
+        assert_contains!(error.to_string(), "inconsistent data type");
+        plan.with_param_values(vec![ScalarValue::Null])?;
+    }
+    Ok(())
+}
+
+#[test]
+fn plan_select_object_union_checks_bound_scalar_branch() -> Result<()> {
+    let plan = logical_plan_from_state(
+        "SELECT items FROM untyped_object_target UNION ALL SELECT $1",
+        &SnowflakeDialect {},
+        ParserOptions::default(),
+        mock_session_state(),
+    )?;
+    for value in [
+        ScalarValue::Utf8(Some("{\"a\":1}".into())),
+        ScalarValue::Utf8(None),
+    ] {
+        let error = plan
+            .clone()
+            .with_param_values(vec![value])
+            .expect_err("a VARCHAR bind cannot enter an OBJECT union branch");
+        assert_contains!(error.to_string(), "inconsistent data type");
+    }
+    plan.with_param_values(vec![ScalarValue::Null])?;
+    Ok(())
+}
+
+#[test]
+fn plan_insert_object_accepts_wide_null_union() -> Result<()> {
+    let source = std::iter::repeat_n("SELECT NULL", 65)
+        .collect::<Vec<_>>()
+        .join(" UNION ALL ");
+    logical_plan(&format!("INSERT INTO untyped_object_target {source}"))?;
+    Ok(())
+}
+
+#[test]
+fn plan_set_operation_rejects_object_and_plain_scalar() {
+    for sql in [
+        "SELECT items FROM untyped_object_target UNION ALL SELECT items FROM plain_string_source",
+        "SELECT items FROM plain_string_source UNION ALL SELECT items FROM untyped_object_target",
+        "SELECT items FROM untyped_object_target UNION ALL SELECT 42",
+        "SELECT items FROM untyped_object_target UNION ALL SELECT CAST(NULL AS VARCHAR)",
+        "SELECT items FROM untyped_object_target UNION ALL BY NAME SELECT items FROM plain_string_source",
+        "INSERT INTO untyped_object_target SELECT items FROM untyped_object_target UNION ALL SELECT items FROM plain_string_source",
+    ] {
+        let err = logical_plan(sql)
+            .expect_err("OBJECT and a scalar must not share a set column");
+        assert_contains!(err.to_string(), "inconsistent data type");
+    }
+}
+
+#[test]
+fn plan_set_operation_accepts_object_and_null() -> Result<()> {
+    logical_plan("SELECT items FROM untyped_object_target UNION ALL SELECT NULL")?;
+    logical_plan("SELECT NULL UNION ALL SELECT items FROM untyped_object_target")?;
+    Ok(())
+}
+
+#[test]
+fn plan_set_operation_accepts_object_and_variant() -> Result<()> {
+    logical_plan(
+        "SELECT items FROM untyped_object_target UNION ALL SELECT items FROM plain_variant_target",
+    )?;
     Ok(())
 }
 

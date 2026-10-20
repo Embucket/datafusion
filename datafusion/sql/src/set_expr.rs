@@ -15,14 +15,82 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::planner::{ContextProvider, PlannerContext, SqlToRel};
+use arrow::datatypes::{DataType, Field};
 use datafusion_common::{
     DataFusionError, Diagnostic, Result, Span, not_impl_err, plan_err,
 };
 use datafusion_expr::{LogicalPlan, LogicalPlanBuilder};
 use sqlparser::ast::{SetExpr, SetOperator, SetQuantifier, Spanned};
+
+fn is_object_field(field: &Field) -> bool {
+    field
+        .metadata()
+        .get("embucket.snowflake_logical_type")
+        .is_some_and(|logical_type| logical_type == "OBJECT")
+}
+
+fn is_object_set_compatible(field: &Field) -> bool {
+    field.data_type() == &DataType::Null
+        || is_object_field(field)
+        || (field.extension_type_name() == Some("arrow.parquet.variant")
+            && !field
+                .metadata()
+                .get("embucket.snowflake_logical_type")
+                .is_some_and(|logical_type| logical_type == "ARRAY"))
+}
+
+fn validate_object_set_column(left: &Field, right: &Field) -> Result<()> {
+    if (is_object_field(left) && !is_object_set_compatible(right))
+        || (is_object_field(right) && !is_object_set_compatible(left))
+    {
+        return plan_err!(
+            "inconsistent data type for result columns for set operator input branches: OBJECT and {}",
+            if is_object_field(left) {
+                right.data_type()
+            } else {
+                left.data_type()
+            }
+        );
+    }
+    Ok(())
+}
+
+fn validate_object_set_columns(
+    left: &LogicalPlan,
+    right: &LogicalPlan,
+    set_quantifier: SetQuantifier,
+) -> Result<()> {
+    let left_fields = left.schema().fields();
+    let right_fields = right.schema().fields();
+    if matches!(
+        set_quantifier,
+        SetQuantifier::ByName | SetQuantifier::AllByName | SetQuantifier::DistinctByName
+    ) {
+        if !left_fields.iter().any(|field| is_object_field(field))
+            && !right_fields.iter().any(|field| is_object_field(field))
+        {
+            return Ok(());
+        }
+        let right_by_name: HashMap<_, _> = right_fields
+            .iter()
+            .map(|field| (field.name(), field.as_ref()))
+            .collect();
+        for left in left_fields {
+            if let Some(right) = right_by_name.get(left.name()) {
+                validate_object_set_column(left, right)?;
+            }
+        }
+    } else {
+        for (left, right) in left_fields.iter().zip(right_fields) {
+            validate_object_set_column(left, right)?;
+        }
+    }
+    Ok(())
+}
 
 impl<S: ContextProvider> SqlToRel<'_, S> {
     pub(super) fn set_expr_to_plan(
@@ -139,6 +207,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         right_plan: LogicalPlan,
         set_quantifier: SetQuantifier,
     ) -> Result<LogicalPlan> {
+        validate_object_set_columns(&left_plan, &right_plan, set_quantifier)?;
         match (op, set_quantifier) {
             (SetOperator::Union, SetQuantifier::All) => {
                 LogicalPlanBuilder::from(left_plan)

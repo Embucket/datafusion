@@ -21,10 +21,317 @@ use std::sync::Arc;
 use crate::planner::{ContextProvider, PlannerContext, SqlToRel};
 use arrow::datatypes::DataType;
 use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
-use datafusion_common::{DFSchema, DataFusionError, Result, not_impl_err, plan_err};
+use datafusion_common::{
+    Column, DFSchema, DataFusionError, Result, not_impl_err, plan_err,
+};
 use datafusion_expr::expr::ScalarFunction;
 use datafusion_expr::{Expr, ExprSchemable, LogicalPlan, LogicalPlanBuilder, ScalarUDF};
 use sqlparser::ast::Values as SQLValues;
+
+enum ObjectSource<'a> {
+    Plan(&'a LogicalPlan, usize),
+    Expr(&'a Expr, Option<&'a LogicalPlan>),
+}
+
+pub(super) fn object_output_has_placeholder(
+    source: &LogicalPlan,
+    output_index: usize,
+) -> Result<bool> {
+    object_source_has_placeholder(ObjectSource::Plan(source, output_index))
+}
+
+pub(super) fn object_output_is_object_variant_union(
+    source: &LogicalPlan,
+    output_index: usize,
+) -> Result<bool> {
+    Ok(object_union_source_kind(source, output_index, 0)? == ObjectUnionKind::Mixed)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ObjectUnionKind {
+    Object,
+    Variant,
+    Null,
+    Mixed,
+    Other,
+}
+
+fn object_union_field_kind(field: &arrow::datatypes::Field) -> ObjectUnionKind {
+    let logical_type = field.metadata().get("embucket.snowflake_logical_type");
+    if logical_type.is_some_and(|kind| kind == "OBJECT") {
+        ObjectUnionKind::Object
+    } else if field.extension_type_name() == Some("arrow.parquet.variant")
+        && logical_type.is_none_or(|kind| kind != "ARRAY")
+    {
+        ObjectUnionKind::Variant
+    } else if field.data_type() == &DataType::Null {
+        ObjectUnionKind::Null
+    } else {
+        ObjectUnionKind::Other
+    }
+}
+
+fn object_union_source_kind(
+    plan: &LogicalPlan,
+    index: usize,
+    depth: usize,
+) -> Result<ObjectUnionKind> {
+    if depth > 256 {
+        return plan_err!("OBJECT INSERT source is too deeply nested");
+    }
+    let passthrough = |input: &LogicalPlan, column: &Column| {
+        input
+            .schema()
+            .maybe_index_of_column(column)
+            .map(|index| object_union_source_kind(input, index, depth + 1))
+    };
+    match plan {
+        LogicalPlan::Union(node) => {
+            let mut has_object = false;
+            let mut has_variant = false;
+            for input in &node.inputs {
+                match object_union_source_kind(input, index, depth + 1)? {
+                    ObjectUnionKind::Object => has_object = true,
+                    ObjectUnionKind::Variant => has_variant = true,
+                    ObjectUnionKind::Mixed => {
+                        has_object = true;
+                        has_variant = true;
+                    }
+                    ObjectUnionKind::Null => {}
+                    ObjectUnionKind::Other => return Ok(ObjectUnionKind::Other),
+                }
+            }
+            Ok(match (has_object, has_variant) {
+                (true, true) => ObjectUnionKind::Mixed,
+                (true, false) => ObjectUnionKind::Object,
+                (false, true) => ObjectUnionKind::Variant,
+                (false, false) => ObjectUnionKind::Null,
+            })
+        }
+        LogicalPlan::Projection(node) => {
+            let Some(mut expr) = node.expr.get(index) else {
+                return Ok(ObjectUnionKind::Other);
+            };
+            while let Expr::Alias(alias) = expr {
+                expr = alias.expr.as_ref();
+            }
+            if let Expr::Column(column) = expr
+                && let Some(kind) = passthrough(node.input.as_ref(), column)
+            {
+                return kind;
+            }
+            Ok(object_union_field_kind(plan.schema().field(index)))
+        }
+        LogicalPlan::Filter(node) => {
+            object_union_source_kind(&node.input, index, depth + 1)
+        }
+        LogicalPlan::Limit(node) => {
+            object_union_source_kind(&node.input, index, depth + 1)
+        }
+        LogicalPlan::Sort(node) => {
+            object_union_source_kind(&node.input, index, depth + 1)
+        }
+        LogicalPlan::SubqueryAlias(node) => {
+            object_union_source_kind(&node.input, index, depth + 1)
+        }
+        LogicalPlan::Subquery(node) => {
+            object_union_source_kind(&node.subquery, index, depth + 1)
+        }
+        LogicalPlan::Repartition(node) => {
+            object_union_source_kind(&node.input, index, depth + 1)
+        }
+        LogicalPlan::Distinct(node) => {
+            object_union_source_kind(node.input().as_ref(), index, depth + 1)
+        }
+        LogicalPlan::Join(node) => {
+            let column = Column::from(plan.schema().qualified_field(index));
+            if let Some(kind) = passthrough(node.left.as_ref(), &column) {
+                kind
+            } else if let Some(kind) = passthrough(node.right.as_ref(), &column) {
+                kind
+            } else {
+                Ok(ObjectUnionKind::Other)
+            }
+        }
+        LogicalPlan::Aggregate(node) => {
+            if let Some(Expr::Column(column)) = node.group_expr.get(index)
+                && let Some(kind) = passthrough(node.input.as_ref(), column)
+            {
+                return kind;
+            }
+            Ok(object_union_field_kind(plan.schema().field(index)))
+        }
+        LogicalPlan::Window(node) if index < node.input.schema().fields().len() => {
+            object_union_source_kind(&node.input, index, depth + 1)
+        }
+        _ => Ok(object_union_field_kind(plan.schema().field(index))),
+    }
+}
+
+fn object_value_has_placeholder(expr: &Expr) -> Result<bool> {
+    object_source_has_placeholder(ObjectSource::Expr(expr, None))
+}
+
+fn object_source_has_placeholder(source: ObjectSource<'_>) -> Result<bool> {
+    let mut pending = vec![(source, 0)];
+    while let Some((source, depth)) = pending.pop() {
+        if depth > 256 {
+            return plan_err!("OBJECT INSERT source is too deeply nested");
+        }
+        match source {
+            ObjectSource::Plan(plan, index) => match plan {
+                LogicalPlan::Projection(node) => {
+                    let expr = node.expr.get(index).ok_or_else(|| {
+                        DataFusionError::Plan(
+                            "OBJECT INSERT source column is missing".into(),
+                        )
+                    })?;
+                    pending.push((
+                        ObjectSource::Expr(expr, Some(node.input.as_ref())),
+                        depth + 1,
+                    ));
+                }
+                LogicalPlan::Values(node) => {
+                    for row in &node.values {
+                        if let Some(expr) = row.get(index)
+                            && !matches!(expr, Expr::Placeholder(_))
+                        {
+                            pending.push((ObjectSource::Expr(expr, None), depth + 1));
+                        }
+                    }
+                }
+                LogicalPlan::Limit(node) => {
+                    pending.push((
+                        ObjectSource::Plan(node.input.as_ref(), index),
+                        depth + 1,
+                    ));
+                }
+                LogicalPlan::Sort(node) => {
+                    pending.push((
+                        ObjectSource::Plan(node.input.as_ref(), index),
+                        depth + 1,
+                    ));
+                }
+                LogicalPlan::Filter(node) => {
+                    pending.push((
+                        ObjectSource::Plan(node.input.as_ref(), index),
+                        depth + 1,
+                    ));
+                }
+                LogicalPlan::SubqueryAlias(node) => {
+                    pending.push((
+                        ObjectSource::Plan(node.input.as_ref(), index),
+                        depth + 1,
+                    ));
+                }
+                LogicalPlan::Subquery(node) => {
+                    pending.push((
+                        ObjectSource::Plan(node.subquery.as_ref(), index),
+                        depth + 1,
+                    ));
+                }
+                LogicalPlan::Repartition(node) => {
+                    pending.push((
+                        ObjectSource::Plan(node.input.as_ref(), index),
+                        depth + 1,
+                    ));
+                }
+                LogicalPlan::Distinct(node) => {
+                    pending.push((
+                        ObjectSource::Plan(node.input().as_ref(), index),
+                        depth + 1,
+                    ));
+                }
+                LogicalPlan::Join(node) => {
+                    let column = Column::from(plan.schema().qualified_field(index));
+                    if let Some(index) = node.left.schema().maybe_index_of_column(&column)
+                    {
+                        pending.push((
+                            ObjectSource::Plan(node.left.as_ref(), index),
+                            depth + 1,
+                        ));
+                    } else if let Some(index) =
+                        node.right.schema().maybe_index_of_column(&column)
+                    {
+                        pending.push((
+                            ObjectSource::Plan(node.right.as_ref(), index),
+                            depth + 1,
+                        ));
+                    } else {
+                        return Ok(true);
+                    }
+                }
+                LogicalPlan::Aggregate(node) => {
+                    let expr = node.group_expr.get(index).or_else(|| {
+                        index
+                            .checked_sub(node.group_expr.len())
+                            .and_then(|index| node.aggr_expr.get(index))
+                    });
+                    let Some(expr) = expr else {
+                        return Ok(true);
+                    };
+                    pending.push((
+                        ObjectSource::Expr(expr, Some(node.input.as_ref())),
+                        depth + 1,
+                    ));
+                }
+                LogicalPlan::Window(node) => {
+                    let input_len = node.input.schema().fields().len();
+                    if index < input_len {
+                        pending.push((
+                            ObjectSource::Plan(node.input.as_ref(), index),
+                            depth + 1,
+                        ));
+                    } else if let Some(expr) = node.window_expr.get(index - input_len) {
+                        pending.push((
+                            ObjectSource::Expr(expr, Some(node.input.as_ref())),
+                            depth + 1,
+                        ));
+                    } else {
+                        return Ok(true);
+                    }
+                }
+                LogicalPlan::Union(node) => {
+                    pending.extend(node.inputs.iter().map(|input| {
+                        (ObjectSource::Plan(input.as_ref(), index), depth + 1)
+                    }));
+                }
+                _ => {}
+            },
+            ObjectSource::Expr(expr, input) => match expr {
+                Expr::Placeholder(_) => return Ok(true),
+                Expr::Case(case) => {
+                    pending.extend(case.when_then_expr.iter().map(|(_, value)| {
+                        (ObjectSource::Expr(value.as_ref(), input), depth + 1)
+                    }));
+                    pending.extend(
+                        case.else_expr
+                            .as_deref()
+                            .map(|expr| (ObjectSource::Expr(expr, input), depth + 1)),
+                    );
+                }
+                Expr::Column(column) => {
+                    if let Some(input) = input
+                        && let Some(index) = input.schema().maybe_index_of_column(column)
+                    {
+                        pending.push((ObjectSource::Plan(input, index), depth + 1));
+                    }
+                }
+                Expr::ScalarSubquery(node) => {
+                    pending
+                        .push((ObjectSource::Plan(node.subquery.as_ref(), 0), depth + 1));
+                }
+                _ => {
+                    expr.apply_children(|child| {
+                        pending.push((ObjectSource::Expr(child, input), depth + 1));
+                        Ok(TreeNodeRecursion::Continue)
+                    })?;
+                }
+            },
+        }
+    }
+    Ok(false)
+}
 
 impl<S: ContextProvider> SqlToRel<'_, S> {
     pub(super) fn sql_values_to_plan(
@@ -58,6 +365,47 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         let mut values = values?;
 
         let schema = table_schema.unwrap_or(empty_schema);
+        let object_columns = schema
+            .fields()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, field)| {
+                (field.data_type() == &DataType::Utf8
+                    && field
+                        .metadata()
+                        .get("embucket.snowflake_logical_type")
+                        .is_some_and(|value| value == "OBJECT"))
+                .then_some(index)
+            })
+            .collect::<Vec<_>>();
+        for row in &values {
+            for &index in &object_columns {
+                let Some(expr) = row.get(index) else {
+                    continue;
+                };
+                let (_, source_field) = expr.to_field(&schema)?;
+                if source_field.data_type() == &DataType::Null
+                    && !matches!(expr, Expr::Placeholder(_))
+                    && object_value_has_placeholder(expr)?
+                {
+                    return plan_err!(
+                        "Cannot insert an untyped bound expression into OBJECT"
+                    );
+                }
+                if source_field.data_type() != &DataType::Null
+                    && source_field.extension_type_name() != Some("arrow.parquet.variant")
+                    && !source_field
+                        .metadata()
+                        .get("embucket.snowflake_logical_type")
+                        .is_some_and(|value| value == "OBJECT")
+                {
+                    plan_err!(
+                        "Cannot implicitly convert {} to OBJECT during INSERT; use TO_OBJECT",
+                        source_field.data_type()
+                    )?;
+                }
+            }
+        }
         let array_columns = schema
             .fields()
             .iter()
