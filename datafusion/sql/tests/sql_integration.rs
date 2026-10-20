@@ -1002,8 +1002,18 @@ fn plan_insert_values_validates_bound_object_source() -> Result<()> {
             .expect_err("bound scalar needs an explicit OBJECT conversion");
         assert_contains!(err.to_string(), "to OBJECT; use TO_OBJECT");
     }
-    plan.clone().with_param_values(vec![ScalarValue::Null])?;
-    plan.with_param_values(vec![ScalarValue::Utf8(None)])?;
+    for value in [ScalarValue::Null, ScalarValue::Utf8(None)] {
+        let bound = plan.clone().with_param_values(vec![value])?;
+        let mut input = &bound;
+        while !matches!(input, LogicalPlan::Values(_)) {
+            input = input
+                .inputs()
+                .into_iter()
+                .next()
+                .expect("INSERT VALUES input");
+        }
+        assert_eq!(input.schema().field(0).data_type(), &DataType::Utf8);
+    }
     Ok(())
 }
 

@@ -2054,12 +2054,13 @@ impl LogicalPlan {
                             let (value, metadata) = param_values
                                 .get_placeholders_with_values(&id)?
                                 .into_inner();
-                            if field.as_ref().is_some_and(|field| {
+                            let object_field = field.as_ref().filter(|field| {
                                 field
                                     .metadata()
                                     .get("embucket.snowflake_logical_type")
                                     .is_some_and(|logical_type| logical_type == "OBJECT")
-                            }) && !value.is_null()
+                            });
+                            if object_field.is_some() && !value.is_null()
                                 && !metadata.as_ref().is_some_and(|metadata| {
                                     metadata
                                         .inner()
@@ -2076,6 +2077,15 @@ impl LogicalPlan {
                                     value.data_type()
                                 );
                             }
+                            let value = if value.is_null() {
+                                if let Some(field) = object_field {
+                                    ScalarValue::try_new_null(field.data_type())?
+                                } else {
+                                    value
+                                }
+                            } else {
+                                value
+                            };
                             Ok(Transformed::yes(Expr::Literal(value, metadata)))
                         } else {
                             Ok(Transformed::no(e))
