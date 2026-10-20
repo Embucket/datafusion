@@ -25,7 +25,9 @@ use crate::expr::{
 use crate::expr::{FieldMetadata, LambdaVariable};
 use crate::higher_order_function::HigherOrderReturnFieldArgs;
 use crate::type_coercion::functions::value_fields_with_higher_order_udf_and_lambdas;
-use crate::type_coercion::functions::{UDFCoercionExt, fields_with_udf};
+use crate::type_coercion::functions::{
+    UDFCoercionExt, contains_external_error, fields_with_udf,
+};
 use crate::udf::ReturnFieldArgs;
 use crate::{LogicalPlan, Projection, Subquery, WindowFunctionDefinition, utils};
 use arrow::compute::can_cast_types;
@@ -1003,18 +1005,23 @@ fn verify_function_arguments<F: UDFCoercionExt>(
             .map(|f| f.data_type())
             .cloned()
             .collect::<Vec<_>>();
-        plan_datafusion_err!(
-            "{}. {}",
-            match err {
-                DataFusionError::Plan(msg) => msg,
-                err => err.to_string(),
-            },
-            utils::generate_signature_error_message(
-                function.name(),
-                function.signature(),
-                &data_types
+        let signature_message = utils::generate_signature_error_message(
+            function.name(),
+            function.signature(),
+            &data_types,
+        );
+        if contains_external_error(&err) {
+            err.context(signature_message)
+        } else {
+            plan_datafusion_err!(
+                "{}. {}",
+                match err {
+                    DataFusionError::Plan(msg) => msg,
+                    err => err.to_string(),
+                },
+                signature_message
             )
-        )
+        }
     })
 }
 
@@ -1080,6 +1087,84 @@ mod tests {
 
     use arrow::datatypes::Schema;
     use datafusion_common::{DFSchema, assert_or_internal_err};
+
+    #[test]
+    fn scalar_function_preserves_udf_coercion_error_source() {
+        #[derive(Debug)]
+        struct NestedExternalError(DataFusionError);
+
+        impl std::fmt::Display for NestedExternalError {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "typed coercion failure")
+            }
+        }
+
+        impl std::error::Error for NestedExternalError {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+
+        #[derive(Debug, PartialEq, Eq, Hash)]
+        struct CoercionUdf {
+            signature: crate::Signature,
+            nested: bool,
+        }
+
+        impl crate::ScalarUDFImpl for CoercionUdf {
+            fn name(&self) -> &str {
+                "coercion_udf"
+            }
+
+            fn signature(&self) -> &crate::Signature {
+                &self.signature
+            }
+
+            fn coerce_types(&self, _arg_types: &[DataType]) -> Result<Vec<DataType>> {
+                if self.nested {
+                    Err(DataFusionError::External(Box::new(NestedExternalError(
+                        DataFusionError::Plan("nested planning error".to_string()),
+                    ))))
+                } else {
+                    Err(DataFusionError::External(Box::new(std::io::Error::other(
+                        "typed coercion failure",
+                    ))))
+                }
+            }
+
+            fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
+                Ok(DataType::Int32)
+            }
+
+            fn invoke_with_args(
+                &self,
+                _args: crate::ScalarFunctionArgs,
+            ) -> Result<crate::ColumnarValue> {
+                unreachable!("planning must fail before invocation")
+            }
+        }
+
+        for nested in [false, true] {
+            let udf = Arc::new(crate::ScalarUDF::new_from_impl(CoercionUdf {
+                signature: crate::Signature::user_defined(crate::Volatility::Immutable),
+                nested,
+            }));
+            let error =
+                Expr::ScalarFunction(ScalarFunction::new_udf(udf, vec![lit(1i32)]))
+                    .to_field(&DFSchema::empty())
+                    .unwrap_err();
+            assert!(contains_external_error(&error), "{error:?}");
+            assert!(error.to_string().contains("typed coercion failure"));
+            if nested {
+                assert!(matches!(error.find_root(), DataFusionError::Plan(_)));
+            } else {
+                let DataFusionError::External(source) = error.find_root() else {
+                    panic!("expected original external error, got {error:?}");
+                };
+                assert!(source.downcast_ref::<std::io::Error>().is_some());
+            }
+        }
+    }
 
     #[test]
     fn scalar_function_preserves_udf_supplied_diagnostic() {

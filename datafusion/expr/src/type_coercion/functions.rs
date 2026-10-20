@@ -31,7 +31,8 @@ use datafusion_common::utils::{
     ListCoercion, base_type, coerced_fixed_size_list_to_list,
 };
 use datafusion_common::{
-    Result, exec_err, internal_err, plan_err, types::NativeType, utils::list_ndims,
+    DataFusionError, Result, exec_err, internal_err, plan_err, types::NativeType,
+    utils::list_ndims,
 };
 use datafusion_expr_common::signature::{
     ArrayFunctionArgument, EncodingPreservation, TypeSignatureClass,
@@ -44,6 +45,20 @@ use datafusion_expr_common::{
 };
 use itertools::Itertools as _;
 use std::sync::Arc;
+
+pub(crate) fn contains_external_error(error: &DataFusionError) -> bool {
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(source) = current {
+        if matches!(
+            source.downcast_ref::<DataFusionError>(),
+            Some(DataFusionError::External(_))
+        ) {
+            return true;
+        }
+        current = source.source();
+    }
+    false
+}
 
 /// Extension trait to unify common functionality between [`ScalarUDF`], [`AggregateUDF`]
 /// and [`WindowUDF`] for use by signature coercion functions.
@@ -538,6 +553,12 @@ fn get_valid_types_with_udf<F: UDFCoercionExt>(
         TypeSignature::UserDefined => match func.coerce_types(current_types) {
             Ok(coerced_types) => vec![coerced_types],
             Err(e) => {
+                if contains_external_error(&e) {
+                    return Err(e.context(format!(
+                        "Function '{}' user-defined coercion failed",
+                        func.name()
+                    )));
+                }
                 return exec_err!(
                     "Function '{}' user-defined coercion failed with: {}",
                     func.name(),
