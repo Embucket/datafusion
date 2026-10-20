@@ -1662,6 +1662,370 @@ impl LogicalPlan {
     }
 }
 
+fn bound_source_is_null_literal(source: &LogicalPlan, index: usize) -> Result<bool> {
+    enum Node<'a> {
+        Plan(&'a LogicalPlan, usize),
+        Expr(&'a Expr, Option<&'a LogicalPlan>),
+    }
+    let mut pending = vec![Node::Plan(source, index)];
+    while let Some(node) = pending.pop() {
+        match node {
+            Node::Plan(plan, index) => match plan {
+                LogicalPlan::Projection(node) => {
+                    let Some(expr) = node.expr.get(index) else {
+                        return Ok(false);
+                    };
+                    pending.push(Node::Expr(expr, Some(node.input.as_ref())));
+                }
+                LogicalPlan::Values(node) => {
+                    for row in &node.values {
+                        let Some(expr) = row.get(index) else {
+                            return Ok(false);
+                        };
+                        pending.push(Node::Expr(expr, None));
+                    }
+                }
+                LogicalPlan::Filter(node) => pending.push(Node::Plan(&node.input, index)),
+                LogicalPlan::Limit(node) => pending.push(Node::Plan(&node.input, index)),
+                LogicalPlan::Sort(node) => pending.push(Node::Plan(&node.input, index)),
+                LogicalPlan::SubqueryAlias(node) => {
+                    pending.push(Node::Plan(&node.input, index));
+                }
+                LogicalPlan::Subquery(node) => {
+                    pending.push(Node::Plan(&node.subquery, index));
+                }
+                LogicalPlan::Repartition(node) => {
+                    pending.push(Node::Plan(&node.input, index));
+                }
+                LogicalPlan::Distinct(node) => {
+                    pending.push(Node::Plan(node.input(), index));
+                }
+                LogicalPlan::Join(node) => {
+                    let column = Column::from(plan.schema().qualified_field(index));
+                    if let Some(index) = node.left.schema().maybe_index_of_column(&column)
+                    {
+                        pending.push(Node::Plan(&node.left, index));
+                    } else if let Some(index) =
+                        node.right.schema().maybe_index_of_column(&column)
+                    {
+                        pending.push(Node::Plan(&node.right, index));
+                    } else {
+                        return Ok(false);
+                    }
+                }
+                LogicalPlan::Aggregate(node) => {
+                    let expr = node.group_expr.get(index).or_else(|| {
+                        index
+                            .checked_sub(node.group_expr.len())
+                            .and_then(|index| node.aggr_expr.get(index))
+                    });
+                    let Some(expr) = expr else {
+                        return Ok(false);
+                    };
+                    pending.push(Node::Expr(expr, Some(node.input.as_ref())));
+                }
+                LogicalPlan::Window(node) => {
+                    let input_len = node.input.schema().fields().len();
+                    if index < input_len {
+                        pending.push(Node::Plan(node.input.as_ref(), index));
+                    } else if let Some(expr) = node.window_expr.get(index - input_len) {
+                        pending.push(Node::Expr(expr, Some(node.input.as_ref())));
+                    } else {
+                        return Ok(false);
+                    }
+                }
+                LogicalPlan::Union(node) => {
+                    pending
+                        .extend(node.inputs.iter().map(|input| Node::Plan(input, index)));
+                }
+                _ => return Ok(false),
+            },
+            Node::Expr(expr, input) => match expr {
+                Expr::Alias(alias) => pending.push(Node::Expr(&alias.expr, input)),
+                Expr::Column(column) => {
+                    let Some(input) = input else {
+                        return Ok(false);
+                    };
+                    let Some(index) = input.schema().maybe_index_of_column(column) else {
+                        return Ok(false);
+                    };
+                    pending.push(Node::Plan(input, index));
+                }
+                Expr::Literal(value, _) if value.is_null() => {}
+                _ => return Ok(false),
+            },
+        }
+    }
+    Ok(true)
+}
+
+fn bound_source_incompatible_branch_type(
+    source: &LogicalPlan,
+    index: usize,
+) -> Result<Option<DataType>> {
+    enum Node<'a> {
+        Plan(&'a LogicalPlan, usize),
+        Expr(&'a Expr, Option<&'a LogicalPlan>),
+    }
+    let mut pending = vec![(Node::Plan(source, index), 0)];
+    while let Some((node, depth)) = pending.pop() {
+        if depth > 256 {
+            return plan_err!("OBJECT INSERT source is too deeply nested");
+        }
+        match node {
+            Node::Plan(plan, index) => {
+                let field = plan.schema().field(index);
+                let passes_through_source = match plan {
+                    LogicalPlan::Union(_)
+                    | LogicalPlan::Filter(_)
+                    | LogicalPlan::Limit(_)
+                    | LogicalPlan::Sort(_)
+                    | LogicalPlan::SubqueryAlias(_)
+                    | LogicalPlan::Subquery(_)
+                    | LogicalPlan::Repartition(_)
+                    | LogicalPlan::Distinct(_)
+                    | LogicalPlan::Join(_) => true,
+                    LogicalPlan::Projection(node) => {
+                        node.expr.get(index).is_some_and(|expr| {
+                            let mut expr = expr;
+                            while let Expr::Alias(alias) = expr {
+                                expr = alias.expr.as_ref();
+                            }
+                            matches!(expr, Expr::Column(_))
+                        })
+                    }
+                    LogicalPlan::Aggregate(node) => node
+                        .group_expr
+                        .get(index)
+                        .is_some_and(|expr| matches!(expr, Expr::Column(_))),
+                    LogicalPlan::Window(node) => {
+                        index < node.input.schema().fields().len()
+                    }
+                    _ => false,
+                };
+                if field.data_type() != &DataType::Null && !passes_through_source {
+                    if field.extension_type_name() != Some("arrow.parquet.variant")
+                        && !field
+                            .metadata()
+                            .get("embucket.snowflake_logical_type")
+                            .is_some_and(|logical_type| logical_type == "OBJECT")
+                        && !bound_source_is_null_literal(plan, index)?
+                    {
+                        return Ok(Some(field.data_type().clone()));
+                    }
+                    continue;
+                }
+                match plan {
+                    LogicalPlan::Projection(node) => {
+                        if let Some(expr) = node.expr.get(index) {
+                            pending.push((
+                                Node::Expr(expr, Some(node.input.as_ref())),
+                                depth + 1,
+                            ));
+                        }
+                    }
+                    LogicalPlan::Filter(node) => {
+                        pending.push((Node::Plan(node.input.as_ref(), index), depth + 1));
+                    }
+                    LogicalPlan::Limit(node) => {
+                        pending.push((Node::Plan(node.input.as_ref(), index), depth + 1));
+                    }
+                    LogicalPlan::Sort(node) => {
+                        pending.push((Node::Plan(node.input.as_ref(), index), depth + 1));
+                    }
+                    LogicalPlan::SubqueryAlias(node) => {
+                        pending.push((Node::Plan(node.input.as_ref(), index), depth + 1));
+                    }
+                    LogicalPlan::Subquery(node) => {
+                        pending
+                            .push((Node::Plan(node.subquery.as_ref(), index), depth + 1));
+                    }
+                    LogicalPlan::Repartition(node) => {
+                        pending.push((Node::Plan(node.input.as_ref(), index), depth + 1));
+                    }
+                    LogicalPlan::Distinct(node) => {
+                        pending
+                            .push((Node::Plan(node.input().as_ref(), index), depth + 1));
+                    }
+                    LogicalPlan::Union(node) => {
+                        pending.extend(
+                            node.inputs.iter().map(|input| {
+                                (Node::Plan(input.as_ref(), index), depth + 1)
+                            }),
+                        );
+                    }
+                    LogicalPlan::Join(node) => {
+                        let column = Column::from(plan.schema().qualified_field(index));
+                        if let Some(index) =
+                            node.left.schema().maybe_index_of_column(&column)
+                        {
+                            pending
+                                .push((Node::Plan(node.left.as_ref(), index), depth + 1));
+                        } else if let Some(index) =
+                            node.right.schema().maybe_index_of_column(&column)
+                        {
+                            pending.push((
+                                Node::Plan(node.right.as_ref(), index),
+                                depth + 1,
+                            ));
+                        }
+                    }
+                    LogicalPlan::Aggregate(node) => {
+                        let expr = node.group_expr.get(index).or_else(|| {
+                            index
+                                .checked_sub(node.group_expr.len())
+                                .and_then(|index| node.aggr_expr.get(index))
+                        });
+                        if let Some(expr) = expr {
+                            pending.push((
+                                Node::Expr(expr, Some(node.input.as_ref())),
+                                depth + 1,
+                            ));
+                        }
+                    }
+                    LogicalPlan::Window(node) => {
+                        let input_len = node.input.schema().fields().len();
+                        if index < input_len {
+                            pending.push((
+                                Node::Plan(node.input.as_ref(), index),
+                                depth + 1,
+                            ));
+                        } else if let Some(expr) = node.window_expr.get(index - input_len)
+                        {
+                            pending.push((
+                                Node::Expr(expr, Some(node.input.as_ref())),
+                                depth + 1,
+                            ));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Node::Expr(expr, input) => match expr {
+                Expr::Column(column) => {
+                    if let Some(input) = input
+                        && let Some(index) = input.schema().maybe_index_of_column(column)
+                    {
+                        pending.push((Node::Plan(input, index), depth + 1));
+                    }
+                }
+                Expr::ScalarSubquery(node) => {
+                    pending.push((Node::Plan(node.subquery.as_ref(), 0), depth + 1));
+                }
+                Expr::Case(case) => {
+                    pending.extend(case.when_then_expr.iter().map(|(_, value)| {
+                        (Node::Expr(value.as_ref(), input), depth + 1)
+                    }));
+                    pending.extend(
+                        case.else_expr
+                            .as_deref()
+                            .map(|expr| (Node::Expr(expr, input), depth + 1)),
+                    );
+                }
+                _ => {
+                    expr.apply_children(|child| {
+                        pending.push((Node::Expr(child, input), depth + 1));
+                        Ok(TreeNodeRecursion::Continue)
+                    })?;
+                }
+            },
+        }
+    }
+    Ok(None)
+}
+
+fn validate_bound_object_insert_source(dml: &DmlStatement) -> Result<()> {
+    if !matches!(dml.op, WriteOp::Insert(_)) {
+        return Ok(());
+    }
+    let LogicalPlan::Projection(projection) = dml.input.as_ref() else {
+        return Ok(());
+    };
+    if matches!(projection.input.as_ref(), LogicalPlan::Values(_)) {
+        return Ok(());
+    }
+    for (index, target_field) in dml.target.schema().fields().iter().enumerate() {
+        if target_field.data_type() != &DataType::Utf8
+            || !target_field
+                .metadata()
+                .get("embucket.snowflake_logical_type")
+                .is_some_and(|logical_type| logical_type == "OBJECT")
+        {
+            continue;
+        }
+        let Some(mut expr) = projection.expr.get(index) else {
+            continue;
+        };
+        loop {
+            expr = match expr {
+                Expr::Alias(alias) => alias.expr.as_ref(),
+                Expr::Cast(cast) => cast.expr.as_ref(),
+                _ => break,
+            };
+        }
+        let Expr::Column(column) = expr else {
+            continue;
+        };
+        let source_schema = projection.input.schema();
+        let source_index = source_schema.index_of_column(column)?;
+        let source_field = source_schema.field(source_index);
+        let source_is_object = source_field.extension_type_name()
+            == Some("arrow.parquet.variant")
+            || source_field
+                .metadata()
+                .get("embucket.snowflake_logical_type")
+                .is_some_and(|logical_type| logical_type == "OBJECT");
+        let incompatible_branch_type = bound_source_incompatible_branch_type(
+            projection.input.as_ref(),
+            source_index,
+        )?;
+        if (!source_is_object
+            && source_field.data_type() != &DataType::Null
+            && !bound_source_is_null_literal(projection.input.as_ref(), source_index)?)
+            || incompatible_branch_type.is_some()
+        {
+            return plan_err!(
+                "Cannot implicitly convert {} to OBJECT; use TO_OBJECT",
+                incompatible_branch_type
+                    .as_ref()
+                    .unwrap_or_else(|| source_field.data_type())
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_bound_object_union(union: &Union) -> Result<()> {
+    for index in 0..union.schema.fields().len() {
+        let has_object = union.inputs.iter().any(|input| {
+            input
+                .schema()
+                .field(index)
+                .metadata()
+                .get("embucket.snowflake_logical_type")
+                .is_some_and(|logical_type| logical_type == "OBJECT")
+        });
+        if !has_object {
+            continue;
+        }
+        for input in &union.inputs {
+            let field = input.schema().field(index);
+            let logical_type = field.metadata().get("embucket.snowflake_logical_type");
+            if field.data_type() != &DataType::Null
+                && logical_type.is_none_or(|logical_type| logical_type != "OBJECT")
+                && !(field.extension_type_name() == Some("arrow.parquet.variant")
+                    && logical_type.is_none_or(|logical_type| logical_type != "ARRAY"))
+            {
+                return plan_err!(
+                    "inconsistent data type for result columns for set operator input branches: OBJECT and {}",
+                    field.data_type()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 impl LogicalPlan {
     /// Return a `LogicalPlan` with all placeholders (e.g $1 $2,
     /// ...) replaced with corresponding values provided in
@@ -1686,10 +2050,32 @@ impl LogicalPlan {
                 } else {
                     let original_name = name_preserver.save(&e);
                     let transformed_expr = e.transform_up(|e| {
-                        if let Expr::Placeholder(Placeholder { id, .. }) = e {
+                        if let Expr::Placeholder(Placeholder { id, field }) = e {
                             let (value, metadata) = param_values
                                 .get_placeholders_with_values(&id)?
                                 .into_inner();
+                            if field.as_ref().is_some_and(|field| {
+                                field
+                                    .metadata()
+                                    .get("embucket.snowflake_logical_type")
+                                    .is_some_and(|logical_type| logical_type == "OBJECT")
+                            }) && !value.is_null()
+                                && !metadata.as_ref().is_some_and(|metadata| {
+                                    metadata
+                                        .inner()
+                                        .get("embucket.snowflake_logical_type")
+                                        .is_some_and(|logical_type| logical_type == "OBJECT")
+                                        || metadata
+                                            .inner()
+                                            .get("ARROW:extension:name")
+                                            .is_some_and(|extension| extension == "arrow.parquet.variant")
+                                })
+                            {
+                                return plan_err!(
+                                    "Cannot implicitly convert {} to OBJECT; use TO_OBJECT",
+                                    value.data_type()
+                                );
+                            }
                             Ok(Transformed::yes(Expr::Literal(value, metadata)))
                         } else {
                             Ok(Transformed::no(e))
@@ -1699,7 +2085,15 @@ impl LogicalPlan {
                     Ok(transformed_expr.update_data(|expr| original_name.restore(expr)))
                 }
             })?
-            .map_data(|plan| plan.update_schema_data_type())
+            .map_data(|plan| {
+                let plan = plan.update_schema_data_type()?;
+                if let LogicalPlan::Dml(dml) = &plan {
+                    validate_bound_object_insert_source(dml)?;
+                } else if let LogicalPlan::Union(union) = &plan {
+                    validate_bound_object_union(union)?;
+                }
+                Ok(plan)
+            })
         })
         .map(|res| res.data)
     }

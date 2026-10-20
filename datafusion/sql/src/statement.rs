@@ -2972,6 +2972,21 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                             .metadata()
                             .get("embucket.snowflake_logical_type")
                             .is_some_and(|value| value == "OBJECT");
+                        let source_is_object_variant_union = target_is_object
+                            && target_field.data_type() == &arrow::datatypes::DataType::Utf8
+                            && !source_is_values
+                            && crate::values::object_output_is_object_variant_union(&source, v)?;
+                        if target_is_object
+                            && target_field.data_type() == &arrow::datatypes::DataType::Utf8
+                            && !source_is_values
+                            && source_field.data_type()
+                                == &arrow::datatypes::DataType::Null
+                            && crate::values::object_output_has_placeholder(&source, v)?
+                        {
+                            plan_err!(
+                                "Cannot insert an untyped bound parameter into OBJECT from SELECT"
+                            )?;
+                        }
                         let source_is_text = matches!(
                             source_field.data_type(),
                             arrow::datatypes::DataType::Utf8
@@ -2987,20 +3002,26 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                         if target_is_object
                             && target_field.data_type() == &arrow::datatypes::DataType::Utf8
                             && !source_is_values
-                            && source_is_text
+                            && source_field.data_type()
+                                != &arrow::datatypes::DataType::Null
+                            && source_field.extension_type_name()
+                                != Some("arrow.parquet.variant")
+                            && !source_is_object_variant_union
                             && !source_field
                                 .metadata()
                                 .get("embucket.snowflake_logical_type")
                                 .is_some_and(|value| value == "OBJECT")
                         {
                             plan_err!(
-                                "Cannot implicitly convert text to OBJECT during INSERT; use TO_OBJECT"
+                                "Cannot implicitly convert {} to OBJECT during INSERT; use TO_OBJECT",
+                                source_field.data_type()
                             )?;
                         }
                         let expr = if target_is_object
                             && target_field.data_type() == &arrow::datatypes::DataType::Utf8
-                            && source_field.extension_type_name()
+                            && (source_field.extension_type_name()
                                 == Some("arrow.parquet.variant")
+                                || source_is_object_variant_union)
                         {
                             let to_object = self
                                 .context_provider
