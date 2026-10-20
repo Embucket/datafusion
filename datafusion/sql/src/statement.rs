@@ -2968,6 +2968,10 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                             .metadata()
                             .get("embucket.snowflake_logical_type")
                             .is_some_and(|value| value == "ARRAY");
+                        let target_is_object = target_field
+                            .metadata()
+                            .get("embucket.snowflake_logical_type")
+                            .is_some_and(|value| value == "OBJECT");
                         let source_is_text = matches!(
                             source_field.data_type(),
                             arrow::datatypes::DataType::Utf8
@@ -2980,7 +2984,22 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                                 | arrow::datatypes::DataType::LargeList(_)
                                 | arrow::datatypes::DataType::FixedSizeList(_, _)
                         );
-                        let expr = if target_field.extension_type_name()
+                        let expr = if target_is_object
+                            && target_field.data_type() == &arrow::datatypes::DataType::Utf8
+                            && source_field.extension_type_name()
+                                == Some("arrow.parquet.variant")
+                        {
+                            let to_object = self
+                                .context_provider
+                                .get_function_meta("to_object")
+                                .ok_or_else(|| {
+                                    DataFusionError::Plan(
+                                        "to_object is required to insert VARIANT into OBJECT storage"
+                                            .to_string(),
+                                    )
+                                })?;
+                            Expr::ScalarFunction(ScalarFunction::new_udf(to_object, vec![expr]))
+                        } else if target_field.extension_type_name()
                             == Some("arrow.parquet.variant")
                             && source_field.data_type() != target_field.data_type()
                             && (source_is_array

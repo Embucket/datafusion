@@ -870,6 +870,35 @@ fn plan_insert_converts_tagged_array_to_variant_storage() -> Result<()> {
 }
 
 #[test]
+fn plan_insert_converts_variant_to_untyped_object_storage() -> Result<()> {
+    let state = mock_session_state().with_scalar_function(Arc::new(make_udf(
+        "to_object",
+        vec![variant_storage_type()],
+        DataType::Utf8,
+    )));
+    let plan = logical_plan_from_state(
+        "INSERT INTO untyped_object_target SELECT items FROM plain_variant_target",
+        &SnowflakeDialect {},
+        ParserOptions::default(),
+        state,
+    )?;
+    assert_contains!(
+        plan.display_indent().to_string(),
+        "to_object(plain_variant_target.items)"
+    );
+    Ok(())
+}
+
+#[test]
+fn plan_insert_keeps_untyped_object_text_fast_path() -> Result<()> {
+    let plan = logical_plan(
+        "INSERT INTO untyped_object_target SELECT items FROM plain_string_source",
+    )?;
+    assert!(!plan.display_indent().to_string().contains("to_object("));
+    Ok(())
+}
+
+#[test]
 fn plan_insert_uses_explicit_array_conversion_for_untagged_text() -> Result<()> {
     let state = mock_session_state().with_scalar_function(Arc::new(make_udf(
         "__rustice_array_to_variant",
