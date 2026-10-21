@@ -227,24 +227,41 @@ impl From<&str> for NullOrdering {
 }
 
 /// Ident Normalizer
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct IdentNormalizer {
     normalize: bool,
+    uppercase_unquoted: bool,
 }
 
 impl Default for IdentNormalizer {
     fn default() -> Self {
-        Self { normalize: true }
+        Self {
+            normalize: true,
+            uppercase_unquoted: false,
+        }
     }
 }
 
 impl IdentNormalizer {
     pub fn new(normalize: bool) -> Self {
-        Self { normalize }
+        Self {
+            normalize,
+            uppercase_unquoted: false,
+        }
+    }
+
+    /// Creates a normalizer with optional uppercase folding for unquoted identifiers.
+    pub fn new_with_uppercase(normalize: bool, uppercase_unquoted: bool) -> Self {
+        Self {
+            normalize,
+            uppercase_unquoted,
+        }
     }
 
     pub fn normalize(&self, ident: Ident) -> String {
-        if self.normalize {
+        if self.normalize && self.uppercase_unquoted && ident.quote_style.is_none() {
+            ident.value.to_ascii_uppercase()
+        } else if self.normalize {
             crate::utils::normalize_ident(ident)
         } else {
             ident.value
@@ -480,15 +497,19 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
 
     /// Create a new query planner with the given parser options.
     ///
-    /// The query planner ignores the parser options from the context provider
-    /// and uses the given parser options instead.
+    /// The query planner uses the given parser options and takes identifier case
+    /// folding from the context provider's SQL parser configuration.
     pub fn new_with_options(context_provider: &'a S, options: ParserOptions) -> Self {
-        let ident_normalize = options.enable_ident_normalization;
-
         SqlToRel {
             context_provider,
+            ident_normalizer: IdentNormalizer::new_with_uppercase(
+                options.enable_ident_normalization,
+                context_provider
+                    .options()
+                    .sql_parser
+                    .uppercase_unquoted_identifiers,
+            ),
             options,
-            ident_normalizer: IdentNormalizer::new(ident_normalize),
             warnings: Mutex::new(vec![]),
         }
     }
@@ -928,10 +949,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
         &self,
         object_name: ObjectName,
     ) -> Result<TableReference> {
-        object_name_to_table_reference(
-            object_name,
-            self.options.enable_ident_normalization,
-        )
+        object_name_to_table_reference_with_normalizer(object_name, self.ident_normalizer)
     }
 }
 
@@ -949,6 +967,17 @@ pub fn object_name_to_table_reference(
     object_name: ObjectName,
     enable_normalization: bool,
 ) -> Result<TableReference> {
+    object_name_to_table_reference_with_normalizer(
+        object_name,
+        IdentNormalizer::new(enable_normalization),
+    )
+}
+
+/// Create a table reference with a caller-selected identifier normalization policy.
+pub fn object_name_to_table_reference_with_normalizer(
+    object_name: ObjectName,
+    normalizer: IdentNormalizer,
+) -> Result<TableReference> {
     // Use destructure to make it clear no fields on ObjectName are ignored
     let ObjectName(object_name_parts) = object_name;
     let idents = object_name_parts
@@ -962,7 +991,7 @@ pub fn object_name_to_table_reference(
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    idents_to_table_reference(idents, enable_normalization)
+    idents_to_table_reference(idents, normalizer)
 }
 
 struct IdentTaker {
@@ -973,11 +1002,8 @@ struct IdentTaker {
 /// Take the next identifier from the back of idents, panic'ing if
 /// there are none left
 impl IdentTaker {
-    fn new(idents: Vec<Ident>, enable_normalization: bool) -> Self {
-        Self {
-            normalizer: IdentNormalizer::new(enable_normalization),
-            idents,
-        }
+    fn new(idents: Vec<Ident>, normalizer: IdentNormalizer) -> Self {
+        Self { normalizer, idents }
     }
 
     fn take(&mut self) -> String {
@@ -1010,9 +1036,9 @@ impl std::fmt::Display for IdentTaker {
 /// Create a [`TableReference`] after normalizing the specified identifier
 pub(crate) fn idents_to_table_reference(
     idents: Vec<Ident>,
-    enable_normalization: bool,
+    normalizer: IdentNormalizer,
 ) -> Result<TableReference> {
-    let mut taker = IdentTaker::new(idents, enable_normalization);
+    let mut taker = IdentTaker::new(idents, normalizer);
 
     match taker.len() {
         1 => {
@@ -1044,8 +1070,18 @@ pub fn object_name_to_qualifier(
     sql_table_name: &ObjectName,
     enable_normalization: bool,
 ) -> Result<String> {
+    object_name_to_qualifier_with_normalizer(
+        sql_table_name,
+        IdentNormalizer::new(enable_normalization),
+    )
+}
+
+/// Construct an information-schema qualifier using the selected identifier policy.
+pub fn object_name_to_qualifier_with_normalizer(
+    sql_table_name: &ObjectName,
+    normalizer: IdentNormalizer,
+) -> Result<String> {
     let columns = vec!["table_name", "table_schema", "table_catalog"].into_iter();
-    let normalizer = IdentNormalizer::new(enable_normalization);
     sql_table_name
         .0
         .iter()

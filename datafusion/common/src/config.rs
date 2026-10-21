@@ -275,8 +275,16 @@ config_namespace! {
         /// For example, `10.00` is planned as `DECIMAL(2, 0)` instead of `DECIMAL(4, 2)`.
         pub trim_decimal_literal_trailing_zeros: bool, default = false
 
-        /// When set to true, SQL parser will normalize ident (convert ident to lowercase when not quoted)
+        /// When set to true, normalize unquoted identifiers to lowercase by default.
         pub enable_ident_normalization: bool, default = true
+
+        /// When identifier normalization is enabled, fold unquoted relation, schema,
+        /// column, and CTE identifiers to uppercase instead of lowercase. Quoted
+        /// identifiers retain their exact spelling. Set this when creating the session;
+        /// SQL SET/RESET cannot change it later. Catalogs and schemas used by SQL should
+        /// be registered under their uppercase names. Function names still follow the
+        /// existing function-registry lookup rules.
+        pub uppercase_unquoted_identifiers: bool, default = false
 
         /// When set to true, SQL parser will normalize options value (convert value to lowercase).
         /// Note that this option is ignored and will be removed in the future. All case-insensitive values

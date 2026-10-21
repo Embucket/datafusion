@@ -25,7 +25,8 @@ use crate::parser::{
     LexOrdering, ResetStatement, Statement as DFStatement,
 };
 use crate::planner::{
-    ContextProvider, PlannerContext, SqlToRel, object_name_to_qualifier,
+    ContextProvider, IdentNormalizer, PlannerContext, SqlToRel,
+    object_name_to_qualifier_with_normalizer,
 };
 use crate::utils::normalize_ident;
 
@@ -72,7 +73,10 @@ use sqlparser::ast::{
     ShowStatementFilter, Statement, TableConstraint, TableFactor, TableWithJoins,
     TransactionMode, UnaryOperator, Value,
 };
+use sqlparser::dialect::dialect_from_str;
+use sqlparser::parser::Parser;
 use sqlparser::parser::ParserError::ParserError;
+use sqlparser::tokenizer::Token;
 
 fn ident_to_string(ident: &Ident) -> String {
     normalize_ident(ident.to_owned())
@@ -93,14 +97,46 @@ pub fn object_name_to_string(object_name: &ObjectName) -> String {
         .join(".")
 }
 
-fn get_schema_name(schema_name: &SchemaName) -> String {
+fn object_name_to_string_with_normalizer(
+    object_name: &ObjectName,
+    normalizer: IdentNormalizer,
+) -> String {
+    object_name
+        .0
+        .iter()
+        .map(|part| {
+            part.as_ident()
+                .map_or_else(String::new, |ident| normalizer.normalize(ident.clone()))
+        })
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+fn normalize_partition_column_name(
+    name: &str,
+    normalizer: IdentNormalizer,
+    dialect_name: &datafusion_common::config::Dialect,
+) -> Result<String> {
+    let dialect = dialect_from_str(dialect_name)
+        .ok_or_else(|| plan_datafusion_err!("Unsupported SQL dialect: {dialect_name}"))?;
+    let mut parser = Parser::new(dialect.as_ref()).try_with_sql(name)?;
+    let ident = parser.parse_identifier()?;
+    if parser.peek_token().token != Token::EOF {
+        return plan_err!("Invalid partition column name: {name}");
+    }
+    Ok(normalizer.normalize(ident))
+}
+
+fn get_schema_name(schema_name: &SchemaName, normalizer: IdentNormalizer) -> String {
     match schema_name {
-        SchemaName::Simple(schema_name) => object_name_to_string(schema_name),
-        SchemaName::UnnamedAuthorization(auth) => ident_to_string(auth),
+        SchemaName::Simple(schema_name) => {
+            object_name_to_string_with_normalizer(schema_name, normalizer)
+        }
+        SchemaName::UnnamedAuthorization(auth) => normalizer.normalize(auth.clone()),
         SchemaName::NamedAuthorization(schema_name, auth) => format!(
             "{}.{}",
-            object_name_to_string(schema_name),
-            ident_to_string(auth)
+            object_name_to_string_with_normalizer(schema_name, normalizer),
+            normalizer.normalize(auth.clone())
         ),
     }
 }
@@ -737,7 +773,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 ..
             } => Ok(LogicalPlan::Ddl(DdlStatement::CreateCatalogSchema(
                 CreateCatalogSchema {
-                    schema_name: get_schema_name(&schema_name),
+                    schema_name: get_schema_name(&schema_name, self.ident_normalizer),
                     if_not_exists,
                     schema: Arc::new(DFSchema::empty()),
                 },
@@ -748,7 +784,10 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 ..
             } => Ok(LogicalPlan::Ddl(DdlStatement::CreateCatalog(
                 CreateCatalog {
-                    catalog_name: object_name_to_string(&db_name),
+                    catalog_name: object_name_to_string_with_normalizer(
+                        &db_name,
+                        self.ident_normalizer,
+                    ),
                     if_not_exists,
                     schema: Arc::new(DFSchema::empty()),
                 },
@@ -860,7 +899,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 }
 
                 Ok(LogicalPlan::Statement(PlanStatement::Prepare(Prepare {
-                    name: ident_to_string(&name),
+                    name: self.ident_normalizer.normalize(name),
                     fields,
                     input: Arc::new(plan),
                 })))
@@ -912,7 +951,10 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     .collect::<Result<Vec<Expr>>>()?;
 
                 Ok(LogicalPlan::Statement(PlanStatement::Execute(Execute {
-                    name: object_name_to_string(&name),
+                    name: object_name_to_string_with_normalizer(
+                        &name,
+                        self.ident_normalizer,
+                    ),
                     parameters,
                 })))
             }
@@ -922,7 +964,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 prepare: _,
             } => Ok(LogicalPlan::Statement(PlanStatement::Deallocate(
                 Deallocate {
-                    name: ident_to_string(&name),
+                    name: self.ident_normalizer.normalize(name),
                 },
             ))),
 
@@ -1685,12 +1727,12 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         let copy_source = statement.source;
         let (input, input_schema, table_ref) = match copy_source {
             CopyToSource::Relation(object_name) => {
-                let table_name = object_name_to_string(&object_name);
                 let table_ref = self.object_name_to_table_reference(object_name)?;
                 let table_source =
                     self.context_provider.get_table_source(table_ref.clone())?;
                 let plan =
-                    LogicalPlanBuilder::scan(table_name, table_source, None)?.build()?;
+                    LogicalPlanBuilder::scan(table_ref.clone(), table_source, None)?
+                        .build()?;
                 let input_schema = Arc::clone(plan.schema());
                 (plan, input_schema, Some(table_ref))
             }
@@ -1733,7 +1775,14 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         let partition_by = statement
             .partitioned_by
             .iter()
-            .map(|col| input_schema.field_with_name(table_ref.as_ref(), col))
+            .map(|col| {
+                let name = normalize_partition_column_name(
+                    col,
+                    self.ident_normalizer,
+                    &self.context_provider.options().sql_parser.dialect,
+                )?;
+                input_schema.field_with_name(table_ref.as_ref(), &name)
+            })
             .collect::<Result<Vec<_>>>()?
             .into_iter()
             .map(|f| f.name().to_owned())
@@ -1861,6 +1910,16 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             self.build_order_by(order_exprs, &df_schema, &mut planner_context)?;
 
         let name = self.object_name_to_table_reference(name)?;
+        let table_partition_cols = table_partition_cols
+            .iter()
+            .map(|column| {
+                normalize_partition_column_name(
+                    column,
+                    self.ident_normalizer,
+                    &self.context_provider.options().sql_parser.dialect,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
         let constraints =
             self.new_constraint_from_table_constraints(&all_constraints, &df_schema)?;
 
@@ -3118,9 +3177,9 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         sql_table_name: ObjectName,
     ) -> Result<LogicalPlan> {
         // Figure out the where clause
-        let where_clause = object_name_to_qualifier(
+        let where_clause = object_name_to_qualifier_with_normalizer(
             &sql_table_name,
-            self.options.enable_ident_normalization,
+            self.ident_normalizer,
         )?;
 
         if !self.has_table("information_schema", "columns") {
@@ -3277,9 +3336,9 @@ FROM (
             );
         }
         // Figure out the where clause
-        let where_clause = object_name_to_qualifier(
+        let where_clause = object_name_to_qualifier_with_normalizer(
             &sql_table_name,
-            self.options.enable_ident_normalization,
+            self.ident_normalizer,
         )?;
 
         // Do a table lookup to verify the table exists
@@ -3298,8 +3357,8 @@ FROM (
     /// Return true if there is a table provider available for "schema.table"
     fn has_table(&self, schema: &str, table: &str) -> bool {
         let tables_reference = TableReference::Partial {
-            schema: schema.into(),
-            table: table.into(),
+            schema: self.ident_normalizer.normalize(Ident::new(schema)).into(),
+            table: self.ident_normalizer.normalize(Ident::new(table)).into(),
         };
         self.context_provider
             .get_table_source(tables_reference)

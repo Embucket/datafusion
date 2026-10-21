@@ -1111,6 +1111,14 @@ impl SessionContext {
             variable, value, ..
         } = stmt;
 
+        if variable
+            .eq_ignore_ascii_case("datafusion.sql_parser.uppercase_unquoted_identifiers")
+        {
+            return exec_err!(
+                "uppercase_unquoted_identifiers must be configured when creating the session"
+            );
+        }
+
         // Check if this is a runtime configuration
         if variable.starts_with("datafusion.runtime.") {
             self.set_runtime_variable(&variable, &value)?;
@@ -1143,6 +1151,13 @@ impl SessionContext {
 
     fn reset_variable(&self, stmt: ResetVariable) -> Result<()> {
         let variable = stmt.variable;
+        if variable
+            .eq_ignore_ascii_case("datafusion.sql_parser.uppercase_unquoted_identifiers")
+        {
+            return exec_err!(
+                "uppercase_unquoted_identifiers must be configured when creating the session"
+            );
+        }
         if variable.starts_with("datafusion.runtime.") {
             return self.reset_runtime_variable(&variable);
         }
@@ -2761,6 +2776,181 @@ mod tests {
         let results = ctx.sql("SELECT * FROM information_schema.tables WHERE table_schema='abc' AND table_name = 'y'").await.unwrap().collect().await.unwrap();
 
         assert_eq!(results[0].num_rows(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sql_uppercase_unquoted_names_preserve_distinct_quoted_schemas() -> Result<()>
+    {
+        let default_ctx = SessionContext::new_with_config(
+            SessionConfig::new()
+                .set_bool("datafusion.sql_parser.uppercase_unquoted_identifiers", true),
+        );
+        assert!(default_ctx.catalog("datafusion").is_some());
+
+        let config = SessionConfig::new()
+            .with_information_schema(true)
+            .set_str("datafusion.catalog.default_catalog", "DATAFUSION")
+            .set_str("datafusion.catalog.default_schema", "PUBLIC")
+            .set_bool("datafusion.sql_parser.uppercase_unquoted_identifiers", true);
+        let ctx = SessionContext::new_with_config(config);
+
+        for sql in [
+            "SET datafusion.sql_parser.uppercase_unquoted_identifiers = false",
+            "RESET datafusion.sql_parser.uppercase_unquoted_identifiers",
+        ] {
+            let error = ctx.sql(sql).await.err().expect("startup-only setting");
+            assert!(
+                error
+                    .to_string()
+                    .contains("must be configured when creating the session"),
+                "{sql}: {error}"
+            );
+        }
+
+        ctx.sql("CREATE SCHEMA foo").await?.collect().await?;
+        ctx.sql("CREATE SCHEMA \"foo\"").await?.collect().await?;
+        ctx.sql("CREATE TABLE foo.copy_source (p INT)")
+            .await?
+            .collect()
+            .await?;
+        let copy = ctx
+            .state()
+            .create_logical_plan(
+                "COPY foo.copy_source TO 'out.csv' STORED AS CSV PARTITIONED BY (p)",
+            )
+            .await?;
+        let LogicalPlan::Copy(copy) = copy else {
+            panic!("expected COPY plan");
+        };
+        assert_eq!(copy.partition_by, vec!["P"]);
+        ctx.sql("CREATE TABLE foo.t AS VALUES (1)")
+            .await?
+            .collect()
+            .await?;
+        ctx.sql("CREATE TABLE \"foo\".t AS VALUES (2)")
+            .await?
+            .collect()
+            .await?;
+
+        let catalog = ctx.catalog("DATAFUSION").unwrap();
+        assert!(catalog.schema("FOO").is_some());
+        assert!(catalog.schema("foo").is_some());
+        let upper = ctx.sql("SELECT * FROM foo.t").await?.collect().await?;
+        let lower = ctx.sql("SELECT * FROM \"foo\".t").await?.collect().await?;
+        assert_eq!(upper[0].num_rows(), 1);
+        assert_eq!(lower[0].num_rows(), 1);
+        assert_eq!(
+            upper[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+                .unwrap()
+                .value(0),
+            1
+        );
+        assert_eq!(
+            lower[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+                .unwrap()
+                .value(0),
+            2
+        );
+
+        let schema_rows = ctx
+            .sql(
+                "SELECT table_schema FROM information_schema.tables \
+                 WHERE table_name = 'T' AND table_schema IN ('FOO', 'foo')",
+            )
+            .await?
+            .collect()
+            .await?;
+        assert_eq!(
+            schema_rows
+                .iter()
+                .map(|batch| batch.num_rows())
+                .sum::<usize>(),
+            2
+        );
+        let shown = ctx.sql("SHOW TABLES").await?.collect().await?;
+        assert!(shown.iter().map(|batch| batch.num_rows()).sum::<usize>() >= 2);
+        let virtual_table = ctx
+            .sql(
+                "SELECT table_name FROM information_schema.tables \
+                 WHERE table_schema = 'INFORMATION_SCHEMA' AND table_name = 'TABLES'",
+            )
+            .await?
+            .collect()
+            .await?;
+        assert_eq!(
+            virtual_table
+                .iter()
+                .map(|batch| batch.num_rows())
+                .sum::<usize>(),
+            1
+        );
+        assert!(
+            ctx.sql("SELECT * FROM information_schema.\"tables\"")
+                .await
+                .is_err()
+        );
+
+        ctx.sql("CREATE SCHEMA \"information_schema\"")
+            .await?
+            .collect()
+            .await?;
+        ctx.sql("CREATE TABLE \"information_schema\".t AS VALUES (3)")
+            .await?
+            .collect()
+            .await?;
+        let physical_schema = ctx
+            .sql(
+                "SELECT table_name FROM information_schema.tables \
+                 WHERE table_schema = 'information_schema' AND table_name = 'T'",
+            )
+            .await?
+            .collect()
+            .await?;
+        assert_eq!(
+            physical_schema
+                .iter()
+                .map(|batch| batch.num_rows())
+                .sum::<usize>(),
+            1
+        );
+
+        ctx.sql("CREATE TABLE builtin_t AS VALUES (9)")
+            .await?
+            .collect()
+            .await?;
+        for sql in [
+            "SELECT * FROM builtin_t",
+            "SELECT * FROM public.builtin_t",
+            "SELECT * FROM datafusion.public.builtin_t",
+        ] {
+            let batches = ctx.sql(sql).await?.collect().await?;
+            assert_eq!(
+                batches[0]
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow::array::Int64Array>()
+                    .unwrap()
+                    .value(0),
+                9,
+                "{sql}"
+            );
+        }
+
+        ctx.sql("DROP TABLE foo.t").await?.collect().await?;
+        ctx.sql("DROP TABLE foo.copy_source")
+            .await?
+            .collect()
+            .await?;
+        ctx.sql("DROP SCHEMA foo").await?.collect().await?;
+        assert!(catalog.schema("FOO").is_none());
+        assert!(catalog.schema("foo").is_some());
         Ok(())
     }
 
