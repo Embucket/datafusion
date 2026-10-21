@@ -21,7 +21,7 @@ use std::ops::ControlFlow;
 use datafusion_common::{DataFusionError, Result};
 
 use crate::parser::{CopyToSource, CopyToStatement, Statement as DFStatement};
-use crate::planner::object_name_to_table_reference;
+use crate::planner::{IdentNormalizer, object_name_to_table_reference_with_normalizer};
 use datafusion_common::TableReference;
 use sqlparser::ast::*;
 
@@ -53,15 +53,15 @@ struct RelationVisitor {
     relations: BTreeSet<TableReference>,
     all_ctes: BTreeSet<TableReference>,
     ctes_in_scope: Vec<TableReference>,
-    enable_ident_normalization: bool,
+    normalizer: IdentNormalizer,
 }
 
 impl RelationVisitor {
     /// Record the reference to `relation`, if it's not a CTE reference.
     fn insert_relation(&mut self, relation: &ObjectName) -> ControlFlow<DataFusionError> {
-        match object_name_to_table_reference(
+        match object_name_to_table_reference_with_normalizer(
             relation.clone(),
-            self.enable_ident_normalization,
+            self.normalizer,
         ) {
             Ok(relation) => {
                 if !self.relations.contains(&relation)
@@ -96,9 +96,9 @@ impl Visitor for RelationVisitor {
                     cte.visit(self)?;
                 }
                 let cte_name = ObjectName::from(vec![cte.alias.name.clone()]);
-                match object_name_to_table_reference(
+                match object_name_to_table_reference_with_normalizer(
                     cte_name,
-                    self.enable_ident_normalization,
+                    self.normalizer,
                 ) {
                     Ok(cte_ref) => self.ctes_in_scope.push(cte_ref),
                     Err(e) => return ControlFlow::Break(e),
@@ -146,7 +146,7 @@ impl Visitor for RelationVisitor {
                     Ident::new(INFORMATION_SCHEMA),
                     Ident::new(*s),
                 ]);
-                match object_name_to_table_reference(obj, self.enable_ident_normalization)
+                match object_name_to_table_reference_with_normalizer(obj, self.normalizer)
                 {
                     Ok(tbl_ref) => {
                         self.relations.insert(tbl_ref);
@@ -228,11 +228,23 @@ pub fn resolve_table_references(
     statement: &crate::parser::Statement,
     enable_ident_normalization: bool,
 ) -> Result<(Vec<TableReference>, Vec<TableReference>)> {
+    resolve_table_references_with_uppercase(statement, enable_ident_normalization, false)
+}
+
+/// Resolve relation and CTE names with an optional uppercase-folding policy.
+pub fn resolve_table_references_with_uppercase(
+    statement: &crate::parser::Statement,
+    enable_ident_normalization: bool,
+    uppercase_unquoted_identifiers: bool,
+) -> Result<(Vec<TableReference>, Vec<TableReference>)> {
     let mut visitor = RelationVisitor {
         relations: BTreeSet::new(),
         all_ctes: BTreeSet::new(),
         ctes_in_scope: vec![],
-        enable_ident_normalization,
+        normalizer: IdentNormalizer::new_with_uppercase(
+            enable_ident_normalization,
+            uppercase_unquoted_identifiers,
+        ),
     };
 
     visit_statement(statement, &mut visitor)?;
@@ -246,6 +258,36 @@ pub fn resolve_table_references(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uppercase_unquoted_names_distinguish_quoted_relations_and_ctes() {
+        use crate::parser::DFParser;
+
+        let statement =
+            DFParser::parse_sql(r#"WITH foo AS (SELECT * FROM "foo") SELECT * FROM foo"#)
+                .unwrap()
+                .pop_back()
+                .unwrap();
+        let (relations, ctes) =
+            resolve_table_references_with_uppercase(&statement, true, true).unwrap();
+        assert_eq!(ctes, vec![TableReference::bare("FOO")]);
+        assert_eq!(relations, vec![TableReference::bare("foo")]);
+
+        let statement = DFParser::parse_sql(r#"SELECT * FROM foo JOIN "foo" ON true"#)
+            .unwrap()
+            .pop_back()
+            .unwrap();
+        let (relations, _) =
+            resolve_table_references_with_uppercase(&statement, true, true).unwrap();
+        assert_eq!(
+            relations,
+            vec![TableReference::bare("FOO"), TableReference::bare("foo")]
+        );
+
+        let (relations, _) =
+            resolve_table_references_with_uppercase(&statement, false, true).unwrap();
+        assert_eq!(relations, vec![TableReference::bare("foo")]);
+    }
 
     #[test]
     fn resolve_table_references_shadowed_cte() {

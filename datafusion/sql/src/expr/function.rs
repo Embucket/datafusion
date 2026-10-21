@@ -431,7 +431,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     FunctionArg::Unnamed(FunctionArgExpr::Expr(SQLExpr::Lambda(
                         lambda,
                     ))) => {
-                        if !all_unique(&lambda.params) {
+                        if !all_unique(&lambda.params, &self.ident_normalizer) {
                             return plan_err!(
                                 "lambda parameters names must be unique, got {}",
                                 lambda.params
@@ -993,7 +993,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         let params = lambda
             .params
             .iter()
-            .map(|p| crate::utils::normalize_ident(p.name.clone()))
+            .map(|p| self.ident_normalizer.normalize(p.name.clone()))
             .collect();
 
         let lambda_parameters = std::iter::zip(lambda_params, &params)
@@ -1265,22 +1265,23 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
     }
 }
 
-/// After normalization with [normalize_ident], check whether all params are unique
-///
-/// [normalize_ident]: crate::utils::normalize_ident
-fn all_unique(params: &[sqlparser::ast::LambdaFunctionParameter]) -> bool {
+/// Check whether all lambda parameters are unique under the active identifier policy.
+fn all_unique(
+    params: &[sqlparser::ast::LambdaFunctionParameter],
+    normalizer: &crate::planner::IdentNormalizer,
+) -> bool {
     match params.len() {
         0 | 1 => true,
         2 => {
-            crate::utils::normalize_ident(params[0].name.clone())
-                != crate::utils::normalize_ident(params[1].name.clone())
+            normalizer.normalize(params[0].name.clone())
+                != normalizer.normalize(params[1].name.clone())
         }
         _ => {
             let mut set = HashSet::with_capacity(params.len());
 
             params
                 .iter()
-                .map(|p| crate::utils::normalize_ident(p.name.clone()))
+                .map(|p| normalizer.normalize(p.name.clone()))
                 .all(|p| set.insert(p))
         }
     }

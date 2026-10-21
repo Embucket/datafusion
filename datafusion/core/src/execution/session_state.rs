@@ -370,10 +370,20 @@ impl SessionState {
         table_ref: impl Into<TableReference>,
     ) -> datafusion_common::Result<Arc<dyn SchemaProvider>> {
         let resolved_ref = self.resolve_table_ref(table_ref);
-        if self.config.information_schema() && *resolved_ref.schema == *INFORMATION_SCHEMA
+        let parser_options = &self.config.options().sql_parser;
+        let uppercase_identifiers = parser_options.enable_ident_normalization
+            && parser_options.uppercase_unquoted_identifiers;
+        let information_schema_name = if uppercase_identifiers {
+            "INFORMATION_SCHEMA"
+        } else {
+            INFORMATION_SCHEMA
+        };
+        if self.config.information_schema()
+            && resolved_ref.schema.as_ref() == information_schema_name
         {
             return Ok(Arc::new(
                 InformationSchemaProvider::new(Arc::clone(&self.catalog_list))
+                    .with_uppercase_identifiers(uppercase_identifiers)
                     .with_table_functions(self.table_functions.clone()),
             ));
         }
@@ -536,12 +546,13 @@ impl SessionState {
         &self,
         statement: &Statement,
     ) -> datafusion_common::Result<Vec<TableReference>> {
-        let enable_ident_normalization =
-            self.config.options().sql_parser.enable_ident_normalization;
-        let (table_refs, _) = datafusion_sql::resolve::resolve_table_references(
-            statement,
-            enable_ident_normalization,
-        )?;
+        let sql_parser = &self.config.options().sql_parser;
+        let (table_refs, _) =
+            datafusion_sql::resolve::resolve_table_references_with_uppercase(
+                statement,
+                sql_parser.enable_ident_normalization,
+                sql_parser.uppercase_unquoted_identifiers,
+            )?;
         Ok(table_refs)
     }
 

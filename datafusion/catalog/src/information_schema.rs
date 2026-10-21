@@ -43,6 +43,7 @@ use datafusion_expr::{TableType, Volatility};
 use datafusion_physical_plan::SendableRecordBatchStream;
 use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_physical_plan::streaming::PartitionStream;
+use futures::StreamExt;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -76,6 +77,7 @@ pub const INFORMATION_SCHEMA_TABLES: &[&str] = &[
 #[derive(Debug)]
 pub struct InformationSchemaProvider {
     config: InformationSchemaConfig,
+    uppercase_identifiers: bool,
 }
 
 impl InformationSchemaProvider {
@@ -85,8 +87,17 @@ impl InformationSchemaProvider {
             config: InformationSchemaConfig {
                 catalog_list,
                 table_functions: HashMap::new(),
+                uppercase_identifiers: false,
             },
+            uppercase_identifiers: false,
         }
+    }
+
+    /// Expose virtual schema table and column names in uppercase.
+    pub fn with_uppercase_identifiers(mut self, uppercase_identifiers: bool) -> Self {
+        self.uppercase_identifiers = uppercase_identifiers;
+        self.config.uppercase_identifiers = uppercase_identifiers;
+        self
     }
 
     /// Attach the session's table (UDTF) functions so that they appear in
@@ -104,9 +115,18 @@ impl InformationSchemaProvider {
 struct InformationSchemaConfig {
     catalog_list: Arc<dyn CatalogProviderList>,
     table_functions: HashMap<String, Arc<TableFunction>>,
+    uppercase_identifiers: bool,
 }
 
 impl InformationSchemaConfig {
+    fn virtual_schema_name(&self) -> &'static str {
+        if self.uppercase_identifiers {
+            "INFORMATION_SCHEMA"
+        } else {
+            INFORMATION_SCHEMA
+        }
+    }
+
     /// Construct the `information_schema.tables` virtual table
     async fn make_tables(
         &self,
@@ -118,7 +138,7 @@ impl InformationSchemaConfig {
             let catalog = self.catalog_list.catalog(&catalog_name).unwrap();
 
             for schema_name in catalog.schema_names() {
-                if schema_name != INFORMATION_SCHEMA {
+                if schema_name != self.virtual_schema_name() {
                     // schema name may not exist in the catalog, so we need to check
                     if let Some(schema) = catalog.schema(&schema_name) {
                         for table_name in schema.table_names() {
@@ -139,12 +159,21 @@ impl InformationSchemaConfig {
 
             // Add a final list for the information schema tables themselves
             for table_name in INFORMATION_SCHEMA_TABLES {
-                builder.add_table(
-                    &catalog_name,
-                    INFORMATION_SCHEMA,
-                    table_name,
-                    TableType::View,
-                );
+                if self.uppercase_identifiers {
+                    builder.add_table(
+                        &catalog_name,
+                        self.virtual_schema_name(),
+                        table_name.to_ascii_uppercase(),
+                        TableType::View,
+                    );
+                } else {
+                    builder.add_table(
+                        &catalog_name,
+                        INFORMATION_SCHEMA,
+                        table_name,
+                        TableType::View,
+                    );
+                }
             }
         }
 
@@ -156,7 +185,7 @@ impl InformationSchemaConfig {
             let catalog = self.catalog_list.catalog(&catalog_name).unwrap();
 
             for schema_name in catalog.schema_names() {
-                if schema_name != INFORMATION_SCHEMA
+                if schema_name != self.virtual_schema_name()
                     && let Some(schema) = catalog.schema(&schema_name)
                 {
                     let schema_owner = schema.owner_name();
@@ -174,7 +203,7 @@ impl InformationSchemaConfig {
             let catalog = self.catalog_list.catalog(&catalog_name).unwrap();
 
             for schema_name in catalog.schema_names() {
-                if schema_name != INFORMATION_SCHEMA {
+                if schema_name != self.virtual_schema_name() {
                     // schema name may not exist in the catalog, so we need to check
                     if let Some(schema) = catalog.schema(&schema_name) {
                         for table_name in schema.table_names() {
@@ -204,7 +233,7 @@ impl InformationSchemaConfig {
             let catalog = self.catalog_list.catalog(&catalog_name).unwrap();
 
             for schema_name in catalog.schema_names() {
-                if schema_name != INFORMATION_SCHEMA {
+                if schema_name != self.virtual_schema_name() {
                     // schema name may not exist in the catalog, so we need to check
                     if let Some(schema) = catalog.schema(&schema_name) {
                         for table_name in schema.table_names() {
@@ -616,7 +645,13 @@ impl SchemaProvider for InformationSchemaProvider {
     fn table_names(&self) -> Vec<String> {
         INFORMATION_SCHEMA_TABLES
             .iter()
-            .map(|t| (*t).to_string())
+            .map(|name| {
+                if self.uppercase_identifiers {
+                    name.to_ascii_uppercase()
+                } else {
+                    (*name).to_string()
+                }
+            })
             .collect()
     }
 
@@ -624,6 +659,11 @@ impl SchemaProvider for InformationSchemaProvider {
         &self,
         name: &str,
     ) -> Result<Option<Arc<dyn TableProvider>>, DataFusionError> {
+        if self.uppercase_identifiers
+            && name.bytes().any(|byte| byte.is_ascii_lowercase())
+        {
+            return Ok(None);
+        }
         let config = self.config.clone();
         let table: Arc<dyn PartitionStream> = match name.to_ascii_lowercase().as_str() {
             TABLES => Arc::new(InformationSchemaTables::new(config)),
@@ -636,13 +676,70 @@ impl SchemaProvider for InformationSchemaProvider {
             _ => return Ok(None),
         };
 
+        let table: Arc<dyn PartitionStream> = if self.uppercase_identifiers {
+            Arc::new(UppercaseColumnsPartitionStream::new(table))
+        } else {
+            table
+        };
+
         Ok(Some(Arc::new(
             StreamingTable::try_new(Arc::clone(table.schema()), vec![table]).unwrap(),
         )))
     }
 
     fn table_exist(&self, name: &str) -> bool {
-        INFORMATION_SCHEMA_TABLES.contains(&name.to_ascii_lowercase().as_str())
+        (!self.uppercase_identifiers
+            || !name.bytes().any(|byte| byte.is_ascii_lowercase()))
+            && INFORMATION_SCHEMA_TABLES.contains(&name.to_ascii_lowercase().as_str())
+    }
+}
+
+#[derive(Debug)]
+struct UppercaseColumnsPartitionStream {
+    inner: Arc<dyn PartitionStream>,
+    schema: SchemaRef,
+}
+
+impl UppercaseColumnsPartitionStream {
+    fn new(inner: Arc<dyn PartitionStream>) -> Self {
+        let original = inner.schema();
+        let fields: Vec<FieldRef> = original
+            .fields()
+            .iter()
+            .map(|field| {
+                Arc::new(
+                    field
+                        .as_ref()
+                        .clone()
+                        .with_name(field.name().to_ascii_uppercase()),
+                )
+            })
+            .collect();
+        let schema = Arc::new(Schema::new_with_metadata(
+            fields,
+            original.metadata().clone(),
+        ));
+        Self { inner, schema }
+    }
+}
+
+impl PartitionStream for UppercaseColumnsPartitionStream {
+    fn schema(&self) -> &SchemaRef {
+        &self.schema
+    }
+
+    fn execute(&self, ctx: Arc<TaskContext>) -> SendableRecordBatchStream {
+        let schema = Arc::clone(&self.schema);
+        let batches = self.inner.execute(ctx).map({
+            let schema = Arc::clone(&schema);
+            move |batch| {
+                batch.and_then(|batch| {
+                    RecordBatch::try_new(Arc::clone(&schema), batch.columns().to_vec())
+                        .map_err(Into::into)
+                })
+            }
+        });
+        Box::pin(RecordBatchStreamAdapter::new(schema, batches))
     }
 }
 

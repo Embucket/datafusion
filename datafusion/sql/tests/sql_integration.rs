@@ -65,7 +65,7 @@ use datafusion_functions_window::{
 use insta::{allow_duplicates, assert_snapshot};
 use rstest::rstest;
 use sqlparser::dialect::{
-    DatabricksDialect, Dialect, GenericDialect, HiveDialect, MySqlDialect,
+    DatabricksDialect, Dialect, GenericDialect, HiveDialect, MsSqlDialect, MySqlDialect,
     SnowflakeDialect,
 };
 use sqlparser::parser::Parser;
@@ -3662,6 +3662,126 @@ fn create_schema_with_unquoted_normalized_name() {
 }
 
 #[test]
+fn uppercase_unquoted_identifiers_apply_to_schema_and_table_ddl() {
+    let unquoted =
+        logical_plan_with_uppercase_unquoted_identifiers("CREATE SCHEMA foo").unwrap();
+    let quoted =
+        logical_plan_with_uppercase_unquoted_identifiers("CREATE SCHEMA \"foo\"")
+            .unwrap();
+    assert_eq!(
+        unquoted.display_indent().to_string(),
+        "CreateCatalogSchema: \"FOO\""
+    );
+    assert_eq!(
+        quoted.display_indent().to_string(),
+        "CreateCatalogSchema: \"foo\""
+    );
+
+    let table =
+        logical_plan_with_uppercase_unquoted_identifiers("CREATE TABLE foo.bar (id INT)")
+            .unwrap();
+    assert!(
+        table
+            .display_indent()
+            .to_string()
+            .contains("Partial { schema: \"FOO\", table: \"BAR\" }")
+    );
+
+    let drop =
+        logical_plan_with_uppercase_unquoted_identifiers("DROP SCHEMA foo").unwrap();
+    assert!(
+        drop.display_indent()
+            .to_string()
+            .contains("schema: \"FOO\"")
+    );
+}
+
+#[test]
+fn uppercase_unquoted_prepared_statement_names() {
+    use datafusion_expr::logical_plan::Statement as PlanStatement;
+
+    for (sql, expected) in [
+        ("PREPARE foo AS SELECT 1", "FOO"),
+        ("PREPARE \"foo\" AS SELECT 1", "foo"),
+        ("EXECUTE foo", "FOO"),
+        ("EXECUTE \"foo\"", "foo"),
+        ("DEALLOCATE foo", "FOO"),
+        ("DEALLOCATE \"foo\"", "foo"),
+    ] {
+        let plan = logical_plan_with_uppercase_unquoted_identifiers(sql).unwrap();
+        let name = match plan {
+            LogicalPlan::Statement(PlanStatement::Prepare(plan)) => plan.name,
+            LogicalPlan::Statement(PlanStatement::Execute(plan)) => plan.name,
+            LogicalPlan::Statement(PlanStatement::Deallocate(plan)) => plan.name,
+            other => panic!("unexpected plan for {sql}: {other:?}"),
+        };
+        assert_eq!(name, expected, "{sql}");
+    }
+}
+
+#[test]
+fn uppercase_unquoted_partition_columns_in_copy_and_external_table() {
+    for (column, expected) in [("p", "P"), ("\"p\"", "p")] {
+        let copy = logical_plan_with_uppercase_unquoted_identifiers(&format!(
+            "COPY (SELECT 1 AS {column}) TO 'out.csv' STORED AS CSV PARTITIONED BY ({column})"
+        ))
+        .unwrap();
+        let LogicalPlan::Copy(copy) = copy else {
+            panic!("expected COPY plan");
+        };
+        assert_eq!(copy.partition_by, vec![expected]);
+
+        let external = logical_plan_with_uppercase_unquoted_identifiers(&format!(
+            "CREATE EXTERNAL TABLE t ({column} INT) STORED AS CSV PARTITIONED BY ({column}) LOCATION 'foo.csv'"
+        ))
+        .unwrap();
+        let LogicalPlan::Ddl(DdlStatement::CreateExternalTable(external)) = external
+        else {
+            panic!("expected CREATE EXTERNAL TABLE plan");
+        };
+        assert_eq!(external.table_partition_cols, vec![expected]);
+    }
+}
+
+#[test]
+fn uppercase_partition_columns_use_session_dialect() {
+    let make_state = || {
+        let mut state = mock_session_state();
+        state
+            .config_options
+            .sql_parser
+            .uppercase_unquoted_identifiers = true;
+        state.config_options.sql_parser.dialect =
+            datafusion_common::config::Dialect::MsSQL;
+        state
+    };
+
+    let copy = logical_plan_from_state(
+        "COPY (SELECT 1 AS [p]) TO 'out.csv' STORED AS CSV PARTITIONED BY ([p])",
+        &MsSqlDialect {},
+        ParserOptions::default(),
+        make_state(),
+    )
+    .unwrap();
+    let LogicalPlan::Copy(copy) = copy else {
+        panic!("expected COPY plan");
+    };
+    assert_eq!(copy.partition_by, vec!["p"]);
+
+    let external = logical_plan_from_state(
+        "CREATE EXTERNAL TABLE t ([p] INT) STORED AS CSV PARTITIONED BY ([p]) LOCATION 'foo.csv'",
+        &MsSqlDialect {},
+        ParserOptions::default(),
+        make_state(),
+    )
+    .unwrap();
+    let LogicalPlan::Ddl(DdlStatement::CreateExternalTable(external)) = external else {
+        panic!("expected CREATE EXTERNAL TABLE plan");
+    };
+    assert_eq!(external.table_partition_cols, vec!["p"]);
+}
+
+#[test]
 fn create_external_table_custom() {
     let sql = "CREATE EXTERNAL TABLE dt STORED AS DELTATABLE LOCATION 's3://bucket/schema/table';";
     let plan = logical_plan(sql).unwrap();
@@ -4984,6 +5104,12 @@ fn logical_plan_with_config(
 fn logical_plan_with_options(sql: &str, options: ParserOptions) -> Result<LogicalPlan> {
     let dialect = &GenericDialect {};
     logical_plan_with_dialect_and_options(sql, dialect, options)
+}
+
+fn logical_plan_with_uppercase_unquoted_identifiers(sql: &str) -> Result<LogicalPlan> {
+    let mut config = datafusion_common::config::ConfigOptions::default();
+    config.sql_parser.uppercase_unquoted_identifiers = true;
+    logical_plan_with_config_and_options(sql, config, ParserOptions::default())
 }
 
 fn logical_plan_with_dialect(sql: &str, dialect: &dyn Dialect) -> Result<LogicalPlan> {
@@ -6951,6 +7077,36 @@ fn test_progressive_lambda_parameters() {
             ]
         ))
     )
+}
+
+#[test]
+fn uppercase_unquoted_lambda_parameters_preserve_quoted_names() {
+    let make_state = || {
+        let mut state = MockSessionState::default()
+            .with_higher_order_function(Arc::new(HigherOrderUDF::new_from_impl(
+                MockArrayReduce::new(),
+            )))
+            .with_scalar_function(make_array_udf())
+            .with_expr_planner(Arc::new(CustomExprPlanner {}));
+        state
+            .config_options
+            .sql_parser
+            .uppercase_unquoted_identifiers = true;
+        state
+    };
+    let options = ParserOptions::new();
+    let sql =
+        "select array_reduce([1.0, 2.0], 0, (acc, \"acc\") -> acc + \"acc\", v -> v)";
+    logical_plan_from_state(sql, &SnowflakeDialect {}, options, make_state()).unwrap();
+
+    let duplicate = "select array_reduce([1.0, 2.0], 0, (acc, \"ACC\") -> acc, v -> v)";
+    let err =
+        logical_plan_from_state(duplicate, &SnowflakeDialect {}, options, make_state())
+            .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("lambda parameters names must be unique")
+    );
 }
 
 fn resolved_lambda_var(name: &str, dt: DataType) -> Expr {
