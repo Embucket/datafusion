@@ -634,6 +634,21 @@ pub trait ScalarUDFImpl: Debug + DynEq + DynHash + Send + Sync + Any {
         None
     }
 
+    /// Create an invocation instance for a newly constructed physical expression.
+    ///
+    /// The registered UDF remains responsible for type coercion, return-field
+    /// inference, and optimizer metadata. The returned UDF is used only for
+    /// [`Self::invoke_with_args`] and must accept the same arguments and produce
+    /// values matching the registered return field. Physical-expression rewrites
+    /// and plan clones share this instance; independent execution requires a
+    /// newly constructed physical expression. Foreign UDF wrappers do not
+    /// currently forward this hook across the FFI boundary.
+    ///
+    /// The default invokes the registered UDF directly.
+    fn create_physical_instance(&self) -> Option<ScalarUDF> {
+        None
+    }
+
     /// What type will be returned by this function, given the arguments?
     ///
     /// By default, this function calls [`Self::return_type`] with the
@@ -1148,6 +1163,15 @@ impl ScalarUDFImpl for AliasedScalarUDFImpl {
 
     fn with_updated_config(&self, _config: &ConfigOptions) -> Option<ScalarUDF> {
         None
+    }
+
+    fn create_physical_instance(&self) -> Option<ScalarUDF> {
+        self.inner.create_physical_instance().map(|udf| {
+            ScalarUDF::new_from_impl(Self {
+                inner: Arc::clone(udf.inner()).into(),
+                aliases: self.aliases.clone(),
+            })
+        })
     }
 
     fn aliases(&self) -> &[String] {

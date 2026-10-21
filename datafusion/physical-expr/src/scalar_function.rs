@@ -51,6 +51,7 @@ use datafusion_expr::{
 /// Physical expression of a scalar function
 pub struct ScalarFunctionExpr {
     fun: Arc<ScalarUDF>,
+    eval_fun: Arc<ScalarUDF>,
     name: String,
     args: Vec<Arc<dyn PhysicalExpr>>,
     return_field: FieldRef,
@@ -69,6 +70,12 @@ impl Debug for ScalarFunctionExpr {
 }
 
 impl ScalarFunctionExpr {
+    fn physical_instance(fun: &Arc<ScalarUDF>) -> Arc<ScalarUDF> {
+        fun.inner()
+            .create_physical_instance()
+            .map_or_else(|| Arc::clone(fun), Arc::new)
+    }
+
     /// Create a new Scalar function
     pub fn new(
         name: &str,
@@ -77,8 +84,10 @@ impl ScalarFunctionExpr {
         return_field: FieldRef,
         config_options: Arc<ConfigOptions>,
     ) -> Self {
+        let eval_fun = Self::physical_instance(&fun);
         Self {
             fun,
+            eval_fun,
             name: name.to_owned(),
             args,
             return_field,
@@ -111,8 +120,10 @@ impl ScalarFunctionExpr {
             scalar_arguments: &arguments,
         };
         let return_field = fun.return_field_from_args(ret_args)?;
+        let eval_fun = Self::physical_instance(&fun);
         Ok(Self {
             fun,
+            eval_fun,
             name,
             args,
             return_field,
@@ -187,12 +198,14 @@ impl PartialEq for ScalarFunctionExpr {
         }
         let Self {
             fun,
+            eval_fun,
             name,
             args,
             return_field,
             config_options,
         } = self;
         fun.eq(&o.fun)
+            && eval_fun.eq(&o.eval_fun)
             && name.eq(&o.name)
             && args.eq(&o.args)
             && return_field.eq(&o.return_field)
@@ -206,12 +219,14 @@ impl Hash for ScalarFunctionExpr {
     fn hash<H: Hasher>(&self, state: &mut H) {
         let Self {
             fun,
+            eval_fun,
             name,
             args,
             return_field,
             config_options: _, // expensive to hash, and often equal
         } = self;
         fun.hash(state);
+        eval_fun.hash(state);
         name.hash(state);
         args.hash(state);
         return_field.hash(state);
@@ -252,7 +267,7 @@ impl PhysicalExpr for ScalarFunctionExpr {
             .all(|arg| matches!(arg, ColumnarValue::Scalar(_)));
 
         // evaluate the function
-        let output = self.fun.invoke_with_args(ScalarFunctionArgs {
+        let output = self.eval_fun.invoke_with_args(ScalarFunctionArgs {
             args,
             arg_fields,
             number_rows: batch.num_rows(),
@@ -292,13 +307,14 @@ impl PhysicalExpr for ScalarFunctionExpr {
         self: Arc<Self>,
         children: Vec<Arc<dyn PhysicalExpr>>,
     ) -> Result<Arc<dyn PhysicalExpr>> {
-        Ok(Arc::new(ScalarFunctionExpr::new(
-            &self.name,
-            Arc::clone(&self.fun),
-            children,
-            Arc::clone(&self.return_field),
-            Arc::clone(&self.config_options),
-        )))
+        Ok(Arc::new(Self {
+            fun: Arc::clone(&self.fun),
+            eval_fun: Arc::clone(&self.eval_fun),
+            name: self.name.clone(),
+            args: children,
+            return_field: Arc::clone(&self.return_field),
+            config_options: Arc::clone(&self.config_options),
+        }))
     }
 
     fn evaluate_bounds(&self, children: &[&Interval]) -> Result<Interval> {
@@ -357,9 +373,165 @@ impl PhysicalExpr for ScalarFunctionExpr {
 mod tests {
     use super::*;
     use crate::expressions::Column;
+    use arrow::array::{Int64Array, RecordBatchOptions};
     use arrow::datatypes::Field;
     use datafusion_expr::{ScalarUDFImpl, Signature};
     use datafusion_physical_expr_common::physical_expr::is_volatile;
+    use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+
+    static NEXT_INSTANCE_ID: AtomicU64 = AtomicU64::new(0);
+
+    #[derive(Debug, PartialEq, Eq, Hash)]
+    struct SequenceFactory {
+        signature: Signature,
+    }
+
+    #[derive(Debug)]
+    struct SequenceInstance {
+        signature: Signature,
+        id: u64,
+        next: AtomicI64,
+    }
+
+    impl PartialEq for SequenceInstance {
+        fn eq(&self, other: &Self) -> bool {
+            self.id == other.id
+        }
+    }
+
+    impl Eq for SequenceInstance {}
+
+    impl Hash for SequenceInstance {
+        fn hash<H: Hasher>(&self, state: &mut H) {
+            self.id.hash(state);
+        }
+    }
+
+    impl ScalarUDFImpl for SequenceFactory {
+        fn name(&self) -> &str {
+            "test_sequence"
+        }
+
+        fn signature(&self) -> &Signature {
+            &self.signature
+        }
+
+        fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
+            Ok(DataType::Int64)
+        }
+
+        fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+            internal_err!("factory must be replaced at physical expression creation")
+        }
+
+        fn create_physical_instance(&self) -> Option<ScalarUDF> {
+            Some(ScalarUDF::from(SequenceInstance {
+                signature: self.signature.clone(),
+                id: NEXT_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
+                next: AtomicI64::new(0),
+            }))
+        }
+    }
+
+    impl ScalarUDFImpl for SequenceInstance {
+        fn name(&self) -> &str {
+            "test_sequence"
+        }
+
+        fn signature(&self) -> &Signature {
+            &self.signature
+        }
+
+        fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
+            Ok(DataType::Int64)
+        }
+
+        fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+            let count = i64::try_from(args.number_rows).map_err(|_| {
+                datafusion_common::DataFusionError::Execution("batch too large".into())
+            })?;
+            let start = self.next.fetch_add(count, Ordering::Relaxed);
+            Ok(ColumnarValue::Array(Arc::new(
+                Int64Array::from_iter_values(start..start + count),
+            )))
+        }
+    }
+
+    fn empty_batch(rows: usize) -> Result<RecordBatch> {
+        RecordBatch::try_new_with_options(
+            Arc::new(Schema::empty()),
+            vec![],
+            &RecordBatchOptions::new().with_row_count(Some(rows)),
+        )
+        .map_err(Into::into)
+    }
+
+    fn evaluate_sequence(expr: &ScalarFunctionExpr, rows: usize) -> Result<Vec<i64>> {
+        let batch = empty_batch(rows)?;
+        let values = expr.evaluate(&batch)?.into_array(rows)?;
+        let values = values
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| {
+                datafusion_common::DataFusionError::Internal("expected Int64".into())
+            })?;
+        Ok(values.values().to_vec())
+    }
+
+    #[test]
+    fn physical_scalar_instances_are_independent_across_constructions() -> Result<()> {
+        let factory = Arc::new(ScalarUDF::from(SequenceFactory {
+            signature: Signature::exact(vec![], Volatility::Volatile),
+        }));
+        let config = Arc::new(ConfigOptions::default());
+        let first = Arc::new(ScalarFunctionExpr::try_new(
+            Arc::clone(&factory),
+            vec![],
+            &Schema::empty(),
+            Arc::clone(&config),
+        )?);
+        assert!(first.fun().inner().is::<SequenceFactory>());
+        assert!(
+            ScalarFunctionExpr::try_downcast_func::<SequenceFactory>(first.as_ref())
+                .is_some()
+        );
+        assert_eq!(evaluate_sequence(&first, 3)?, vec![0, 1, 2]);
+        assert_eq!(evaluate_sequence(&first, 2)?, vec![3, 4]);
+
+        let rewritten = Arc::clone(&first).with_new_children(vec![])?;
+        let rewritten =
+            rewritten
+                .downcast_ref::<ScalarFunctionExpr>()
+                .ok_or_else(|| {
+                    datafusion_common::DataFusionError::Internal("expected UDF".into())
+                })?;
+        assert_eq!(evaluate_sequence(rewritten, 1)?, vec![5]);
+
+        let second = ScalarFunctionExpr::new(
+            "test_sequence",
+            Arc::clone(&factory),
+            vec![],
+            Arc::new(Field::new("test_sequence", DataType::Int64, false)),
+            config,
+        );
+        assert_eq!(evaluate_sequence(&second, 2)?, vec![0, 1]);
+
+        let aliased = Arc::new(
+            ScalarUDF::from(SequenceFactory {
+                signature: Signature::exact(vec![], Volatility::Volatile),
+            })
+            .with_aliases(["seq_alias"]),
+        );
+        let aliased = ScalarFunctionExpr::try_new(
+            aliased,
+            vec![],
+            &Schema::empty(),
+            Arc::new(ConfigOptions::default()),
+        )?;
+        assert_eq!(aliased.fun().aliases(), &["seq_alias"]);
+        assert_eq!(evaluate_sequence(&aliased, 2)?, vec![0, 1]);
+        Ok(())
+    }
 
     /// Test helper to create a mock UDF with a specific volatility
     #[derive(Debug, PartialEq, Eq, Hash)]
