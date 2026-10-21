@@ -50,8 +50,20 @@ use datafusion_macros::user_doc;
 use datafusion_physical_expr_common::sort_expr::LexOrdering;
 
 mod state;
+mod unordered_struct;
 
 use state::{BytesValueState, GenericValueState, PrimitiveValueState, ValueState};
+use unordered_struct::UnorderedStructFirstValueGroupsAccumulator;
+
+fn flat_view_struct(data_type: &DataType) -> bool {
+    let DataType::Struct(fields) = data_type else {
+        return false;
+    };
+    !fields.is_empty()
+        && fields.iter().all(|field| {
+            matches!(field.data_type(), DataType::BinaryView | DataType::Utf8View)
+        })
+}
 
 create_func!(FirstValue, first_value_udaf);
 create_func!(LastValue, last_value_udaf);
@@ -339,13 +351,20 @@ impl AggregateUDFImpl for FirstValue {
     }
 
     fn groups_accumulator_supported(&self, args: AccumulatorArgs) -> bool {
-        groups_accumulator_supported(&args)
+        (args.order_bys.is_empty() && flat_view_struct(args.return_field.data_type()))
+            || groups_accumulator_supported(&args)
     }
 
     fn create_groups_accumulator(
         &self,
         args: AccumulatorArgs,
     ) -> Result<Box<dyn GroupsAccumulator>> {
+        if args.order_bys.is_empty() && flat_view_struct(args.return_field.data_type()) {
+            return Ok(Box::new(UnorderedStructFirstValueGroupsAccumulator::new(
+                args.return_field.data_type().clone(),
+                args.ignore_nulls,
+            )));
+        }
         create_groups_accumulator(&args, true, self.name())
     }
 
@@ -1448,6 +1467,21 @@ mod tests {
     use datafusion_physical_expr::{PhysicalSortExpr, expressions::col};
 
     use super::*;
+
+    #[test]
+    fn unordered_struct_fast_path_only_accepts_flat_view_fields() {
+        let view = Arc::new(Field::new("value", DataType::BinaryView, false));
+        let nested = Arc::new(Field::new(
+            "values",
+            DataType::List(Arc::clone(&view)),
+            false,
+        ));
+        assert!(flat_view_struct(&DataType::Struct(vec![view].into())));
+        assert!(!flat_view_struct(&DataType::Struct(vec![nested].into())));
+        assert!(!flat_view_struct(&DataType::Struct(
+            vec![Arc::new(Field::new("value", DataType::Int64, false))].into()
+        )));
+    }
 
     #[test]
     fn test_first_last_value_value() -> Result<()> {
