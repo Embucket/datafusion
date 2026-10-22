@@ -3724,6 +3724,35 @@ fn uppercase_unquoted_identifiers_apply_to_values_columns() {
     )
     .unwrap();
     assert_eq!(unnormalized.schema().field(0).name(), "column1");
+
+    let insert = logical_plan_with_uppercase_unquoted_identifiers(
+        "INSERT INTO \"test_decimal\" VALUES (1, 2)",
+    )
+    .unwrap();
+    let LogicalPlan::Dml(dml) = insert else {
+        panic!("expected INSERT plan");
+    };
+    let LogicalPlan::Projection(projection) = dml.input.as_ref() else {
+        panic!("expected INSERT projection");
+    };
+    assert_eq!(projection.input.schema().field(0).name(), "column1");
+
+    let bound =
+        logical_plan_with_uppercase_unquoted_identifiers("VALUES (CAST($1 AS INT))")
+            .unwrap()
+            .with_param_values(vec![ScalarValue::Int32(Some(7))])
+            .unwrap();
+    assert_eq!(bound.schema().field(0).name(), "COLUMN1");
+    logical_plan_with_uppercase_unquoted_identifiers(
+        "SELECT column1 FROM (VALUES (CAST($1 AS INT)))",
+    )
+    .unwrap()
+    .with_param_values(vec![ScalarValue::Int32(Some(7))])
+    .unwrap();
+    logical_plan_with_uppercase_unquoted_identifiers("SELECT column1 FROM (VALUES (7))")
+        .unwrap()
+        .with_param_values(Vec::<ScalarValue>::new())
+        .unwrap();
 }
 
 #[test]

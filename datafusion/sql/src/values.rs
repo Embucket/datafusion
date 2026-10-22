@@ -364,6 +364,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         planner_context.set_table_schema(table_schema.clone());
         let mut values = values?;
 
+        let has_target_schema = table_schema.is_some();
         let schema = table_schema.unwrap_or(empty_schema);
         let object_columns = schema
             .fields()
@@ -425,7 +426,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             } else {
                 LogicalPlanBuilder::values_with_schema(values, &schema)?.build()
             };
-            return self.normalize_values_column_names(plan?);
+            return self.normalize_values_column_names(plan?, has_target_schema);
         }
         for row in &values {
             for expr in row {
@@ -566,14 +567,16 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         } else {
             LogicalPlanBuilder::values_with_schema(values, &values_schema)?.build()
         };
-        self.normalize_values_column_names(plan?)
+        self.normalize_values_column_names(plan?, has_target_schema)
     }
 
     fn normalize_values_column_names(
         &self,
         mut plan: LogicalPlan,
+        has_target_schema: bool,
     ) -> Result<LogicalPlan> {
-        if !self.options.enable_ident_normalization
+        if has_target_schema
+            || !self.options.enable_ident_normalization
             || !self
                 .context_provider
                 .options()
