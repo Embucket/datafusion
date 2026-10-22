@@ -17,7 +17,7 @@
 
 use datafusion::common::test_util::batches_to_string;
 use datafusion::error::Result;
-use datafusion::prelude::SessionContext;
+use datafusion::prelude::{SessionConfig, SessionContext};
 
 #[tokio::test]
 async fn pivot_list_is_lowered_to_filtered_aggregates() -> Result<()> {
@@ -100,6 +100,75 @@ async fn unpivot_excludes_nulls_by_default() -> Result<()> {
     | 1  | JAN   | 10    |
     | 2  | JAN   | 30    |
     +----+-------+-------+
+    ");
+    Ok(())
+}
+
+#[tokio::test]
+async fn unpivot_normalizes_unquoted_identifiers() -> Result<()> {
+    let mut config = SessionConfig::new();
+    config
+        .options_mut()
+        .sql_parser
+        .uppercase_unquoted_identifiers = true;
+    let ctx = SessionContext::new_with_config(config);
+
+    let batches = ctx
+        .sql(
+            "SELECT MONTH, SALES
+             FROM (VALUES (1, 10, 20), (2, 30, NULL)) t(id, jan, feb)
+             UNPIVOT(SALES FOR MONTH IN (jan, feb))
+             ORDER BY MONTH, SALES",
+        )
+        .await?
+        .collect()
+        .await?;
+    insta::assert_snapshot!(batches_to_string(&batches), @r"
+    +-------+-------+
+    | MONTH | SALES |
+    +-------+-------+
+    | FEB   | 20    |
+    | JAN   | 10    |
+    | JAN   | 30    |
+    +-------+-------+
+    ");
+
+    let quoted = ctx
+        .sql(
+            "SELECT \"month\", \"sales\"
+             FROM (VALUES (10, 20)) t(\"jan\", \"JAN\")
+             UNPIVOT(\"sales\" FOR \"month\" IN (\"jan\", \"JAN\"))
+             ORDER BY \"sales\"",
+        )
+        .await?
+        .collect()
+        .await?;
+    insta::assert_snapshot!(batches_to_string(&quoted), @r"
+    +-------+-------+
+    | month | sales |
+    +-------+-------+
+    | jan   | 10    |
+    | JAN   | 20    |
+    +-------+-------+
+    ");
+
+    let aliased = ctx
+        .sql(
+            "SELECT MONTH, SALES
+             FROM (VALUES (10, 20)) t(jan, feb)
+             UNPIVOT(SALES FOR MONTH IN (jan AS january, feb AS \"Feb\"))
+             ORDER BY SALES",
+        )
+        .await?
+        .collect()
+        .await?;
+    insta::assert_snapshot!(batches_to_string(&aliased), @r"
+    +---------+-------+
+    | MONTH   | SALES |
+    +---------+-------+
+    | JANUARY | 10    |
+    | Feb     | 20    |
+    +---------+-------+
     ");
     Ok(())
 }

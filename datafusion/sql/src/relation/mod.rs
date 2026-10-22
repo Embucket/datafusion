@@ -48,6 +48,14 @@ struct ResolvedPivotValue {
     name: String,
 }
 
+fn unpivot_name_value(ident: &sqlparser::ast::Ident) -> String {
+    if ident.quote_style.is_some() {
+        ident.value.clone()
+    } else {
+        ident.value.to_uppercase()
+    }
+}
+
 // Implement RelationPlannerContext
 impl<'a, 'b, S: ContextProvider> RelationPlannerContext
     for SqlToRelRelationContext<'a, 'b, S>
@@ -425,14 +433,33 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             } => {
                 let base_plan = self.create_relation(*table, planner_context)?;
                 let base_schema = base_plan.schema();
-                let value_column = value.to_string();
-                let name_column = name.value;
+                let value_column = match value {
+                    sqlparser::ast::Expr::Identifier(ident) => {
+                        self.ident_normalizer.normalize(ident)
+                    }
+                    other => other.to_string(),
+                };
+                let name_column = self.ident_normalizer.normalize(name);
                 let mut unpivot_column_indices = Vec::new();
                 let mut unpivot_column_names = Vec::new();
                 let mut common_type = None;
 
                 for column_ident in columns {
-                    let column_name = column_ident.expr.to_string();
+                    let name_value = column_ident.alias.as_ref().map_or_else(
+                        || match &column_ident.expr {
+                            sqlparser::ast::Expr::Identifier(ident) => {
+                                unpivot_name_value(ident)
+                            }
+                            other => other.to_string().to_uppercase(),
+                        },
+                        unpivot_name_value,
+                    );
+                    let column_name = match column_ident.expr {
+                        sqlparser::ast::Expr::Identifier(ident) => {
+                            self.ident_normalizer.normalize(ident)
+                        }
+                        other => other.to_string(),
+                    };
                     let Some(index) =
                         base_schema.index_of_column_by_name(None, &column_name)
                     else {
@@ -450,7 +477,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                         common_type = Some(field_type.clone());
                     }
                     unpivot_column_indices.push(index);
-                    unpivot_column_names.push(column_name);
+                    unpivot_column_names.push((column_name, name_value));
                 }
 
                 if unpivot_column_names.is_empty() {
@@ -465,14 +492,11 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     .collect::<Vec<_>>();
                 let mut union_inputs = Vec::with_capacity(unpivot_column_names.len());
 
-                for column_name in unpivot_column_names {
+                for (column_name, name_value) in unpivot_column_names {
                     let mut projection_exprs = non_pivot_exprs.clone();
                     projection_exprs.push(
-                        Expr::Literal(
-                            ScalarValue::Utf8(Some(column_name.to_uppercase())),
-                            None,
-                        )
-                        .alias(name_column.clone()),
+                        Expr::Literal(ScalarValue::Utf8(Some(name_value)), None)
+                            .alias(name_column.clone()),
                     );
                     projection_exprs.push(
                         Expr::Column(Column::from_name(&column_name))
