@@ -3724,6 +3724,18 @@ fn uppercase_unquoted_identifiers_apply_to_values_columns() {
     )
     .unwrap();
     assert_eq!(unnormalized.schema().field(0).name(), "column1");
+
+    let insert = logical_plan_with_uppercase_unquoted_identifiers(
+        "INSERT INTO \"test_decimal\" VALUES (1, 2)",
+    )
+    .unwrap();
+    let LogicalPlan::Dml(dml) = insert else {
+        panic!("expected INSERT plan");
+    };
+    let LogicalPlan::Projection(projection) = dml.input.as_ref() else {
+        panic!("expected INSERT projection");
+    };
+    assert_eq!(projection.input.schema().field(0).name(), "column1");
 }
 
 #[test]
