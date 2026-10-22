@@ -2118,8 +2118,37 @@ impl LogicalPlan {
             // Build `LogicalPlan::Values` from the values for type inference.
             // We can't use `recompute_schema` because it skips recomputing for
             // `LogicalPlan::Values`.
-            LogicalPlan::Values(Values { values, schema: _ }) => {
-                LogicalPlanBuilder::values(values)?.build()
+            LogicalPlan::Values(Values { values, schema }) => {
+                let mut plan = LogicalPlanBuilder::values(values)?.build()?;
+                let LogicalPlan::Values(rebuilt) = &mut plan else {
+                    return internal_err!("Expected VALUES plan after rebuilding VALUES");
+                };
+                if rebuilt
+                    .schema
+                    .fields()
+                    .iter()
+                    .zip(schema.fields())
+                    .any(|(new, original)| new.name() != original.name())
+                {
+                    let fields = rebuilt
+                        .schema
+                        .fields()
+                        .iter()
+                        .zip(schema.fields())
+                        .map(|(new, original)| {
+                            Arc::new(
+                                new.as_ref()
+                                    .clone()
+                                    .with_name(original.name().to_string()),
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    rebuilt.schema = Arc::new(DFSchema::from_unqualified_fields(
+                        fields.into(),
+                        rebuilt.schema.metadata().clone(),
+                    )?);
+                }
+                Ok(plan)
             }
             // other plans can just use `recompute_schema` directly.
             plan => plan.recompute_schema(),
