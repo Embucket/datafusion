@@ -420,11 +420,12 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             })
             .collect::<Vec<_>>();
         if array_columns.is_empty() {
-            return if schema.fields().is_empty() {
+            let plan = if schema.fields().is_empty() {
                 LogicalPlanBuilder::values(values)?.build()
             } else {
                 LogicalPlanBuilder::values_with_schema(values, &schema)?.build()
             };
+            return self.normalize_values_column_names(plan?);
         }
         for row in &values {
             for expr in row {
@@ -560,10 +561,48 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 Default::default(),
             )?)
         };
-        if values_schema.fields().is_empty() {
+        let plan = if values_schema.fields().is_empty() {
             LogicalPlanBuilder::values(values)?.build()
         } else {
             LogicalPlanBuilder::values_with_schema(values, &values_schema)?.build()
+        };
+        self.normalize_values_column_names(plan?)
+    }
+
+    fn normalize_values_column_names(
+        &self,
+        mut plan: LogicalPlan,
+    ) -> Result<LogicalPlan> {
+        if !self.options.enable_ident_normalization
+            || !self
+                .context_provider
+                .options()
+                .sql_parser
+                .uppercase_unquoted_identifiers
+        {
+            return Ok(plan);
         }
+
+        if let LogicalPlan::Values(values) = &mut plan {
+            let fields = values
+                .schema
+                .fields()
+                .iter()
+                .map(|field| {
+                    Arc::new(
+                        field
+                            .as_ref()
+                            .clone()
+                            .with_name(field.name().to_ascii_uppercase()),
+                    )
+                })
+                .collect::<Vec<_>>();
+            values.schema = Arc::new(DFSchema::from_unqualified_fields(
+                fields.into(),
+                values.schema.metadata().clone(),
+            )?);
+        }
+
+        Ok(plan)
     }
 }

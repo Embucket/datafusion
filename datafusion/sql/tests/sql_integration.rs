@@ -3697,6 +3697,36 @@ fn uppercase_unquoted_identifiers_apply_to_schema_and_table_ddl() {
 }
 
 #[test]
+fn uppercase_unquoted_identifiers_apply_to_values_columns() {
+    let default = logical_plan("VALUES (1, 'x')").unwrap();
+    assert_eq!(default.schema().field(0).name(), "column1");
+    assert_eq!(default.schema().field(1).name(), "column2");
+
+    let uppercase =
+        logical_plan_with_uppercase_unquoted_identifiers("VALUES (1, 'x')").unwrap();
+    assert_eq!(uppercase.schema().field(0).name(), "COLUMN1");
+    assert_eq!(uppercase.schema().field(1).name(), "COLUMN2");
+    logical_plan_with_uppercase_unquoted_identifiers("SELECT column1 FROM (VALUES (1))")
+        .unwrap();
+    assert!(
+        logical_plan_with_uppercase_unquoted_identifiers(
+            "SELECT \"column1\" FROM (VALUES (1))",
+        )
+        .is_err()
+    );
+
+    let mut config = datafusion_common::config::ConfigOptions::default();
+    config.sql_parser.uppercase_unquoted_identifiers = true;
+    let unnormalized = logical_plan_with_config_and_options(
+        "VALUES (1)",
+        config,
+        ParserOptions::default().with_enable_ident_normalization(false),
+    )
+    .unwrap();
+    assert_eq!(unnormalized.schema().field(0).name(), "column1");
+}
+
+#[test]
 fn uppercase_unquoted_prepared_statement_names() {
     use datafusion_expr::logical_plan::Statement as PlanStatement;
 
