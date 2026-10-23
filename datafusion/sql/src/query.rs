@@ -122,7 +122,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
     ) -> Result<LogicalPlan> {
         match pipe_operator {
             PipeOperator::Where { expr } => {
-                self.plan_selection(Some(expr), plan, planner_context)
+                self.plan_selection(Some(expr), plan, &[], planner_context)
             }
             PipeOperator::OrderBy { exprs } => {
                 let sort_exprs = self.order_by_to_sort_expr(
