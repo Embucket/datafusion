@@ -1256,7 +1256,7 @@ impl AsLogicalPlan for LogicalPlanNode {
                 let schema = convert_required!(*schema)?;
                 let cte_work_table = CteWorkTable::new(name.as_str(), Arc::new(schema));
                 LogicalPlanBuilder::scan(
-                    name.as_str(),
+                    TableReference::bare(name.as_str()),
                     provider_as_source(Arc::new(cte_work_table)),
                     None,
                 )?

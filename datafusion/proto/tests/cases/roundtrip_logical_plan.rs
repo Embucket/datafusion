@@ -3529,6 +3529,45 @@ async fn roundtrip_recursive_query() {
 }
 
 #[tokio::test]
+async fn roundtrip_recursive_query_preserves_normalized_name() -> Result<()> {
+    for query in [
+        "WITH RECURSIVE current_layer (component_id) AS (
+            SELECT 1 UNION ALL
+            SELECT current_layer.component_id + 1 FROM current_layer
+            WHERE current_layer.component_id < 3
+        ) SELECT component_id FROM current_layer",
+        "WITH RECURSIVE \"Mixed\" (\"n\") AS (
+            SELECT 1 UNION ALL
+            SELECT \"Mixed\".\"n\" + 1 FROM \"Mixed\"
+            WHERE \"Mixed\".\"n\" < 3
+        ) SELECT \"n\" FROM \"Mixed\"",
+    ] {
+        let mut config = SessionConfig::new();
+        config
+            .options_mut()
+            .sql_parser
+            .uppercase_unquoted_identifiers = true;
+        let ctx = SessionContext::new_with_config(config);
+        let plan = ctx.sql(query).await?.logical_plan().clone();
+        let output = ctx
+            .execute_logical_plan(plan.clone())
+            .await?
+            .collect()
+            .await?;
+        let bytes = logical_plan_to_bytes(&plan)?;
+        let decoded = logical_plan_from_bytes(&bytes, &ctx.task_ctx())?;
+
+        assert_eq!(format!("{plan:?}"), format!("{decoded:?}"));
+        let decoded_output = ctx.execute_logical_plan(decoded).await?.collect().await?;
+        assert_eq!(
+            pretty_format_batches(&output)?.to_string(),
+            pretty_format_batches(&decoded_output)?.to_string()
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn roundtrip_union_query() -> Result<()> {
     let query = "SELECT a FROM t1
         UNION (SELECT a from t1 UNION SELECT a from t2)";
