@@ -5187,6 +5187,218 @@ fn logical_plan(sql: &str) -> Result<LogicalPlan> {
     logical_plan_with_options(sql, ParserOptions::default())
 }
 
+#[test]
+fn snowflake_where_aliases_respect_input_columns() {
+    let mut config = datafusion_common::config::ConfigOptions::default();
+    config.sql_parser.dialect = datafusion_common::config::Dialect::Snowflake;
+
+    let plan = logical_plan_with_config(
+        "SELECT 1 AS age FROM person WHERE age = 42",
+        config.clone(),
+    )
+    .unwrap();
+    assert_contains!(
+        plan.display_indent().to_string(),
+        "Filter: person.age = Int64(42)"
+    );
+
+    let plan = logical_plan_with_config(
+        "SELECT age + 1 AS next_age FROM person WHERE next_age > 42",
+        config.clone(),
+    )
+    .unwrap();
+    assert_contains!(
+        plan.display_indent().to_string(),
+        "Filter: person.age + Int64(1) > Int64(42)"
+    );
+
+    let plan = logical_plan_with_config(
+        "SELECT age + 1 AS age FROM person WHERE age > 42",
+        config.clone(),
+    )
+    .unwrap();
+    assert_contains!(
+        plan.display_indent().to_string(),
+        "Filter: person.age > Int64(42)"
+    );
+
+    let plan = logical_plan_with_config(
+        "SELECT age + 1 AS \"NextAge\" FROM person WHERE \"NextAge\" + 1 > 42",
+        config.clone(),
+    )
+    .unwrap();
+    assert_contains!(
+        plan.display_indent().to_string(),
+        "Filter: person.age + Int64(1) + Int64(1) > Int64(42)"
+    );
+
+    let plan = logical_plan_with_config(
+        "WITH src AS (SELECT age FROM person) SELECT 1 AS age FROM src WHERE age > 42",
+        config.clone(),
+    )
+    .unwrap();
+    assert_contains!(
+        plan.display_indent().to_string(),
+        "Filter: src.age > Int64(42)"
+    );
+
+    let plan = logical_plan_with_config(
+        "SELECT 1 AS x FROM person WHERE EXISTS (SELECT age AS x FROM person p WHERE x > 42)",
+        config.clone(),
+    )
+    .unwrap();
+    assert_contains!(
+        plan.display_indent().to_string(),
+        "Filter: p.age > Int64(42)"
+    );
+
+    let plan = logical_plan_with_config("SELECT 123 AS a WHERE a > 100", config).unwrap();
+    assert_contains!(
+        plan.display_indent().to_string(),
+        "Filter: Int64(123) > Int64(100)"
+    );
+}
+
+#[test]
+fn snowflake_where_aliases_take_precedence_over_outer_columns() {
+    let mut config = datafusion_common::config::ConfigOptions::default();
+    config.sql_parser.dialect = datafusion_common::config::Dialect::Snowflake;
+
+    let plan = logical_plan_with_config(
+        "SELECT (SELECT 1 AS age WHERE age = 1) FROM person",
+        config,
+    )
+    .unwrap();
+    assert_contains!(plan.display_indent().to_string(), "Int64(1) = Int64(1)");
+}
+
+#[test]
+fn snowflake_where_aliases_keep_ambiguous_and_invalid_references() {
+    let mut config = datafusion_common::config::ConfigOptions::default();
+    config.sql_parser.dialect = datafusion_common::config::Dialect::Snowflake;
+
+    let err = logical_plan_with_config(
+        "SELECT 1 AS age FROM person p JOIN person q ON p.id = q.id WHERE age = 42",
+        config.clone(),
+    )
+    .unwrap_err();
+    assert_contains!(err.to_string(), "Ambiguous");
+
+    let err = logical_plan_with_config("SELECT a AS a WHERE a = 1", config.clone())
+        .unwrap_err();
+    assert_contains!(err.to_string(), "Circular SELECT alias in WHERE");
+
+    let err = logical_plan_with_config(
+        "SELECT SUM(age) AS total FROM person WHERE total > 42",
+        config,
+    )
+    .unwrap_err();
+    assert_contains!(
+        err.to_string(),
+        "Aggregate functions are not allowed in the WHERE clause"
+    );
+
+    let err = logical_plan("SELECT 123 AS a WHERE a > 100").unwrap_err();
+    assert_contains!(err.to_string(), "No field named a");
+}
+
+#[test]
+fn snowflake_where_aliases_do_not_capture_lambda_parameters() {
+    let mut state = MockSessionState::default()
+        .with_higher_order_function(Arc::new(HigherOrderUDF::new_from_impl(
+            MockArrayReduce::new(),
+        )))
+        .with_scalar_function(make_array_udf())
+        .with_expr_planner(Arc::new(CustomExprPlanner {}));
+    state.config_options.sql_parser.dialect =
+        datafusion_common::config::Dialect::Snowflake;
+
+    let plan = logical_plan_from_state(
+        "SELECT 999 AS acc WHERE array_reduce([1.0, 2.0], 0, (acc, v) -> acc + v, v -> -v) > 0",
+        &DatabricksDialect,
+        ParserOptions::default(),
+        state,
+    )
+    .unwrap();
+    assert_contains!(
+        plan.display_indent().to_string(),
+        "__DF_WHERE_ALIAS_LAMBDA_0 + v"
+    );
+
+    let mut state = MockSessionState::default()
+        .with_higher_order_function(Arc::new(HigherOrderUDF::new_from_impl(
+            MockArrayReduce::new(),
+        )))
+        .with_scalar_function(make_array_udf())
+        .with_expr_planner(Arc::new(CustomExprPlanner {}));
+    state.config_options.sql_parser.dialect =
+        datafusion_common::config::Dialect::Snowflake;
+    let plan = logical_plan_from_state(
+        "SELECT 5 AS k WHERE array_reduce([1.0, 2.0], 0, (acc, v) -> acc + k, v -> -v) > 0",
+        &DatabricksDialect,
+        ParserOptions::default(),
+        state,
+    )
+    .unwrap();
+    assert_contains!(plan.display_indent().to_string(), "acc + Int64(5)");
+}
+
+#[test]
+fn snowflake_where_aliases_in_lambda_preserve_column_sources() {
+    let mut state = MockSessionState::default()
+        .with_higher_order_function(Arc::new(HigherOrderUDF::new_from_impl(
+            MockArrayReduce::new(),
+        )))
+        .with_scalar_function(make_array_udf())
+        .with_expr_planner(Arc::new(CustomExprPlanner {}));
+    state.config_options.sql_parser.dialect =
+        datafusion_common::config::Dialect::Snowflake;
+    let plan = logical_plan_from_state(
+        "SELECT age + 1 AS k FROM person WHERE array_reduce([1.0, 2.0], 0, (age, v) -> age + k, v -> -v) > 0",
+        &DatabricksDialect,
+        ParserOptions::default(),
+        state,
+    )
+    .unwrap();
+    let plan = plan.display_indent().to_string();
+    assert_contains!(plan, "__DF_WHERE_ALIAS_LAMBDA_0 + person.age");
+
+    let mut state = MockSessionState::default()
+        .with_higher_order_function(Arc::new(HigherOrderUDF::new_from_impl(
+            MockArrayReduce::new(),
+        )))
+        .with_scalar_function(make_array_udf())
+        .with_expr_planner(Arc::new(CustomExprPlanner {}));
+    state.config_options.sql_parser.dialect =
+        datafusion_common::config::Dialect::Snowflake;
+    let plan = logical_plan_from_state(
+        "SELECT age + 1 AS k FROM (SELECT 10 AS age) WHERE array_reduce([1.0, 2.0], 0, (age, v) -> age + k, v -> -v) > 0",
+        &DatabricksDialect,
+        ParserOptions::default(),
+        state,
+    )
+    .unwrap();
+    let plan = plan.display_indent().to_string();
+    assert_contains!(plan, "__DF_WHERE_ALIAS_LAMBDA_0 + age");
+}
+
+#[test]
+fn snowflake_where_alias_expansion_is_bounded() {
+    let mut config = datafusion_common::config::ConfigOptions::default();
+    config.sql_parser.dialect = datafusion_common::config::Dialect::Snowflake;
+
+    let mut aliases = vec!["1 AS a0".to_string()];
+    for index in 1..20 {
+        aliases.push(format!(
+            "a{previous} + a{previous} AS a{index}",
+            previous = index - 1
+        ));
+    }
+    let sql = format!("SELECT {} WHERE a19 > 0", aliases.join(", "));
+    let err = logical_plan_with_config(&sql, config).unwrap_err();
+    assert_contains!(err.to_string(), "WHERE alias expansion exceeds");
+}
+
 fn logical_plan_with_config(
     sql: &str,
     config_options: datafusion_common::config::ConfigOptions,

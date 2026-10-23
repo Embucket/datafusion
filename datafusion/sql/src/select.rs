@@ -15,11 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
 use std::sync::Arc;
 
-use crate::planner::{ContextProvider, PlannerContext, SqlToRel};
+use crate::planner::{ContextProvider, IdentNormalizer, PlannerContext, SqlToRel};
 use crate::query::to_order_by_exprs_with_select;
 use crate::utils::{
     CheckColumnsMustReferenceAggregatePurpose, CheckColumnsSatisfyExprsPurpose,
@@ -33,7 +33,9 @@ use arrow::datatypes::DataType;
 use datafusion_common::config::Dialect as SqlDialect;
 use datafusion_common::error::DataFusionErrorBuilder;
 use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
-use datafusion_common::{Column, DFSchema, DFSchemaRef, Result, not_impl_err, plan_err};
+use datafusion_common::{
+    Column, DFSchema, DFSchemaRef, Result, not_impl_err, plan_datafusion_err, plan_err,
+};
 use datafusion_common::{NullHandling, RecursionUnnestOption, UnnestOptions};
 use datafusion_expr::ExprSchemable;
 use datafusion_expr::builder::get_struct_unnested_columns;
@@ -54,11 +56,12 @@ use datafusion_expr::{
 
 use indexmap::IndexMap;
 use sqlparser::ast::{
-    Distinct, ExcludeSelectItem, Expr as SQLExpr, GroupByExpr, NamedWindowExpr,
-    ObjectNamePart, OrderBy, RenameSelectItem, SelectItemQualifiedWildcardKind,
-    WildcardAdditionalOptions, WindowType, visit_expressions_mut,
+    Distinct, ExcludeSelectItem, Expr as SQLExpr, GroupByExpr, Ident, NamedWindowExpr,
+    ObjectNamePart, OneOrManyWithParens, OrderBy, RenameSelectItem,
+    SelectItemQualifiedWildcardKind, VisitMut, VisitorMut, WildcardAdditionalOptions,
+    WindowType, visit_expressions, visit_expressions_mut,
 };
-use sqlparser::ast::{NamedWindowDefinition, Select, SelectItem, TableWithJoins};
+use sqlparser::ast::{NamedWindowDefinition, Query, Select, SelectItem, TableWithJoins};
 
 /// Result of the `aggregate` function, containing the aggregate plan and
 /// rewritten expressions that reference the aggregate output columns.
@@ -87,6 +90,303 @@ struct DistinctOnUnnestPlanResult {
 struct RewrittenUnnestExprGroups {
     plan: LogicalPlan,
     expr_groups: Vec<Vec<Expr>>,
+}
+
+const MAX_WHERE_ALIAS_EXPANSIONS: usize = 256;
+const MAX_WHERE_ALIAS_NODES: usize = 4096;
+
+struct WhereAliasResolver<'a> {
+    normalizer: IdentNormalizer,
+    input_schema: &'a DFSchema,
+    projection: &'a [SelectItem],
+    aliases: HashMap<String, Option<&'a SQLExpr>>,
+    expanded: HashMap<String, SQLExpr>,
+    active: HashSet<String>,
+    replacements: usize,
+    replacement_nodes: usize,
+    query_depth: usize,
+}
+
+impl<'a> WhereAliasResolver<'a> {
+    fn new(
+        normalizer: IdentNormalizer,
+        input_schema: &'a DFSchema,
+        projection: &'a [SelectItem],
+    ) -> Self {
+        let mut aliases: HashMap<String, Option<&SQLExpr>> = HashMap::new();
+        for item in projection {
+            if let SelectItem::ExprWithAlias { expr, alias } = item {
+                let name = normalizer.normalize(alias.clone());
+                aliases
+                    .entry(name)
+                    .and_modify(|existing| *existing = None)
+                    .or_insert(Some(expr));
+            }
+        }
+        Self {
+            normalizer,
+            input_schema,
+            projection,
+            aliases,
+            expanded: HashMap::new(),
+            active: HashSet::new(),
+            replacements: 0,
+            replacement_nodes: 0,
+            query_depth: 0,
+        }
+    }
+
+    fn resolve(&mut self, expr: &mut SQLExpr) -> Result<()> {
+        match expr.visit(self) {
+            ControlFlow::Continue(()) => Ok(()),
+            ControlFlow::Break(error) => Err(error),
+        }
+    }
+
+    fn resolve_alias(&mut self, name: &str) -> Result<SQLExpr> {
+        if let Some(expr) = self.expanded.get(name) {
+            return Ok(expr.clone());
+        }
+        let Some(alias) = self.aliases.get(name).copied().flatten() else {
+            return plan_err!("Ambiguous SELECT alias in WHERE: {name}");
+        };
+        if !self.active.insert(name.to_string()) {
+            return plan_err!("Circular SELECT alias in WHERE: {name}");
+        }
+        let mut expr = alias.clone();
+        if contains_lambda(&expr) {
+            WhereLambdaAlphaRenamer::new(
+                self.normalizer,
+                self.input_schema,
+                self.projection,
+                &expr,
+            )
+            .rename(&mut expr)?;
+        }
+        self.resolve(&mut expr)?;
+        self.active.remove(name);
+        self.expanded.insert(name.to_string(), expr.clone());
+        Ok(expr)
+    }
+
+    fn count_replacement_nodes(&mut self, expr: &SQLExpr) -> Result<()> {
+        let remaining = MAX_WHERE_ALIAS_NODES - self.replacement_nodes;
+        let mut nodes = 0;
+        let result = visit_expressions(expr, |_: &SQLExpr| {
+            nodes += 1;
+            if nodes > remaining {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        });
+        if result.is_break() {
+            return plan_err!(
+                "WHERE alias expansion exceeds {MAX_WHERE_ALIAS_NODES} expression nodes"
+            );
+        }
+        self.replacement_nodes += nodes;
+        Ok(())
+    }
+}
+
+fn contains_lambda(expr: &SQLExpr) -> bool {
+    visit_expressions(expr, |node| {
+        if matches!(node, SQLExpr::Lambda(_)) {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    })
+    .is_break()
+}
+
+struct WhereLambdaAlphaRenamer {
+    normalizer: IdentNormalizer,
+    relevant_names: HashSet<String>,
+    used_names: HashSet<String>,
+    scopes: Vec<HashMap<String, Ident>>,
+    query_boundaries: Vec<usize>,
+    next_name: usize,
+}
+
+impl WhereLambdaAlphaRenamer {
+    fn new(
+        normalizer: IdentNormalizer,
+        input_schema: &DFSchema,
+        projection: &[SelectItem],
+        predicate: &SQLExpr,
+    ) -> Self {
+        let mut relevant_names = HashSet::new();
+        let mut used_names = HashSet::new();
+        for item in projection {
+            if let SelectItem::ExprWithAlias { expr, alias } = item {
+                let name = normalizer.normalize(alias.clone());
+                relevant_names.insert(name.clone());
+                used_names.insert(name);
+                let _ = visit_expressions(expr, |node| {
+                    Self::collect_names(normalizer, node, &mut relevant_names);
+                    Self::collect_names(normalizer, node, &mut used_names);
+                    ControlFlow::<()>::Continue(())
+                });
+            }
+        }
+        let _ = visit_expressions(predicate, |node| {
+            Self::collect_names(normalizer, node, &mut used_names);
+            ControlFlow::<()>::Continue(())
+        });
+        for (_, field) in input_schema.iter() {
+            used_names.insert(field.name().to_string());
+        }
+        Self {
+            normalizer,
+            relevant_names,
+            used_names,
+            scopes: Vec::new(),
+            query_boundaries: Vec::new(),
+            next_name: 0,
+        }
+    }
+
+    fn collect_names(
+        normalizer: IdentNormalizer,
+        node: &SQLExpr,
+        names: &mut HashSet<String>,
+    ) {
+        if let SQLExpr::Identifier(ident) = node {
+            names.insert(normalizer.normalize(ident.clone()));
+        }
+        if let SQLExpr::Lambda(lambda) = node {
+            names.extend(
+                lambda
+                    .params
+                    .iter()
+                    .map(|param| normalizer.normalize(param.name.clone())),
+            );
+        }
+    }
+
+    fn fresh_name(&mut self) -> Ident {
+        loop {
+            let name = format!("__DF_WHERE_ALIAS_LAMBDA_{}", self.next_name);
+            self.next_name += 1;
+            if self.used_names.insert(name.clone()) {
+                return Ident::with_quote('"', name);
+            }
+        }
+    }
+
+    fn rename(&mut self, expr: &mut SQLExpr) -> Result<()> {
+        match expr.visit(self) {
+            ControlFlow::Continue(()) => Ok(()),
+            ControlFlow::Break(error) => Err(error),
+        }
+    }
+}
+
+impl VisitorMut for WhereLambdaAlphaRenamer {
+    type Break = datafusion_common::DataFusionError;
+
+    fn pre_visit_expr(&mut self, expr: &mut SQLExpr) -> ControlFlow<Self::Break> {
+        if let SQLExpr::Lambda(lambda) = expr {
+            let mut scope = HashMap::new();
+            let mut seen = HashSet::new();
+            let params = match &mut lambda.params {
+                OneOrManyWithParens::One(param) => std::slice::from_mut(param),
+                OneOrManyWithParens::Many(params) => params.as_mut_slice(),
+            };
+            for param in params {
+                let name = self.normalizer.normalize(param.name.clone());
+                if !seen.insert(name.clone()) {
+                    return ControlFlow::Break(plan_datafusion_err!(
+                        "Duplicate lambda parameter: {name}"
+                    ));
+                }
+                if self.relevant_names.contains(&name) {
+                    let replacement = self.fresh_name();
+                    scope.insert(name, replacement.clone());
+                    param.name = replacement;
+                }
+            }
+            self.scopes.push(scope);
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_query(&mut self, _query: &mut Query) -> ControlFlow<Self::Break> {
+        self.query_boundaries.push(self.scopes.len());
+        ControlFlow::Continue(())
+    }
+
+    fn post_visit_query(&mut self, _query: &mut Query) -> ControlFlow<Self::Break> {
+        self.query_boundaries.pop();
+        ControlFlow::Continue(())
+    }
+
+    fn post_visit_expr(&mut self, expr: &mut SQLExpr) -> ControlFlow<Self::Break> {
+        if matches!(expr, SQLExpr::Lambda(_)) {
+            self.scopes.pop();
+            return ControlFlow::Continue(());
+        }
+        let SQLExpr::Identifier(ident) = expr else {
+            return ControlFlow::Continue(());
+        };
+        let name = self.normalizer.normalize(ident.clone());
+        let start = self.query_boundaries.last().copied().unwrap_or(0);
+        if let Some(replacement) = self.scopes[start..]
+            .iter()
+            .rev()
+            .find_map(|scope| scope.get(&name))
+        {
+            *ident = replacement.clone();
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+impl VisitorMut for WhereAliasResolver<'_> {
+    type Break = datafusion_common::DataFusionError;
+
+    fn pre_visit_query(&mut self, _query: &mut Query) -> ControlFlow<Self::Break> {
+        self.query_depth += 1;
+        ControlFlow::Continue(())
+    }
+
+    fn post_visit_query(&mut self, _query: &mut Query) -> ControlFlow<Self::Break> {
+        self.query_depth -= 1;
+        ControlFlow::Continue(())
+    }
+
+    fn post_visit_expr(&mut self, expr: &mut SQLExpr) -> ControlFlow<Self::Break> {
+        if self.query_depth != 0 {
+            return ControlFlow::Continue(());
+        }
+        let SQLExpr::Identifier(identifier) = expr else {
+            return ControlFlow::Continue(());
+        };
+        let name = self.normalizer.normalize(identifier.clone());
+        if self.input_schema.has_column_with_unqualified_name(&name)
+            || !self.aliases.contains_key(&name)
+        {
+            return ControlFlow::Continue(());
+        }
+        if self.replacements >= MAX_WHERE_ALIAS_EXPANSIONS {
+            return ControlFlow::Break(plan_datafusion_err!(
+                "WHERE alias expansion exceeds {MAX_WHERE_ALIAS_EXPANSIONS} references"
+            ));
+        }
+        self.replacements += 1;
+        match self.resolve_alias(&name) {
+            Ok(replacement) => {
+                if let Err(error) = self.count_replacement_nodes(&replacement) {
+                    return ControlFlow::Break(error);
+                }
+                *expr = replacement;
+                ControlFlow::Continue(())
+            }
+            Err(error) => ControlFlow::Break(error),
+        }
+    }
 }
 
 fn contains_nested_window_function(expr: &Expr) -> Result<bool> {
@@ -190,7 +490,12 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         let empty_from = matches!(plan, LogicalPlan::EmptyRelation(_));
 
         // Process `where` clause
-        let base_plan = self.plan_selection(select.selection, plan, planner_context)?;
+        let base_plan = self.plan_selection(
+            select.selection,
+            plan,
+            &select.projection,
+            planner_context,
+        )?;
 
         // Handle named windows before processing the projection expression
         check_conflicting_windows(&select.named_window)?;
@@ -1047,13 +1352,36 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         &self,
         selection: Option<SQLExpr>,
         plan: LogicalPlan,
+        projection: &[SelectItem],
         planner_context: &mut PlannerContext,
     ) -> Result<LogicalPlan> {
         match selection {
-            Some(predicate_expr) => {
+            Some(mut predicate_expr) => {
                 let fallback_schemas = plan.fallback_normalize_schemas();
 
                 self.warn_on_null_equality_predicate(&predicate_expr);
+                if self.context_provider.options().sql_parser.dialect
+                    == SqlDialect::Snowflake
+                    && projection
+                        .iter()
+                        .any(|item| matches!(item, SelectItem::ExprWithAlias { .. }))
+                {
+                    if contains_lambda(&predicate_expr) {
+                        WhereLambdaAlphaRenamer::new(
+                            self.ident_normalizer,
+                            plan.schema(),
+                            projection,
+                            &predicate_expr,
+                        )
+                        .rename(&mut predicate_expr)?;
+                    }
+                    WhereAliasResolver::new(
+                        self.ident_normalizer,
+                        plan.schema(),
+                        projection,
+                    )
+                    .resolve(&mut predicate_expr)?;
+                }
                 let filter_expr =
                     self.sql_to_expr(predicate_expr, plan.schema(), planner_context)?;
 
