@@ -3756,6 +3756,40 @@ fn uppercase_unquoted_identifiers_apply_to_values_columns() {
 }
 
 #[test]
+fn recursive_cte_preserves_normalized_and_quoted_names() {
+    let mut config = datafusion_common::config::ConfigOptions::default();
+    config.sql_parser.uppercase_unquoted_identifiers = true;
+    config.execution.enable_recursive_ctes = true;
+
+    for (sql, table_name) in [
+        (
+            "WITH RECURSIVE current_layer (component_id) AS (\
+             SELECT 1 UNION ALL \
+             SELECT current_layer.component_id + 1 FROM current_layer \
+             WHERE current_layer.component_id < 3) \
+             SELECT component_id FROM current_layer",
+            "CURRENT_LAYER",
+        ),
+        (
+            "WITH RECURSIVE \"Mixed\" (\"n\") AS (\
+             SELECT 1 UNION ALL \
+             SELECT \"Mixed\".\"n\" + 1 FROM \"Mixed\" \
+             WHERE \"Mixed\".\"n\" < 3) \
+             SELECT \"n\" FROM \"Mixed\"",
+            "Mixed",
+        ),
+    ] {
+        let plan = logical_plan_with_config(sql, config.clone()).unwrap();
+        let display = plan.display_indent().to_string();
+        assert!(display.contains("RecursiveQuery"), "{display}");
+        assert!(
+            display.contains(&format!("TableScan: {table_name}")),
+            "{display}"
+        );
+    }
+}
+
+#[test]
 fn uppercase_unquoted_prepared_statement_names() {
     use datafusion_expr::logical_plan::Statement as PlanStatement;
 

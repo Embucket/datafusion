@@ -162,7 +162,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         // Step 2.2: Create a temporary relation logical plan that will be used
         // as the input to the recursive term
         let work_table_plan = LogicalPlanBuilder::scan(
-            cte_name.to_string(),
+            TableReference::bare(cte_name.to_string()),
             Arc::clone(&work_table_source),
             None,
         )?
