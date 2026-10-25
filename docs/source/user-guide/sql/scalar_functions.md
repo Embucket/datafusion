@@ -3264,6 +3264,7 @@ _Alias of [current_date](#current_date)._
 - [array_product](#array_product)
 - [array_push_back](#array_push_back)
 - [array_push_front](#array_push_front)
+- [array_reduce](#array_reduce)
 - [array_remove](#array_remove)
 - [array_remove_all](#array_remove_all)
 - [array_remove_n](#array_remove_n)
@@ -4214,6 +4215,31 @@ _Alias of [array_append](#array_append)._
 ### `array_push_front`
 
 _Alias of [array_prepend](#array_prepend)._
+
+### `array_reduce`
+
+Reduces an array to a single value by applying a binary lambda to the accumulator and each array element in order.
+
+```sql
+array_reduce(array, initial, (acc, value) -> expression)
+```
+
+#### Arguments
+
+- **array**: Array expression to reduce.
+- **initial**: Initial accumulator value.
+- **merge**: Binary lambda whose parameters are the accumulator and current array element.
+
+#### Example
+
+```sql
+> select array_reduce([1, 2, 3], 0, (acc, value) -> acc + value);
++----------------------------------------------------------------+
+| array_reduce([1,2,3],0,(acc,value) -> acc + value)              |
++----------------------------------------------------------------+
+| 6                                                              |
++----------------------------------------------------------------+
+```
 
 ### `array_remove`
 
