@@ -16,6 +16,7 @@
 // under the License.
 
 use std::ops::ControlFlow;
+use std::sync::Arc;
 
 use arrow::datatypes::{DataType, TimeUnit};
 use datafusion_expr::planner::{
@@ -29,6 +30,7 @@ use sqlparser::ast::{
 };
 use sqlparser::ast::{Query, Visit, Visitor};
 
+use datafusion_common::config::Dialect as SqlDialect;
 use datafusion_common::{
     DFSchema, Diagnostic, Result, ScalarValue, Span, internal_datafusion_err,
     internal_err, not_impl_err, plan_err,
@@ -43,6 +45,7 @@ use datafusion_expr::{
 };
 
 use crate::planner::{ContextProvider, PlannerContext, SqlToRel};
+use datafusion_expr::expr::EXPLICIT_SQL_TRY_CAST_METADATA_KEY;
 use datafusion_functions_nested::expr_fn::{
     array_has, array_max, array_min, array_position, cardinality,
 };
@@ -362,7 +365,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             }
 
             SQLExpr::Cast {
-                kind: CastKind::TryCast | CastKind::SafeCast,
+                kind: kind @ (CastKind::TryCast | CastKind::SafeCast),
                 expr,
                 data_type,
                 format,
@@ -372,13 +375,23 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     return not_impl_err!("CAST with format is not supported: {format}");
                 }
 
+                let mut field = self.convert_data_type_to_field(&data_type)?;
+                if kind == CastKind::TryCast
+                    && self.context_provider.options().sql_parser.dialect
+                        == SqlDialect::Snowflake
+                {
+                    let mut metadata = field.metadata().clone();
+                    metadata
+                        .insert(EXPLICIT_SQL_TRY_CAST_METADATA_KEY.into(), "true".into());
+                    field = Arc::new(field.as_ref().clone().with_metadata(metadata));
+                }
                 Ok(Expr::TryCast(TryCast::new_from_field(
                     Box::new(self.sql_expr_to_logical_expr(
                         *expr,
                         schema,
                         planner_context,
                     )?),
-                    self.convert_data_type_to_field(&data_type)?,
+                    field,
                 )))
             }
 
@@ -1572,6 +1585,54 @@ mod tests {
     test_stack_overflow!(test_stack_overflow_2048, 2048);
     test_stack_overflow!(test_stack_overflow_4096, 4096);
     test_stack_overflow!(test_stack_overflow_8192, 8192);
+
+    #[test]
+    fn snowflake_sql_try_cast_marks_expression_only() {
+        let dialect = GenericDialect {};
+        let mut parser = Parser::new(&dialect)
+            .try_with_sql("TRY_CAST(column1 AS INTEGER)")
+            .unwrap();
+        let sql_expr = parser.parse_expr().unwrap();
+        let schema = DFSchema::try_from_qualified_schema(
+            "table1",
+            &Schema::new(vec![Field::new("column1", DataType::Utf8, false)]),
+        )
+        .unwrap();
+
+        let mut context_provider = TestContextProvider::new();
+        context_provider.options.sql_parser.dialect = SqlDialect::Snowflake;
+        let planned = SqlToRel::new(&context_provider)
+            .sql_expr_to_logical_expr(
+                sql_expr.clone(),
+                &schema,
+                &mut PlannerContext::default(),
+            )
+            .unwrap();
+        let Expr::TryCast(cast) = planned else {
+            panic!("expected TRY_CAST");
+        };
+        assert_eq!(
+            cast.field
+                .metadata()
+                .get(EXPLICIT_SQL_TRY_CAST_METADATA_KEY),
+            Some(&"true".to_string())
+        );
+
+        let generic = TestContextProvider::new();
+        let planned = SqlToRel::new(&generic)
+            .sql_expr_to_logical_expr(sql_expr, &schema, &mut PlannerContext::default())
+            .unwrap();
+        let Expr::TryCast(cast) = planned else {
+            panic!("expected TRY_CAST");
+        };
+        assert!(
+            !cast
+                .field
+                .metadata()
+                .contains_key(EXPLICIT_SQL_TRY_CAST_METADATA_KEY)
+        );
+    }
+
     #[test]
     fn test_sql_to_expr_with_alias() {
         let schema = DFSchema::empty();

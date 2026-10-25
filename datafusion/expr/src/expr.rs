@@ -1043,6 +1043,9 @@ impl Cast {
     }
 }
 
+/// Temporary provenance marker for `TRY_CAST` parsed from Snowflake SQL.
+pub const EXPLICIT_SQL_TRY_CAST_METADATA_KEY: &str = "datafusion.sql.explicit_try_cast";
+
 /// TryCast Expression
 #[derive(Clone, PartialEq, Eq, PartialOrd, Hash, Debug)]
 pub struct TryCast {
