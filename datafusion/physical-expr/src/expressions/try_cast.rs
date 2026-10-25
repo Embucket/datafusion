@@ -31,6 +31,7 @@ use datafusion_common::datatype::DataTypeExt;
 use datafusion_common::format::DEFAULT_FORMAT_OPTIONS;
 use datafusion_common::{Result, not_impl_err};
 use datafusion_expr::ColumnarValue;
+use datafusion_expr::expr::cast_metadata_is_type_only;
 
 /// TRY_CAST expression casts an expression to a specific data type and returns NULL on invalid cast
 #[derive(Debug, Clone, Eq)]
@@ -308,7 +309,7 @@ pub fn try_cast_with_target_field(
     // when only a DataType is known.
     let is_type_only = target_field.name().is_empty()
         && target_field.is_nullable()
-        && target_field.metadata().is_empty();
+        && cast_metadata_is_type_only(target_field.metadata());
 
     // For same-type casts, we can skip creating a TryCastExpr only if:
     // 1. The target is type-only (no explicit metadata)
@@ -334,9 +335,19 @@ pub fn try_cast_with_target_field(
     if is_type_only {
         Ok(Arc::new(TryCastExpr::new(expr, cast_type.clone())))
     } else {
+        let target_field = if target_field
+            .metadata()
+            .contains_key(datafusion_expr::expr::EXPLICIT_SQL_TRY_CAST_METADATA_KEY)
+        {
+            let mut metadata = target_field.metadata().clone();
+            metadata.remove(datafusion_expr::expr::EXPLICIT_SQL_TRY_CAST_METADATA_KEY);
+            Arc::new(target_field.as_ref().clone().with_metadata(metadata))
+        } else {
+            Arc::clone(target_field)
+        };
         Ok(Arc::new(TryCastExpr::new_with_target_field(
             expr,
-            Arc::clone(target_field),
+            target_field,
         )))
     }
 }
@@ -889,6 +900,39 @@ mod tests {
             );
         }
 
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_sql_marker_preserves_same_type_fast_path() -> Result<()> {
+        let schema = Schema::new(vec![Field::new("a", DataType::Int32, true)]);
+        let input = col("a", &schema)?;
+        let target = Arc::new(Field::new("", DataType::Int32, true).with_metadata(
+            HashMap::from([(
+                datafusion_expr::expr::EXPLICIT_SQL_TRY_CAST_METADATA_KEY.to_string(),
+                "true".to_string(),
+            )]),
+        ));
+        let cast = try_cast_with_target_field(Arc::clone(&input), &schema, &target)?;
+        assert!(Arc::ptr_eq(&input, &cast));
+
+        let target = Arc::new(Field::new("", DataType::Int64, true).with_metadata(
+            HashMap::from([
+                (
+                    datafusion_expr::expr::EXPLICIT_SQL_TRY_CAST_METADATA_KEY.to_string(),
+                    "true".to_string(),
+                ),
+                ("target_key".to_string(), "x".to_string()),
+            ]),
+        ));
+        let cast = try_cast_with_target_field(input, &schema, &target)?;
+        let output = cast.return_field(&schema)?;
+        assert_eq!(output.metadata().get("target_key"), Some(&"x".to_string()));
+        assert!(
+            !output
+                .metadata()
+                .contains_key(datafusion_expr::expr::EXPLICIT_SQL_TRY_CAST_METADATA_KEY)
+        );
         Ok(())
     }
 

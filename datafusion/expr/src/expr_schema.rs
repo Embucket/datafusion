@@ -18,9 +18,10 @@
 use super::{Between, Expr, Like, predicate_bounds};
 use crate::ValueOrLambda;
 use crate::expr::{
-    AggregateFunction, AggregateFunctionParams, Alias, BinaryExpr, Case, Cast, InList,
-    InSubquery, Lambda, Placeholder, ScalarFunction, TryCast, Unnest, WindowFunction,
-    WindowFunctionParams,
+    AggregateFunction, AggregateFunctionParams, Alias, BinaryExpr, Case, Cast,
+    EXPLICIT_SQL_TRY_CAST_METADATA_KEY, InList, InSubquery, Lambda, Placeholder,
+    ScalarFunction, TryCast, Unnest, WindowFunction, WindowFunctionParams,
+    cast_metadata_is_type_only,
 };
 use crate::expr::{FieldMetadata, LambdaVariable};
 use crate::higher_order_function::HigherOrderReturnFieldArgs;
@@ -95,9 +96,9 @@ fn cast_output_field(
     // Check if this is a "type-only" cast (target_field == DataType::X.into_nullable_field())
     let is_type_only = target_field.name().is_empty()
         && target_field.is_nullable()
-        && target_field.metadata().is_empty();
+        && cast_metadata_is_type_only(target_field.metadata());
 
-    let metadata = if is_type_only {
+    let mut metadata = if is_type_only {
         // Type-only cast: propagate source metadata, stripping extension type keys
         let mut meta = source_field.metadata().clone();
         meta.remove(EXTENSION_TYPE_NAME_KEY);
@@ -107,6 +108,7 @@ fn cast_output_field(
         // Explicit target field: use target metadata exactly
         target_field.metadata().clone()
     };
+    metadata.remove(EXPLICIT_SQL_TRY_CAST_METADATA_KEY);
 
     let mut f = source_field
         .as_ref()
@@ -1087,6 +1089,32 @@ mod tests {
 
     use arrow::datatypes::Schema;
     use datafusion_common::{DFSchema, assert_or_internal_err};
+
+    #[test]
+    fn explicit_sql_try_cast_marker_is_not_output_metadata() {
+        let source =
+            Arc::new(Field::new("source", DataType::Utf8, false).with_metadata(
+                HashMap::from([("source_key".to_string(), "x".to_string())]),
+            ));
+        let target = Arc::new(Field::new("", DataType::Int64, true).with_metadata(
+            HashMap::from([(
+                EXPLICIT_SQL_TRY_CAST_METADATA_KEY.to_string(),
+                "true".to_string(),
+            )]),
+        ));
+        let output = cast_output_field(&source, &target, true);
+        assert!(
+            target
+                .metadata()
+                .contains_key(EXPLICIT_SQL_TRY_CAST_METADATA_KEY)
+        );
+        assert!(
+            !output
+                .metadata()
+                .contains_key(EXPLICIT_SQL_TRY_CAST_METADATA_KEY)
+        );
+        assert_eq!(output.metadata().get("source_key"), Some(&"x".to_string()));
+    }
 
     #[test]
     fn scalar_function_preserves_udf_coercion_error_source() {
