@@ -1046,6 +1046,15 @@ impl Cast {
 /// Temporary provenance marker for `TRY_CAST` parsed from Snowflake SQL.
 pub const EXPLICIT_SQL_TRY_CAST_METADATA_KEY: &str = "datafusion.sql.explicit_try_cast";
 
+/// SQL provenance is not a target-field constraint for cast planning.
+pub fn cast_metadata_is_type_only(
+    metadata: &std::collections::HashMap<String, String>,
+) -> bool {
+    metadata.is_empty()
+        || (metadata.len() == 1
+            && metadata.contains_key(EXPLICIT_SQL_TRY_CAST_METADATA_KEY))
+}
+
 /// TryCast Expression
 #[derive(Clone, PartialEq, Eq, PartialOrd, Hash, Debug)]
 pub struct TryCast {
@@ -3637,8 +3646,16 @@ impl Display for Expr {
                 write!(f, "CAST({expr} AS {formatted})")
             }
             Expr::TryCast(TryCast { expr, field }) => {
-                let formatted =
-                    format_type_and_metadata(field.data_type(), Some(field.metadata()));
+                let formatted = if field
+                    .metadata()
+                    .contains_key(EXPLICIT_SQL_TRY_CAST_METADATA_KEY)
+                {
+                    let mut metadata = field.metadata().clone();
+                    metadata.remove(EXPLICIT_SQL_TRY_CAST_METADATA_KEY);
+                    format_type_and_metadata(field.data_type(), Some(&metadata))
+                } else {
+                    format_type_and_metadata(field.data_type(), Some(field.metadata()))
+                };
                 write!(f, "TRY_CAST({expr} AS {formatted})")
             }
             Expr::Not(expr) => write!(f, "NOT {expr}"),

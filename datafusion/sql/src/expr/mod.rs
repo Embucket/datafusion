@@ -1617,6 +1617,11 @@ mod tests {
                 .get(EXPLICIT_SQL_TRY_CAST_METADATA_KEY),
             Some(&"true".to_string())
         );
+        assert!(
+            !Expr::TryCast(cast.clone())
+                .to_string()
+                .contains(EXPLICIT_SQL_TRY_CAST_METADATA_KEY)
+        );
 
         let generic = TestContextProvider::new();
         let planned = SqlToRel::new(&generic)
