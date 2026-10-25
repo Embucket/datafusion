@@ -2799,7 +2799,7 @@ mod tests {
             "SET datafusion.sql_parser.uppercase_unquoted_identifiers = false",
             "RESET datafusion.sql_parser.uppercase_unquoted_identifiers",
         ] {
-            let error = ctx.sql(sql).await.err().expect("startup-only setting");
+            let error = ctx.sql(sql).await.expect_err("startup-only setting");
             assert!(
                 error
                     .to_string()

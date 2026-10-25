@@ -1701,6 +1701,7 @@ mod tests {
         let config = InformationSchemaConfig {
             catalog_list: Arc::new(Fixture),
             table_functions: HashMap::new(),
+            uppercase_identifiers: false,
         };
         let mut builder = InformationSchemaTablesBuilder {
             catalog_names: StringBuilder::new(),
