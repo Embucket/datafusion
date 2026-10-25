@@ -1261,7 +1261,7 @@ mod tests {
                 .try_collect::<Vec<_>>()
                 .await
                 .expect_err("full-file blank record must fail")
-                .to_string();
+                .strip_backtrace();
             let mut ranged_file = file;
             ranged_file.range = Some(FileRange {
                 start: range_start,
@@ -1273,7 +1273,7 @@ mod tests {
                 .try_collect::<Vec<_>>()
                 .await
                 .expect_err("ranged blank record must fail")
-                .to_string();
+                .strip_backtrace();
             assert_eq!(ranged_error, full_error, "{name}");
         }
         Ok(())
