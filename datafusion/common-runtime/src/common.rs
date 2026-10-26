@@ -67,6 +67,12 @@ impl<R: 'static> SpawnedTask<R> {
         self.await
     }
 
+    /// Request cancellation while retaining the handle so callers can await
+    /// task termination before cleaning up resources it may have touched.
+    pub fn abort(&self) {
+        self.inner.abort();
+    }
+
     /// Joins the task and unwinds the panic if it happens.
     pub async fn join_unwind(mut self) -> Result<R, JoinError> {
         self.join_unwind_mut().await
@@ -185,5 +191,17 @@ mod tests {
 
         // The sender was dropped so we receive `None`.
         assert!(receiver.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn abort_then_join_waits_for_cancellation() {
+        let (started, receiver) = oneshot::channel();
+        let task = SpawnedTask::spawn(async move {
+            let _ = started.send(());
+            pending::<()>().await;
+        });
+        receiver.await.unwrap();
+        task.abort();
+        assert!(matches!(task.join().await, Err(error) if error.is_cancelled()));
     }
 }

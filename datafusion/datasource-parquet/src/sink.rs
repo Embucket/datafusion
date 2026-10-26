@@ -45,8 +45,8 @@ use datafusion_execution::{SendableRecordBatchStream, TaskContext};
 #[cfg(feature = "proto")]
 use datafusion_physical_plan::ExecutionPlan;
 use datafusion_physical_plan::metrics::{
-    ElapsedComputeFutureExt, ExecutionPlanMetricsSet, MetricBuilder, MetricCategory,
-    MetricsSet, Time,
+    Count, ElapsedComputeFutureExt, ExecutionPlanMetricsSet, MetricBuilder,
+    MetricCategory, MetricsSet, Time,
 };
 use datafusion_physical_plan::{DisplayAs, DisplayFormatType};
 use object_store::ObjectStore;
@@ -66,6 +66,7 @@ use parquet::file::properties::{
 use parquet::file::writer::SerializedFileWriter;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc::{self, Receiver, Sender};
+use tokio::task::JoinError;
 
 /// Initial writing buffer size. Note this is just a size hint for efficiency. It
 /// will grow beyond the set value if needed.
@@ -207,6 +208,39 @@ impl ParquetSink {
     pub fn parquet_options(&self) -> &TableParquetOptions {
         &self.parquet_options
     }
+
+    fn record_writer_result(
+        &self,
+        result: std::result::Result<Result<(Path, ParquetMetaData)>, JoinError>,
+        rows_written: &Count,
+        bytes_written: &Count,
+    ) -> Result<()> {
+        let (path, parquet_meta_data) = match result {
+            Ok(result) => result?,
+            Err(error) if error.is_panic() => {
+                std::panic::resume_unwind(error.into_panic());
+            }
+            Err(error) => return Err(DataFusionError::ExecutionJoin(Box::new(error))),
+        };
+        let file_rows = parquet_meta_data.file_metadata().num_rows() as usize;
+        let file_bytes: usize = parquet_meta_data
+            .row_groups()
+            .iter()
+            .map(|group| group.compressed_size() as usize)
+            .sum();
+        let mut written_files = self.written.lock();
+        written_files
+            .try_insert(path.clone(), parquet_meta_data)
+            .map_err(|error| {
+                internal_datafusion_err!(
+                    "duplicate entry detected for partitioned file {path}: {error}"
+                )
+            })?;
+        drop(written_files);
+        rows_written.add(file_rows);
+        bytes_written.add(file_bytes);
+        Ok(())
+    }
 }
 
 #[cfg(feature = "parquet_encryption")]
@@ -294,19 +328,53 @@ impl FileSink for ParquetSink {
                 .maximum_buffered_record_batches_per_stream,
         };
 
-        while let Some((path, mut rx)) = file_stream_rx.recv().await {
-            let parquet_props = self.create_writer_props(&runtime, &path).await?;
+        let mut writer_error = None;
+        loop {
+            let has_writers = !file_write_tasks.is_empty();
+            let next_file = tokio::select! {
+                biased;
+                result = file_write_tasks.join_next(), if has_writers => {
+                    if let Some(result) = result {
+                        if let Err(error) = self.record_writer_result(
+                            result,
+                            &rows_written_counter,
+                            &bytes_written_counter,
+                        ) {
+                            writer_error = Some(error);
+                            break;
+                        }
+                    }
+                    continue;
+                }
+                next_file = file_stream_rx.recv() => next_file,
+            };
+            let Some((path, mut rx)) = next_file else {
+                break;
+            };
+            let parquet_props = match self.create_writer_props(&runtime, &path).await {
+                Ok(props) => props,
+                Err(error) => {
+                    writer_error = Some(error);
+                    break;
+                }
+            };
             // CDC requires the sequential writer: the chunker state lives in ArrowWriter
             // and persists across row groups. The parallel path bypasses ArrowWriter entirely.
             if !parquet_opts.global.allow_single_file_parallelism
                 || parquet_opts.global.content_defined_chunking.enabled
             {
-                let mut writer = self.create_async_arrow_writer(
+                let mut writer = match self.create_async_arrow_writer(
                     &path,
                     Arc::clone(&object_store),
                     context,
                     parquet_props.clone(),
-                )?;
+                ) {
+                    Ok(writer) => writer,
+                    Err(error) => {
+                        writer_error = Some(error);
+                        break;
+                    }
+                };
                 let reservation = MemoryConsumer::new(format!("ParquetSink[{path}]"))
                     .register(context.memory_pool());
                 file_write_tasks.spawn(
@@ -324,7 +392,7 @@ impl FileSink for ParquetSink {
                     .with_elapsed_compute(elapsed_compute.clone()),
                 );
             } else {
-                let writer = ObjectWriterBuilder::new(
+                let writer = match ObjectWriterBuilder::new(
                     // Parquet files as a whole are never compressed, since they
                     // manage compressed blocks themselves.
                     FileCompressionType::UNCOMPRESSED,
@@ -338,7 +406,14 @@ impl FileSink for ParquetSink {
                         .execution
                         .objectstore_writer_buffer_size,
                 ))
-                .build()?;
+                .build()
+                {
+                    Ok(writer) => writer,
+                    Err(error) => {
+                        writer_error = Some(error);
+                        break;
+                    }
+                };
                 let ctx = ParquetFileWriteContext {
                     schema: get_writer_schema(&self.config),
                     props: Arc::new(parquet_props),
@@ -360,40 +435,119 @@ impl FileSink for ParquetSink {
             }
         }
 
+        if writer_error.is_some() {
+            drop(file_stream_rx);
+            demux_task.abort();
+            file_write_tasks.abort_all();
+        }
+
         while let Some(result) = file_write_tasks.join_next().await {
-            match result {
-                Ok(r) => {
-                    let (path, parquet_meta_data) = r?;
-                    let file_rows = parquet_meta_data.file_metadata().num_rows() as usize;
-                    let file_bytes: usize = parquet_meta_data
-                        .row_groups()
-                        .iter()
-                        .map(|rg| rg.compressed_size() as usize)
-                        .sum();
-                    rows_written_counter.add(file_rows);
-                    bytes_written_counter.add(file_bytes);
-                    let mut written_files = self.written.lock();
-                    written_files
-                        .try_insert(path.clone(), parquet_meta_data)
-                        .map_err(|e| internal_datafusion_err!("duplicate entry detected for partitioned file {path}: {e}"))?;
-                    drop(written_files);
-                }
-                Err(e) => {
-                    if e.is_panic() {
-                        std::panic::resume_unwind(e.into_panic());
-                    } else {
-                        unreachable!();
-                    }
+            if writer_error.is_none() {
+                if let Err(error) = self.record_writer_result(
+                    result,
+                    &rows_written_counter,
+                    &bytes_written_counter,
+                ) {
+                    writer_error = Some(error);
+                    demux_task.abort();
+                    file_write_tasks.abort_all();
                 }
             }
         }
 
-        demux_task
+        let demux_result = demux_task
             .join_unwind()
             .await
-            .map_err(|e| DataFusionError::ExecutionJoin(Box::new(e)))??;
+            .map_err(|e| DataFusionError::ExecutionJoin(Box::new(e)));
+        if let Some(error) = writer_error {
+            return Err(error);
+        }
+        demux_result??;
 
         Ok(rows_written_counter.value() as u64)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::StringArray;
+    use arrow::datatypes::{DataType, Field};
+    use datafusion_datasource::ListingTableUrl;
+    use datafusion_datasource::file_groups::FileGroup;
+    use datafusion_datasource::file_sink_config::FileOutputMode;
+    use datafusion_execution::object_store::ObjectStoreUrl;
+    use datafusion_expr::dml::InsertOp;
+    use object_store::memory::InMemory;
+    use std::future::pending;
+    use std::time::Duration;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn writer_error_waits_for_other_writers_to_stop() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
+        let config = FileSinkConfig {
+            original_url: String::new(),
+            object_store_url: ObjectStoreUrl::local_filesystem(),
+            file_group: FileGroup::new(vec![]),
+            table_paths: vec![ListingTableUrl::parse("file:///tmp/parquet-sink-test")?],
+            output_schema: Arc::clone(&schema),
+            table_partition_cols: vec![],
+            insert_op: InsertOp::Append,
+            keep_partition_by_columns: false,
+            file_extension: "parquet".into(),
+            file_output_mode: FileOutputMode::Directory,
+        };
+        let mut options = TableParquetOptions::default();
+        options.global.allow_single_file_parallelism = false;
+        let sink = ParquetSink::new(config, options);
+        let context = Arc::new(TaskContext::default());
+        let (file_tx, file_rx) = mpsc::unbounded_channel();
+        let (invalid_tx, invalid_rx) = mpsc::channel(1);
+        let (waiting_tx, waiting_rx) = mpsc::channel(1);
+        file_tx
+            .send((Path::from("waiting.parquet"), waiting_rx))
+            .unwrap();
+        file_tx
+            .send((Path::from("invalid.parquet"), invalid_rx))
+            .unwrap();
+
+        let invalid = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "value",
+                DataType::Utf8,
+                false,
+            )])),
+            vec![Arc::new(StringArray::from(vec!["not an integer"]))],
+        )?;
+        invalid_tx.send(invalid).await.unwrap();
+        drop(invalid_tx);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            sink.spawn_writer_tasks_and_join(
+                &context,
+                SpawnedTask::spawn(async { pending::<Result<()>>().await }),
+                file_rx,
+                Arc::new(InMemory::new()),
+            ),
+        )
+        .await
+        .expect("writer error should not wait for the open second input");
+        assert!(result.is_err());
+        assert!(
+            file_tx.is_closed(),
+            "demux receiver must be stopped before returning"
+        );
+        assert!(
+            waiting_tx.is_closed(),
+            "other writer must be stopped before returning"
+        );
+        assert!(sink.written().is_empty());
+        Ok(())
     }
 }
 
