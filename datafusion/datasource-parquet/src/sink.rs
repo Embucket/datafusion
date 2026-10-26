@@ -334,15 +334,15 @@ impl FileSink for ParquetSink {
             let next_file = tokio::select! {
                 biased;
                 result = file_write_tasks.join_next(), if has_writers => {
-                    if let Some(result) = result {
-                        if let Err(error) = self.record_writer_result(
+                    if let Some(result) = result
+                        && let Err(error) = self.record_writer_result(
                             result,
                             &rows_written_counter,
                             &bytes_written_counter,
-                        ) {
-                            writer_error = Some(error);
-                            break;
-                        }
+                        )
+                    {
+                        writer_error = Some(error);
+                        break;
                     }
                     continue;
                 }
@@ -442,16 +442,16 @@ impl FileSink for ParquetSink {
         }
 
         while let Some(result) = file_write_tasks.join_next().await {
-            if writer_error.is_none() {
-                if let Err(error) = self.record_writer_result(
+            if writer_error.is_none()
+                && let Err(error) = self.record_writer_result(
                     result,
                     &rows_written_counter,
                     &bytes_written_counter,
-                ) {
-                    writer_error = Some(error);
-                    demux_task.abort();
-                    file_write_tasks.abort_all();
-                }
+                )
+            {
+                writer_error = Some(error);
+                demux_task.abort();
+                file_write_tasks.abort_all();
             }
         }
 
