@@ -40,8 +40,8 @@ use datafusion_expr::expr::ScalarFunction;
 use datafusion_expr::expr::SetQuantifier;
 use datafusion_expr::expr::{InList, WildcardOptions};
 use datafusion_expr::{
-    Between, BinaryExpr, Cast, Expr, ExprSchemable, GetFieldAccess, Like, Literal,
-    Operator, TryCast, lit, when,
+    Between, Cast, Expr, ExprSchemable, GetFieldAccess, Like, Literal, Operator, TryCast,
+    lit, when,
 };
 
 use crate::planner::{ContextProvider, PlannerContext, SqlToRel};
@@ -422,35 +422,33 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             ))),
 
             SQLExpr::IsDistinctFrom(left, right) => {
-                Ok(Expr::BinaryExpr(BinaryExpr::new(
-                    Box::new(self.sql_expr_to_logical_expr(
-                        *left,
-                        schema,
-                        planner_context,
-                    )?),
-                    Operator::IsDistinctFrom,
-                    Box::new(self.sql_expr_to_logical_expr(
-                        *right,
-                        schema,
-                        planner_context,
-                    )?),
-                )))
+                let left =
+                    self.sql_expr_to_logical_expr(*left, schema, planner_context)?;
+                let right =
+                    self.sql_expr_to_logical_expr(*right, schema, planner_context)?;
+                let planned = self.build_logical_expr(
+                    BinaryOperator::Spaceship,
+                    left,
+                    right,
+                    schema,
+                )?;
+                Ok(match planned {
+                    Expr::BinaryExpr(mut binary)
+                        if binary.op == Operator::IsNotDistinctFrom =>
+                    {
+                        binary.op = Operator::IsDistinctFrom;
+                        Expr::BinaryExpr(binary)
+                    }
+                    other => Expr::Not(Box::new(other)),
+                })
             }
 
             SQLExpr::IsNotDistinctFrom(left, right) => {
-                Ok(Expr::BinaryExpr(BinaryExpr::new(
-                    Box::new(self.sql_expr_to_logical_expr(
-                        *left,
-                        schema,
-                        planner_context,
-                    )?),
-                    Operator::IsNotDistinctFrom,
-                    Box::new(self.sql_expr_to_logical_expr(
-                        *right,
-                        schema,
-                        planner_context,
-                    )?),
-                )))
+                let left =
+                    self.sql_expr_to_logical_expr(*left, schema, planner_context)?;
+                let right =
+                    self.sql_expr_to_logical_expr(*right, schema, planner_context)?;
+                self.build_logical_expr(BinaryOperator::Spaceship, left, right, schema)
             }
 
             SQLExpr::IsTrue(expr) => Ok(Expr::IsTrue(Box::new(

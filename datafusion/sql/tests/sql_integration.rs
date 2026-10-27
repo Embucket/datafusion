@@ -30,6 +30,7 @@ use datafusion_common::{
     DFSchema, DataFusionError, Result, ScalarValue, assert_contains,
 };
 use datafusion_expr::expr_fn::create_udwf;
+use datafusion_expr::planner::{ExprPlanner, PlannerResult, RawBinaryExpr};
 use datafusion_expr::{
     ColumnarValue, CreateIndex, DdlStatement, Expr, HigherOrderFunctionArgs,
     HigherOrderReturnFieldArgs, HigherOrderSignature, HigherOrderUDF, HigherOrderUDFImpl,
@@ -64,6 +65,7 @@ use datafusion_functions_window::{
 };
 use insta::{allow_duplicates, assert_snapshot};
 use rstest::rstest;
+use sqlparser::ast::BinaryOperator;
 use sqlparser::dialect::{
     DatabricksDialect, Dialect, GenericDialect, HiveDialect, MsSqlDialect, MySqlDialect,
     SnowflakeDialect,
@@ -72,6 +74,89 @@ use sqlparser::parser::Parser;
 
 mod cases;
 mod common;
+
+#[derive(Debug)]
+struct NullSafeComparisonPlanner;
+
+impl ExprPlanner for NullSafeComparisonPlanner {
+    fn plan_binary_op(
+        &self,
+        mut expr: RawBinaryExpr,
+        _schema: &DFSchema,
+    ) -> Result<PlannerResult<RawBinaryExpr>> {
+        if expr.op == BinaryOperator::Spaceship {
+            expr.left = Expr::Literal(ScalarValue::Int64(Some(42)), None);
+        }
+        Ok(PlannerResult::Original(expr))
+    }
+}
+
+#[derive(Debug)]
+struct PlannedNullSafeComparisonPlanner;
+
+impl ExprPlanner for PlannedNullSafeComparisonPlanner {
+    fn plan_binary_op(
+        &self,
+        expr: RawBinaryExpr,
+        _schema: &DFSchema,
+    ) -> Result<PlannerResult<RawBinaryExpr>> {
+        if expr.op == BinaryOperator::Spaceship {
+            return Ok(PlannerResult::Planned(Expr::Literal(
+                ScalarValue::Boolean(Some(true)),
+                None,
+            )));
+        }
+        Ok(PlannerResult::Original(expr))
+    }
+}
+
+#[test]
+fn null_safe_comparisons_visit_binary_expr_planners() {
+    let unchanged = logical_plan("SELECT 1 IS DISTINCT FROM 2, 1 IS NOT DISTINCT FROM 2")
+        .unwrap()
+        .display_indent()
+        .to_string();
+    assert!(
+        unchanged.contains("Int64(1) IS DISTINCT FROM Int64(2)"),
+        "{unchanged}"
+    );
+    assert!(
+        unchanged.contains("Int64(1) IS NOT DISTINCT FROM Int64(2)"),
+        "{unchanged}"
+    );
+
+    let state = MockSessionState::default()
+        .with_expr_planner(Arc::new(NullSafeComparisonPlanner));
+    let plan = logical_plan_from_state(
+        "SELECT 1 IS DISTINCT FROM 2, 1 IS NOT DISTINCT FROM 2",
+        &GenericDialect {},
+        ParserOptions::default(),
+        state,
+    )
+    .unwrap();
+    let display = plan.display_indent().to_string();
+    assert!(
+        display.contains("Int64(42) IS DISTINCT FROM Int64(2)"),
+        "{display}"
+    );
+    assert!(
+        display.contains("Int64(42) IS NOT DISTINCT FROM Int64(2)"),
+        "{display}"
+    );
+
+    let state = MockSessionState::default()
+        .with_expr_planner(Arc::new(PlannedNullSafeComparisonPlanner));
+    let plan = logical_plan_from_state(
+        "SELECT 1 IS DISTINCT FROM 2, 1 IS NOT DISTINCT FROM 2",
+        &GenericDialect {},
+        ParserOptions::default(),
+        state,
+    )
+    .unwrap();
+    let display = plan.display_indent().to_string();
+    assert!(display.contains("NOT Boolean(true)"), "{display}");
+    assert!(display.contains("Boolean(true)"), "{display}");
+}
 
 #[test]
 fn pivot_uses_literal_text_or_explicit_alias_for_column_names() {
