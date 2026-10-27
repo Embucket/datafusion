@@ -1178,6 +1178,7 @@ message PhysicalCaseNode {
   PhysicalExprNode else_expr = 3;
   datafusion_common.ArrowType logical_result_type = 4;
   map<string, string> logical_result_metadata = 5;
+  PhysicalExprNode equality = 6;
 }
 
 message PhysicalTryCastNode {

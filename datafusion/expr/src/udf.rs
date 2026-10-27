@@ -24,6 +24,7 @@ use crate::simplify::{ExprSimplifyResult, SimplifyContext};
 use crate::sort_properties::{ExprProperties, SortProperties};
 use crate::udf_eq::UdfEq;
 use crate::{ColumnarValue, Documentation, Expr, Signature};
+use arrow::array::ArrayRef;
 use arrow::datatypes::{DataType, Field, FieldRef};
 #[cfg(debug_assertions)]
 use datafusion_common::assert_or_internal_err;
@@ -55,6 +56,14 @@ pub struct StructFieldMapping {
     /// For `named_struct('a', col1, 'b', col2)`, this would be:
     /// `[(["a"], 1), (["b"], 3)]` — field `"a"` comes from arg index 1.
     pub fields: Vec<(Vec<ScalarValue>, usize)>,
+}
+
+/// Index for a simple CASE with literal WHEN and result expressions.
+/// Implementations must return the first matching WHEN ordinal for each base
+/// value, or `else_index` when no WHEN matches, using the UDF's equality
+/// semantics. A SQL NULL base must never match.
+pub trait CaseLiteralMatcher: Debug + Send + Sync {
+    fn map_to_when_indices(&self, base: &ArrayRef, else_index: u32) -> Result<Vec<u32>>;
 }
 
 /// Logical representation of a Scalar User Defined Function.
@@ -537,6 +546,17 @@ pub struct ReturnFieldArgs<'a> {
 pub trait ScalarUDFImpl: Debug + DynEq + DynHash + Send + Sync + Any {
     /// Returns this function's name
     fn name(&self) -> &str;
+
+    /// Optionally index literal right-hand values for a simple CASE whose
+    /// equality comparison is implemented by this UDF. The returned matcher
+    /// is built once per physical expression; returning `None` keeps the
+    /// ordinary lazy branch-by-branch evaluation.
+    fn create_case_literal_matcher(
+        &self,
+        _when_values: &[ScalarValue],
+    ) -> Result<Option<Arc<dyn CaseLiteralMatcher>>> {
+        Ok(None)
+    }
 
     /// Returns any aliases (alternate names) for this function.
     ///

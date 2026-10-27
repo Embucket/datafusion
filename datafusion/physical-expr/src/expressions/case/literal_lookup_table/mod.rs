@@ -20,15 +20,20 @@ mod bytes_like_lookup_table;
 mod primitive_lookup_table;
 
 use crate::expressions::Literal;
-use crate::expressions::case::CaseBody;
 use crate::expressions::case::literal_lookup_table::boolean_lookup_table::BooleanIndexMap;
 use crate::expressions::case::literal_lookup_table::bytes_like_lookup_table::BytesLikeIndexMap;
 use crate::expressions::case::literal_lookup_table::primitive_lookup_table::PrimitiveIndexMap;
+use crate::expressions::case::{CaseBody, direct_case_equality_udf};
 use arrow::array::{Array, ArrayRef, UInt32Array, downcast_primitive};
 use arrow::datatypes::DataType;
-use datafusion_common::{ScalarValue, arrow_datafusion_err, plan_datafusion_err};
+use datafusion_common::{
+    ScalarValue, arrow_datafusion_err, internal_err, plan_datafusion_err,
+};
+use datafusion_expr::{CaseLiteralMatcher, Volatility};
+use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
 use indexmap::IndexMap;
 use std::fmt::Debug;
+use std::sync::Arc;
 
 /// Optimization for CASE expressions with literal WHEN and THEN clauses
 ///
@@ -79,7 +84,10 @@ pub(in super::super) struct LiteralLookupTable {
 }
 
 impl LiteralLookupTable {
-    pub(in super::super) fn maybe_new(body: &CaseBody) -> Option<Self> {
+    pub(in super::super) fn maybe_new(
+        body: &CaseBody,
+        equality: Option<&Arc<dyn PhysicalExpr>>,
+    ) -> Option<Self> {
         // We can't use the optimization if we don't have any when then pairs
         if body.when_then_expr.is_empty() {
             return None;
@@ -128,16 +136,17 @@ impl LiteralLookupTable {
 
         // Keep only the first occurrence of each when literal (as the first match is used)
         // and remove nulls (as they cannot be matched - case NULL WHEN NULL THEN ... ELSE ... END always goes to ELSE)
-        let (when, then): (Vec<ScalarValue>, Vec<ScalarValue>) = {
+        let (when, then): (Vec<ScalarValue>, Vec<ScalarValue>) = if equality.is_some() {
+            // Custom predicate equality need not be transitive. Preserve every
+            // literal's original branch ordinal for its matcher.
+            when_then_exprs_scalars.into_iter().unzip()
+        } else {
             let mut map = IndexMap::with_capacity(body.when_then_expr.len());
-
-            for (when, then) in when_then_exprs_scalars.into_iter() {
-                // Don't overwrite existing entries as we want to keep the first occurrence
+            for (when, then) in when_then_exprs_scalars {
                 if !map.contains_key(&when) {
                     map.insert(when, then);
                 }
             }
-
             map.into_iter().unzip()
         };
 
@@ -185,7 +194,20 @@ impl LiteralLookupTable {
         // The else expression is in the end
         let else_index = then_and_else_values.len() as u32 - 1;
 
-        let lookup = try_creating_lookup_table(when).ok()?;
+        let lookup: Box<dyn WhenLiteralIndexMap> = if let Some(equality) = equality {
+            let udf = direct_case_equality_udf(equality)?;
+            if udf.fun().signature().volatility != Volatility::Immutable {
+                return None;
+            }
+            Box::new(
+                udf.fun()
+                    .inner()
+                    .create_case_literal_matcher(&when)
+                    .ok()??,
+            )
+        } else {
+            try_creating_lookup_table(when).ok()?
+        };
 
         Some(Self {
             lookup,
@@ -201,6 +223,13 @@ impl LiteralLookupTable {
         let take_indices = self
             .lookup
             .map_to_when_indices(keys_array, self.else_index)?;
+        if take_indices.len() != keys_array.len() {
+            return internal_err!(
+                "CASE literal matcher returned {} rows for {} inputs",
+                take_indices.len(),
+                keys_array.len()
+            );
+        }
 
         // Zero-copy conversion
         let take_indices = UInt32Array::from(take_indices);
@@ -258,6 +287,16 @@ pub(super) trait WhenLiteralIndexMap: Debug + Send + Sync {
         array: &ArrayRef,
         else_index: u32,
     ) -> datafusion_common::Result<Vec<u32>>;
+}
+
+impl WhenLiteralIndexMap for Arc<dyn CaseLiteralMatcher> {
+    fn map_to_when_indices(
+        &self,
+        array: &ArrayRef,
+        else_index: u32,
+    ) -> datafusion_common::Result<Vec<u32>> {
+        CaseLiteralMatcher::map_to_when_indices(self.as_ref(), array, else_index)
+    }
 }
 
 fn try_creating_lookup_table(

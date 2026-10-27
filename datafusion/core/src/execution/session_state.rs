@@ -822,6 +822,9 @@ impl SessionState {
         let simplify_context = SimplifyContext::builder()
             .with_schema(Arc::new(df_schema.clone()))
             .with_config_options(Arc::clone(config_options))
+            .with_case_equality_planner(
+                self.execution_props().case_equality_planner.clone(),
+            )
             .with_query_execution_start_time(
                 self.execution_props().query_execution_start_time,
             )
@@ -2023,6 +2026,9 @@ impl ContextProvider for SessionContextProvider<'_> {
             .ok_or_else(|| plan_datafusion_err!("table function '{name}' not found"))?;
         let simplify_context = SimplifyContext::builder()
             .with_config_options(Arc::clone(self.state.config_options()))
+            .with_case_equality_planner(
+                self.state.execution_props().case_equality_planner.clone(),
+            )
             .with_query_execution_start_time(
                 self.state.execution_props().query_execution_start_time,
             )
@@ -2327,6 +2333,12 @@ impl OptimizerConfig for SessionState {
         Arc::clone(self.config.options())
     }
 
+    fn case_equality_planner(
+        &self,
+    ) -> Option<&Arc<dyn datafusion_expr::execution_props::CaseEqualityPlanner>> {
+        self.execution_props.case_equality_planner.as_ref()
+    }
+
     fn function_registry(&self) -> Option<&dyn FunctionRegistry> {
         Some(self)
     }
@@ -2408,8 +2420,9 @@ mod tests {
     use datafusion_common::config::Dialect;
     use datafusion_common::{DFSchema, ResolvedTableReference, Result, TableReference};
     use datafusion_execution::config::SessionConfig;
-    use datafusion_expr::Expr;
     use datafusion_expr::HigherOrderUDF;
+    use datafusion_expr::execution_props::CaseEqualityPlanner;
+    use datafusion_expr::{Case, Expr, col, lit};
     use datafusion_optimizer::Optimizer;
     use datafusion_optimizer::optimizer::OptimizerRule;
     use datafusion_physical_plan::display::DisplayableExecutionPlan;
@@ -2417,6 +2430,43 @@ mod tests {
     use datafusion_sql::planner::{PlannerContext, SqlToRel};
     use std::collections::HashMap;
     use std::sync::Arc;
+
+    #[derive(Debug)]
+    struct NotEqualCasePlanner;
+
+    impl CaseEqualityPlanner for NotEqualCasePlanner {
+        fn plan_equality(
+            &self,
+            _case: &Case,
+            _schema: &DFSchema,
+        ) -> Result<Option<Expr>> {
+            Ok(Some(col("case_base").not_eq(col("case_when"))))
+        }
+    }
+
+    #[test]
+    fn session_state_simplification_uses_custom_case_equality() -> Result<()> {
+        let mut state = SessionStateBuilder::new().with_default_features().build();
+        state.execution_props_mut().case_equality_planner =
+            Some(Arc::new(NotEqualCasePlanner));
+        let expr = Expr::Case(Case::new(
+            Some(Box::new(lit(1_i32))),
+            vec![(Box::new(lit(2_i32)), Box::new(lit("match")))],
+            Some(Box::new(lit("miss"))),
+        ));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "dummy",
+            DataType::Int32,
+            false,
+        )]));
+        let df_schema = DFSchema::try_from(Arc::clone(&schema))?;
+        let physical = state.create_physical_expr(expr, &df_schema)?;
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![0]))])?;
+        let value = physical.evaluate(&batch)?.into_array(batch.num_rows())?;
+        assert_eq!(value.as_ref(), &StringArray::from(vec!["match"]));
+        Ok(())
+    }
 
     #[test]
     #[cfg(feature = "sql")]

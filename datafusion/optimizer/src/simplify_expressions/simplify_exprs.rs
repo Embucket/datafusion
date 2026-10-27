@@ -114,6 +114,7 @@ impl SimplifyExpressions {
         let info = SimplifyContext::builder()
             .with_schema(schema)
             .with_config_options(config.options())
+            .with_case_equality_planner(config.case_equality_planner().cloned())
             .with_query_execution_start_time(config.query_execution_start_time())
             .build();
 

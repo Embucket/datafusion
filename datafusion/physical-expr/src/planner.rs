@@ -24,7 +24,7 @@ use crate::{
     expressions::{self, Column, Literal, binary, like, similar_to},
 };
 
-use arrow::datatypes::Schema;
+use arrow::datatypes::{Field, Schema};
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::datatype::FieldExt;
 use datafusion_common::metadata::FieldMetadata;
@@ -338,6 +338,16 @@ pub fn create_physical_expr(
             similar_to(*negated, *case_insensitive, physical_expr, physical_pattern)
         }
         Expr::Case(case) => {
+            let equality = if case.expr.is_some() {
+                execution_props
+                    .case_equality_planner
+                    .as_ref()
+                    .map(|planner| planner.plan_equality(case, input_dfschema))
+                    .transpose()?
+                    .flatten()
+            } else {
+                None
+            };
             let expr: Option<Arc<dyn PhysicalExpr>> = if let Some(e) = &case.expr {
                 Some(create_physical_expr(
                     e.as_ref(),
@@ -401,8 +411,40 @@ pub fn create_physical_expr(
                 } else {
                     None
                 };
-            let physical_case =
-                expressions::CaseExpr::try_new(expr, when_then_expr, else_expr)?;
+            let physical_case = if let Some(equality) = equality {
+                let base = case.expr.as_ref().ok_or_else(|| {
+                    internal_datafusion_err!("Custom CASE equality requires a base")
+                })?;
+                let first_when = case.when_then_expr.first().ok_or_else(|| {
+                    internal_datafusion_err!(
+                        "Custom CASE equality requires a WHEN branch"
+                    )
+                })?;
+                let base_field = base.to_field(input_dfschema)?.1;
+                let when_field = first_when.0.to_field(input_dfschema)?.1;
+                let comparison_schema = DFSchema::try_from(Schema::new(vec![
+                    Field::new("case_base", base_field.data_type().clone(), true)
+                        .with_metadata(base_field.metadata().clone()),
+                    Field::new("case_when", when_field.data_type().clone(), true)
+                        .with_metadata(when_field.metadata().clone()),
+                ]))?;
+                let comparison = create_physical_expr(
+                    &equality,
+                    &comparison_schema,
+                    execution_props,
+                    planning_ctx,
+                )?;
+                expressions::CaseExpr::try_new_with_equality(
+                    expr.ok_or_else(|| {
+                        internal_datafusion_err!("Custom CASE equality requires a base")
+                    })?,
+                    when_then_expr,
+                    else_expr,
+                    comparison,
+                )?
+            } else {
+                expressions::CaseExpr::try_new(expr, when_then_expr, else_expr)?
+            };
             if common_unmarked_branch {
                 Ok(Arc::new(physical_case))
             } else {
@@ -759,10 +801,13 @@ pub fn logical2physical(expr: &Expr, schema: &Schema) -> Arc<dyn PhysicalExpr> {
 
 #[cfg(test)]
 mod tests {
-    use arrow::array::{ArrayRef, BooleanArray, RecordBatch, StringArray};
+    use arrow::array::{
+        ArrayRef, AsArray, BooleanArray, Int32Array, RecordBatch, StringArray,
+    };
     use arrow::datatypes::{DataType, Field};
     use arrow_schema::extension::{EXTENSION_TYPE_METADATA_KEY, EXTENSION_TYPE_NAME_KEY};
     use datafusion_common::HashMap;
+    use datafusion_expr::execution_props::CaseEqualityPlanner;
     use datafusion_expr::physical_planning_context::{
         ScalarSubqueryResults, SubqueryIndex,
     };
@@ -782,6 +827,63 @@ mod tests {
             &ExecutionProps::new(),
             &PhysicalPlanningContext::default(),
         )
+    }
+
+    #[derive(Debug)]
+    struct NotEqualCasePlanner;
+
+    impl CaseEqualityPlanner for NotEqualCasePlanner {
+        fn plan_equality(
+            &self,
+            _case: &datafusion_expr::expr::Case,
+            _input_schema: &DFSchema,
+        ) -> Result<Option<Expr>> {
+            Ok(Some(col("case_base").not_eq(col("case_when"))))
+        }
+    }
+
+    #[test]
+    fn custom_simple_case_equality_uses_planner_hook() -> Result<()> {
+        let schema = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
+        let df_schema = DFSchema::try_from(schema.clone())?;
+        let logical = Expr::Case(datafusion_expr::expr::Case::new(
+            Some(Box::new(col("a"))),
+            vec![
+                (Box::new(lit(2_i32)), Box::new(lit("first"))),
+                (Box::new(lit(1_i32)), Box::new(lit("second"))),
+            ],
+            Some(Box::new(lit("else"))),
+        ));
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![Arc::new(Int32Array::from(vec![1, 2]))],
+        )?;
+        let mut props = ExecutionProps::new();
+        props.case_equality_planner = Some(Arc::new(NotEqualCasePlanner));
+        let custom = create_physical_expr(
+            &logical,
+            &df_schema,
+            &props,
+            &PhysicalPlanningContext::default(),
+        )?;
+        let result = custom.evaluate(&batch)?.into_array(batch.num_rows())?;
+        assert_eq!(
+            result.as_string::<i32>(),
+            &StringArray::from(vec!["first", "second"])
+        );
+
+        let ordinary = create_physical_expr(
+            &logical,
+            &df_schema,
+            &ExecutionProps::new(),
+            &PhysicalPlanningContext::default(),
+        )?;
+        let result = ordinary.evaluate(&batch)?.into_array(batch.num_rows())?;
+        assert_eq!(
+            result.as_string::<i32>(),
+            &StringArray::from(vec!["second", "first"])
+        );
+        Ok(())
     }
 
     #[test]

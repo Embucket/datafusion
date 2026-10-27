@@ -17,10 +17,22 @@
 
 use crate::var_provider::{VarProvider, VarType};
 use chrono::{DateTime, Utc};
-use datafusion_common::HashMap;
 use datafusion_common::alias::AliasGenerator;
 use datafusion_common::config::ConfigOptions;
+use datafusion_common::{DFSchema, HashMap, Result};
 use std::sync::Arc;
+
+/// Selects an optional equality expression for a simple CASE. The returned
+/// expression is planned against synthetic `case_base` and `case_when` fields
+/// and must return a boolean result. Like SQL equality, it must never match a
+/// null base or null WHEN value. Returning `None` retains Arrow equality.
+pub trait CaseEqualityPlanner: std::fmt::Debug + Send + Sync {
+    fn plan_equality(
+        &self,
+        case: &crate::expr::Case,
+        input_schema: &DFSchema,
+    ) -> Result<Option<crate::Expr>>;
+}
 
 /// Holds properties and scratch state used while optimizing a [`LogicalPlan`]
 /// and translating it into an executable physical plan, such as the statement
@@ -59,6 +71,8 @@ pub struct ExecutionProps {
     pub config_options: Option<Arc<ConfigOptions>>,
     /// Providers for scalar variables
     pub var_providers: Option<HashMap<VarType, Arc<dyn VarProvider + Send + Sync>>>,
+    /// Optional simple CASE comparator, selected only during physical planning.
+    pub case_equality_planner: Option<Arc<dyn CaseEqualityPlanner>>,
 }
 
 impl Default for ExecutionProps {
@@ -75,6 +89,7 @@ impl ExecutionProps {
             alias_generator: Arc::new(AliasGenerator::new()),
             config_options: None,
             var_providers: None,
+            case_equality_planner: None,
         }
     }
 
@@ -143,7 +158,7 @@ mod test {
     fn debug() {
         let props = ExecutionProps::new();
         assert_eq!(
-            "ExecutionProps { query_execution_start_time: None, alias_generator: AliasGenerator { next_id: 1 }, config_options: None, var_providers: None }",
+            "ExecutionProps { query_execution_start_time: None, alias_generator: AliasGenerator { next_id: 1 }, config_options: None, var_providers: None, case_equality_planner: None }",
             format!("{props:?}")
         );
     }

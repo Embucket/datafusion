@@ -169,6 +169,45 @@ impl ScalarFunctionExpr {
         &self.config_options
     }
 
+    /// Evaluate precomputed arguments without broadcasting scalar values.
+    pub(crate) fn evaluate_with_args(
+        &self,
+        args: Vec<ColumnarValue>,
+        arg_fields: Vec<FieldRef>,
+        number_rows: usize,
+    ) -> Result<ColumnarValue> {
+        let input_empty = args.is_empty();
+        let input_all_scalar = args
+            .iter()
+            .all(|arg| matches!(arg, ColumnarValue::Scalar(_)));
+
+        let output = self.eval_fun.invoke_with_args(ScalarFunctionArgs {
+            args,
+            arg_fields,
+            number_rows,
+            return_field: Arc::clone(&self.return_field),
+            config_options: Arc::clone(&self.config_options),
+        })?;
+
+        if let ColumnarValue::Array(array) = &output
+            && array.len() != number_rows
+        {
+            // A one-element array is a scalar only when all inputs were scalar.
+            let preserve_scalar = array.len() == 1 && !input_empty && input_all_scalar;
+            return if preserve_scalar {
+                ScalarValue::try_from_array(array, 0).map(ColumnarValue::Scalar)
+            } else {
+                internal_err!(
+                    "UDF {} returned a different number of rows than expected. Expected: {}, Got: {}",
+                    self.name,
+                    number_rows,
+                    array.len()
+                )
+            };
+        }
+        Ok(output)
+    }
+
     /// Given an arbitrary PhysicalExpr attempt to downcast it to a ScalarFunctionExpr
     /// and verify that its inner function is of type T.
     /// If the downcast fails, or the function is not of type T, returns `None`.
@@ -261,38 +300,7 @@ impl PhysicalExpr for ScalarFunctionExpr {
             .map(|e| e.return_field(batch.schema_ref()))
             .collect::<Result<Vec<_>>>()?;
 
-        let input_empty = args.is_empty();
-        let input_all_scalar = args
-            .iter()
-            .all(|arg| matches!(arg, ColumnarValue::Scalar(_)));
-
-        // evaluate the function
-        let output = self.eval_fun.invoke_with_args(ScalarFunctionArgs {
-            args,
-            arg_fields,
-            number_rows: batch.num_rows(),
-            return_field: Arc::clone(&self.return_field),
-            config_options: Arc::clone(&self.config_options),
-        })?;
-
-        if let ColumnarValue::Array(array) = &output
-            && array.len() != batch.num_rows()
-        {
-            // If the arguments are a non-empty slice of scalar values, we can assume that
-            // returning a one-element array is equivalent to returning a scalar.
-            let preserve_scalar = array.len() == 1 && !input_empty && input_all_scalar;
-            return if preserve_scalar {
-                ScalarValue::try_from_array(array, 0).map(ColumnarValue::Scalar)
-            } else {
-                internal_err!(
-                    "UDF {} returned a different number of rows than expected. Expected: {}, Got: {}",
-                    self.name,
-                    batch.num_rows(),
-                    array.len()
-                )
-            };
-        }
-        Ok(output)
+        self.evaluate_with_args(args, arg_fields, batch.num_rows())
     }
 
     fn return_field(&self, _input_schema: &Schema) -> Result<FieldRef> {

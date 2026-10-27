@@ -24,6 +24,7 @@ use chrono::{DateTime, Utc};
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::{DFSchema, DFSchemaRef, Result};
 
+use crate::execution_props::CaseEqualityPlanner;
 use crate::{Expr, ExprSchemable};
 
 /// Provides simplification information based on schema, query execution time,
@@ -38,6 +39,7 @@ pub struct SimplifyContext {
     schema: DFSchemaRef,
     query_execution_start_time: Option<DateTime<Utc>>,
     config_options: Arc<ConfigOptions>,
+    case_equality_planner: Option<Arc<dyn CaseEqualityPlanner>>,
 }
 
 /// Builder for [`SimplifyContext`].
@@ -46,6 +48,7 @@ pub struct SimplifyContextBuilder {
     schema: Option<DFSchemaRef>,
     query_execution_start_time: Option<DateTime<Utc>>,
     config_options: Option<Arc<ConfigOptions>>,
+    case_equality_planner: Option<Arc<dyn CaseEqualityPlanner>>,
 }
 
 impl Default for SimplifyContext {
@@ -54,6 +57,7 @@ impl Default for SimplifyContext {
             schema: Arc::new(DFSchema::empty()),
             query_execution_start_time: None,
             config_options: Arc::new(ConfigOptions::default()),
+            case_equality_planner: None,
         }
     }
 }
@@ -137,12 +141,25 @@ impl SimplifyContext {
     pub fn config_options(&self) -> &Arc<ConfigOptions> {
         &self.config_options
     }
+
+    pub fn case_equality_planner(&self) -> Option<&Arc<dyn CaseEqualityPlanner>> {
+        self.case_equality_planner.as_ref()
+    }
 }
 
 impl SimplifyContextBuilder {
     /// Set the [`ConfigOptions`] for this context.
     pub fn with_config_options(mut self, config_options: Arc<ConfigOptions>) -> Self {
         self.config_options = Some(config_options);
+        self
+    }
+
+    /// Set the simple CASE comparator used during constant folding.
+    pub fn with_case_equality_planner(
+        mut self,
+        planner: Option<Arc<dyn CaseEqualityPlanner>>,
+    ) -> Self {
+        self.case_equality_planner = planner;
         self
     }
 
@@ -175,6 +192,7 @@ impl SimplifyContextBuilder {
             config_options: self
                 .config_options
                 .unwrap_or_else(|| Arc::new(ConfigOptions::default())),
+            case_equality_planner: self.case_equality_planner,
         }
     }
 }

@@ -48,11 +48,26 @@ use crate::expressions::case::literal_lookup_table::LiteralLookupTable;
 use arrow::compute::kernels::merge::{MergeIndex, merge, merge_n};
 use datafusion_common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion_physical_expr_common::datum::compare_with_eq;
+use datafusion_physical_expr_common::physical_expr::is_volatile;
 use datafusion_physical_expr_common::utils::scatter;
 use itertools::Itertools;
 use std::fmt::{Debug, Formatter};
 
 pub(super) type WhenThen = (Arc<dyn PhysicalExpr>, Arc<dyn PhysicalExpr>);
+
+fn direct_case_equality_udf(
+    equality: &Arc<dyn PhysicalExpr>,
+) -> Option<&ScalarFunctionExpr> {
+    equality.downcast_ref::<ScalarFunctionExpr>().filter(|udf| {
+        udf.args().len() == 2
+            && udf.args()[0]
+                .downcast_ref::<Column>()
+                .is_some_and(|column| column.index() == 0 && column.name() == "case_base")
+            && udf.args()[1]
+                .downcast_ref::<Column>()
+                .is_some_and(|column| column.index() == 1 && column.name() == "case_when")
+    })
+}
 
 #[derive(Debug, Hash, PartialEq, Eq)]
 enum EvalMethod {
@@ -279,6 +294,8 @@ pub struct CaseExpr {
     body: CaseBody,
     /// Evaluation method to use
     eval_method: EvalMethod,
+    /// Optional equality expression over two synthetic columns: base and WHEN.
+    equality: Option<Arc<dyn PhysicalExpr>>,
     /// Logical result type and metadata inferred before physical lowering.
     logical_result_field: Option<(DataType, FieldMetadata)>,
 }
@@ -289,13 +306,16 @@ pub struct CaseExpr {
 impl Hash for CaseExpr {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.body.hash(state);
+        self.equality.hash(state);
         self.logical_result_field.hash(state);
     }
 }
 
 impl PartialEq for CaseExpr {
     fn eq(&self, other: &Self) -> bool {
-        self.body == other.body && self.logical_result_field == other.logical_result_field
+        self.body == other.body
+            && self.equality == other.equality
+            && self.logical_result_field == other.logical_result_field
     }
 }
 
@@ -660,6 +680,30 @@ impl CaseExpr {
         when_then_expr: Vec<WhenThen>,
         else_expr: Option<Arc<dyn PhysicalExpr>>,
     ) -> Result<Self> {
+        Self::try_new_internal(expr, when_then_expr, else_expr, None)
+    }
+
+    /// Create a simple CASE using a physical boolean comparator over synthetic
+    /// `case_base` and `case_when` columns. Null operands never match. Ordinary
+    /// CASEs retain native equality.
+    pub fn try_new_with_equality(
+        expr: Arc<dyn PhysicalExpr>,
+        when_then_expr: Vec<WhenThen>,
+        else_expr: Option<Arc<dyn PhysicalExpr>>,
+        equality: Arc<dyn PhysicalExpr>,
+    ) -> Result<Self> {
+        Self::try_new_internal(Some(expr), when_then_expr, else_expr, Some(equality))
+    }
+
+    fn try_new_internal(
+        expr: Option<Arc<dyn PhysicalExpr>>,
+        when_then_expr: Vec<WhenThen>,
+        else_expr: Option<Arc<dyn PhysicalExpr>>,
+        equality: Option<Arc<dyn PhysicalExpr>>,
+    ) -> Result<Self> {
+        if equality.is_some() && expr.is_none() {
+            return internal_err!("Custom CASE equality requires a base expression");
+        }
         // normalize null literals to None in the else_expr (this already happens
         // during SQL planning, but not necessarily for other use cases)
         let else_expr = match &else_expr {
@@ -680,11 +724,12 @@ impl CaseExpr {
             else_expr,
         };
 
-        let eval_method = Self::find_best_eval_method(&body)?;
+        let eval_method = Self::find_best_eval_method(&body, equality.as_ref())?;
 
         Ok(Self {
             body,
             eval_method,
+            equality,
             logical_result_field: None,
         })
     }
@@ -698,9 +743,12 @@ impl CaseExpr {
         self
     }
 
-    fn find_best_eval_method(body: &CaseBody) -> Result<EvalMethod> {
+    fn find_best_eval_method(
+        body: &CaseBody,
+        equality: Option<&Arc<dyn PhysicalExpr>>,
+    ) -> Result<EvalMethod> {
         if body.expr.is_some() {
-            if let Some(mapping) = LiteralLookupTable::maybe_new(body) {
+            if let Some(mapping) = LiteralLookupTable::maybe_new(body, equality) {
                 return Ok(EvalMethod::WithExprScalarLookupTable(mapping));
             }
 
@@ -769,6 +817,7 @@ impl CaseBody {
         &self,
         batch: &RecordBatch,
         return_type: &DataType,
+        equality: Option<&Arc<dyn PhysicalExpr>>,
     ) -> Result<ColumnarValue> {
         let mut result_builder = ResultBuilder::new(return_type, batch.num_rows());
 
@@ -834,19 +883,74 @@ impl CaseBody {
         // The types of case and when expressions will be coerced to match.
         // We only need to check if the base_value is nested.
         let base_value_is_nested = base_values.data_type().is_nested();
+        let base_field = if equality.is_some() {
+            let Some(base_expr) = self.expr.as_ref() else {
+                return internal_err!("Custom CASE equality requires a base");
+            };
+            Some(base_expr.return_field(batch.schema_ref())?)
+        } else {
+            None
+        };
+        let direct_udf = equality.and_then(direct_case_equality_udf);
 
         for i in 0..self.when_then_expr.len() {
             // Evaluate the 'when' predicate for the remainder batch
             // This results in a boolean array with the same length as the remaining number of rows
             let when_expr = &self.when_then_expr[i].0;
-            let when_value = match when_expr.evaluate(&remainder_batch)? {
-                ColumnarValue::Array(a) => {
-                    compare_with_eq(&a, &base_values, base_value_is_nested)
+            let evaluated_when = when_expr.evaluate(&remainder_batch)?;
+            let when_value = if let Some(equality) = equality {
+                let all_null = match &evaluated_when {
+                    ColumnarValue::Array(array) => {
+                        array.logical_null_count() == array.len()
+                    }
+                    ColumnarValue::Scalar(value) => value.is_null(),
+                };
+                if all_null {
+                    continue;
                 }
-                ColumnarValue::Scalar(s) => {
-                    compare_with_eq(&s.to_scalar()?, &base_values, base_value_is_nested)
+                let Some(base_field) = base_field.as_ref() else {
+                    return internal_err!("Custom CASE equality requires a base field");
+                };
+                let when_field = when_expr.return_field(remainder_batch.schema_ref())?;
+                let when_array = evaluated_when.into_array(remainder_batch.num_rows())?;
+                let base_field = Arc::new(
+                    Field::new("case_base", base_values.data_type().clone(), true)
+                        .with_metadata(base_field.metadata().clone()),
+                );
+                let when_field = Arc::new(
+                    Field::new("case_when", when_array.data_type().clone(), true)
+                        .with_metadata(when_field.metadata().clone()),
+                );
+                let compared = if let Some(udf) = direct_udf {
+                    udf.evaluate_with_args(
+                        vec![
+                            ColumnarValue::Array(Arc::clone(&base_values)),
+                            ColumnarValue::Array(when_array),
+                        ],
+                        vec![base_field, when_field],
+                        remainder_batch.num_rows(),
+                    )?
+                } else {
+                    let comparison_batch = RecordBatch::try_new(
+                        Arc::new(Schema::new(vec![base_field, when_field])),
+                        vec![Arc::clone(&base_values), when_array],
+                    )?;
+                    equality.evaluate(&comparison_batch)?
                 }
-            }?;
+                .into_array(remainder_batch.num_rows())?;
+                as_boolean_array(&compared)?.clone()
+            } else {
+                match evaluated_when {
+                    ColumnarValue::Array(a) => {
+                        compare_with_eq(&a, &base_values, base_value_is_nested)
+                    }
+                    ColumnarValue::Scalar(s) => compare_with_eq(
+                        &s.to_scalar()?,
+                        &base_values,
+                        base_value_is_nested,
+                    ),
+                }?
+            };
 
             // If the 'when' predicate did not match any rows, continue to the next branch immediately.
             // Only counts valid slots that are true (masked-null predicate slots are ignored),
@@ -1077,11 +1181,14 @@ impl CaseExpr {
             .collect::<Vec<_>>();
         if projection.len() < batch.num_columns() {
             let projected_batch = batch.project(&projection)?;
-            projected
-                .body
-                .case_when_with_expr(&projected_batch, &return_type)
+            projected.body.case_when_with_expr(
+                &projected_batch,
+                &return_type,
+                self.equality.as_ref(),
+            )
         } else {
-            self.body.case_when_with_expr(batch, &return_type)
+            self.body
+                .case_when_with_expr(batch, &return_type, self.equality.as_ref())
         }
     }
 
@@ -1596,6 +1703,12 @@ impl PhysicalExpr for CaseExpr {
         }
     }
 
+    fn is_volatile_node(&self) -> bool {
+        // The comparator is evaluated against synthetic columns, not the outer
+        // input schema, so it cannot be exposed through `children()`.
+        self.equality.as_ref().is_some_and(is_volatile)
+    }
+
     fn children(&self) -> Vec<&Arc<dyn PhysicalExpr>> {
         let mut children = vec![];
         if let Some(expr) = &self.body.expr {
@@ -1637,10 +1750,11 @@ impl PhysicalExpr for CaseExpr {
                     ),
                     (false, false) => (None, &children[0..children.len()], None),
                 };
-            let mut rebuilt = CaseExpr::try_new(
+            let mut rebuilt = CaseExpr::try_new_internal(
                 expr.cloned(),
                 when_then_expr.iter().cloned().tuples().collect(),
                 else_expr.cloned(),
+                self.equality.clone(),
             )?;
             rebuilt
                 .logical_result_field
@@ -1711,6 +1825,11 @@ impl PhysicalExpr for CaseExpr {
                         .as_ref()
                         .map(|(_, metadata)| metadata.to_hashmap())
                         .unwrap_or_default(),
+                    equality: self
+                        .equality
+                        .as_ref()
+                        .map(|expr| ctx.encode_child(expr).map(Box::new))
+                        .transpose()?,
                 },
             ))),
         }))
@@ -1733,32 +1852,59 @@ impl CaseExpr {
             "CaseExpr",
         );
 
-        let mut expr = CaseExpr::try_new(
-            case.expr
-                .as_deref()
-                .map(|expr| ctx.decode(expr))
-                .transpose()?,
-            case.when_then_expr
-                .iter()
-                .map(|when_then| {
-                    Ok((
-                        ctx.decode_required_expression(
-                            when_then.when_expr.as_ref(),
-                            "CaseExpr",
-                            "when_expr",
-                        )?,
-                        ctx.decode_required_expression(
-                            when_then.then_expr.as_ref(),
-                            "CaseExpr",
-                            "then_expr",
-                        )?,
-                    ))
-                })
-                .collect::<Result<Vec<_>>>()?,
+        let base = case
+            .expr
+            .as_deref()
+            .map(|expr| ctx.decode(expr))
+            .transpose()?;
+        let when_then_expr = case
+            .when_then_expr
+            .iter()
+            .map(|when_then| {
+                Ok((
+                    ctx.decode_required_expression(
+                        when_then.when_expr.as_ref(),
+                        "CaseExpr",
+                        "when_expr",
+                    )?,
+                    ctx.decode_required_expression(
+                        when_then.then_expr.as_ref(),
+                        "CaseExpr",
+                        "then_expr",
+                    )?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let equality = if let Some(equality) = case.equality.as_deref() {
+            let base_field = base
+                .as_ref()
+                .ok_or_else(|| internal_datafusion_err!("Custom CASE requires a base"))?
+                .return_field(ctx.schema())?;
+            let when_field = when_then_expr
+                .first()
+                .ok_or_else(|| {
+                    internal_datafusion_err!("Custom CASE requires a WHEN branch")
+                })?
+                .0
+                .return_field(ctx.schema())?;
+            let schema = Schema::new(vec![
+                Field::new("case_base", base_field.data_type().clone(), true)
+                    .with_metadata(base_field.metadata().clone()),
+                Field::new("case_when", when_field.data_type().clone(), true)
+                    .with_metadata(when_field.metadata().clone()),
+            ]);
+            Some(ctx.decode_with_schema(equality, &schema)?)
+        } else {
+            None
+        };
+        let mut expr = CaseExpr::try_new_internal(
+            base,
+            when_then_expr,
             case.else_expr
                 .as_deref()
                 .map(|expr| ctx.decode(expr))
                 .transpose()?,
+            equality,
         )?;
         if let Some(logical_type) = &case.logical_result_type {
             expr.logical_result_field = Some((
@@ -1901,6 +2047,65 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct VolatileComparator(Arc<dyn PhysicalExpr>);
+
+    impl Hash for VolatileComparator {
+        fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+            self.0.hash(state);
+        }
+    }
+
+    impl PartialEq for VolatileComparator {
+        fn eq(&self, other: &Self) -> bool {
+            self.0.as_ref() == other.0.as_ref()
+        }
+    }
+
+    impl Eq for VolatileComparator {}
+
+    impl std::fmt::Display for VolatileComparator {
+        fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+            std::fmt::Display::fmt(self.0.as_ref(), f)
+        }
+    }
+
+    impl PhysicalExpr for VolatileComparator {
+        fn data_type(&self, schema: &Schema) -> Result<DataType> {
+            self.0.data_type(schema)
+        }
+
+        fn nullable(&self, schema: &Schema) -> Result<bool> {
+            self.0.nullable(schema)
+        }
+
+        fn evaluate(&self, batch: &RecordBatch) -> Result<ColumnarValue> {
+            self.0.evaluate(batch)
+        }
+
+        fn is_volatile_node(&self) -> bool {
+            true
+        }
+
+        fn children(&self) -> Vec<&Arc<dyn PhysicalExpr>> {
+            vec![&self.0]
+        }
+
+        fn with_new_children(
+            self: Arc<Self>,
+            mut children: Vec<Arc<dyn PhysicalExpr>>,
+        ) -> Result<Arc<dyn PhysicalExpr>> {
+            if children.len() != 1 {
+                return internal_err!("VolatileComparator requires one child");
+            }
+            Ok(Arc::new(Self(children.remove(0))))
+        }
+
+        fn fmt_sql(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+            self.0.fmt_sql(f)
+        }
+    }
+
     use crate::expressions;
     use crate::expressions::{BinaryExpr, binary, cast, col, is_not_null};
     use arrow::buffer::Buffer;
@@ -1911,6 +2116,9 @@ mod tests {
     use datafusion_common::plan_err;
     use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
     use datafusion_expr::type_coercion::binary::type_union_coercion;
+    use datafusion_expr::{
+        CaseLiteralMatcher, ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility,
+    };
     use datafusion_expr_common::operator::Operator;
     use datafusion_physical_expr_common::physical_expr::fmt_sql;
     use half::f16;
@@ -2116,7 +2324,7 @@ mod tests {
             "marked_identity",
             vec![DataType::Binary],
             DataType::Binary,
-            datafusion_expr::Volatility::Immutable,
+            Volatility::Immutable,
             Arc::new(|args| Ok(args[0].clone())),
         ));
         let function_field: FieldRef = Arc::new(
@@ -2194,6 +2402,254 @@ mod tests {
 
         assert_eq!(expected, result);
 
+        Ok(())
+    }
+
+    #[test]
+    fn case_with_custom_equality_preserves_first_match_and_nulls() -> Result<()> {
+        let schema = Schema::new(vec![Field::new("x", DataType::Int32, true)]);
+        let compare_schema = Schema::new(vec![
+            Field::new("case_base", DataType::Int32, true),
+            Field::new("case_when", DataType::Int32, true),
+        ]);
+        let comparison = binary(
+            col("case_base", &compare_schema)?,
+            Operator::NotEq,
+            col("case_when", &compare_schema)?,
+            &compare_schema,
+        )?;
+        let make_case = |equality| {
+            CaseExpr::try_new_internal(
+                Some(col("x", &schema)?),
+                vec![
+                    (lit(ScalarValue::Null), lit("null")),
+                    (lit(2_i32), lit("first")),
+                    (lit(1_i32), lit("second")),
+                ],
+                Some(lit("else")),
+                equality,
+            )
+        };
+        let ordinary = make_case(None)?;
+        let customized = make_case(Some(comparison))?;
+        assert_ne!(ordinary, customized);
+        assert!(matches!(
+            customized.eval_method,
+            EvalMethod::WithExpression(_)
+        ));
+
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![Arc::new(Int32Array::from(vec![Some(1), Some(2), None]))],
+        )?;
+        let customized: Arc<dyn PhysicalExpr> = Arc::new(customized);
+        let result = customized.evaluate(&batch)?.into_array(batch.num_rows())?;
+        assert_eq!(
+            as_string_array(&result),
+            &StringArray::from(vec!["first", "second", "else"])
+        );
+
+        let children = customized.children().into_iter().cloned().collect();
+        let rebuilt = customized.with_new_children(children)?;
+        let result = rebuilt.evaluate(&batch)?.into_array(batch.num_rows())?;
+        assert_eq!(
+            as_string_array(&result),
+            &StringArray::from(vec!["first", "second", "else"])
+        );
+        Ok(())
+    }
+
+    #[derive(Debug)]
+    struct NotEqualLiteralMatcher(Vec<i32>);
+
+    impl CaseLiteralMatcher for NotEqualLiteralMatcher {
+        fn map_to_when_indices(
+            &self,
+            base: &ArrayRef,
+            else_index: u32,
+        ) -> Result<Vec<u32>> {
+            let values = as_int32_array(base)?;
+            Ok((0..values.len())
+                .map(|row| {
+                    if values.is_null(row) {
+                        return else_index;
+                    }
+                    self.0
+                        .iter()
+                        .position(|when| values.value(row) != *when)
+                        .and_then(|index| u32::try_from(index).ok())
+                        .unwrap_or(else_index)
+                })
+                .collect())
+        }
+    }
+
+    #[derive(Debug, PartialEq, Eq, Hash)]
+    struct IndexedNotEqualUdf(Signature);
+
+    impl ScalarUDFImpl for IndexedNotEqualUdf {
+        fn name(&self) -> &str {
+            "indexed_not_equal"
+        }
+
+        fn signature(&self) -> &Signature {
+            &self.0
+        }
+
+        fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
+            Ok(DataType::Boolean)
+        }
+
+        fn create_case_literal_matcher(
+            &self,
+            when_values: &[ScalarValue],
+        ) -> Result<Option<Arc<dyn CaseLiteralMatcher>>> {
+            let values = when_values
+                .iter()
+                .map(|value| match value {
+                    ScalarValue::Int32(Some(value)) => Some(*value),
+                    _ => None,
+                })
+                .collect::<Option<Vec<_>>>();
+            Ok(values.map(|values| {
+                Arc::new(NotEqualLiteralMatcher(values)) as Arc<dyn CaseLiteralMatcher>
+            }))
+        }
+
+        fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+            internal_err!("literal CASE should use the indexed matcher")
+        }
+    }
+
+    #[test]
+    fn custom_case_literal_lookup_preserves_first_match_and_rewrite() -> Result<()> {
+        let schema = Schema::new(vec![Field::new("x", DataType::Int32, true)]);
+        let compare_schema = Schema::new(vec![
+            Field::new("case_base", DataType::Int32, true),
+            Field::new("case_when", DataType::Int32, true),
+        ]);
+        let udf = Arc::new(datafusion_expr::ScalarUDF::new_from_impl(
+            IndexedNotEqualUdf(Signature::any(2, Volatility::Immutable)),
+        ));
+        let equality: Arc<dyn PhysicalExpr> = Arc::new(ScalarFunctionExpr::new(
+            "indexed_not_equal",
+            udf,
+            vec![
+                col("case_base", &compare_schema)?,
+                col("case_when", &compare_schema)?,
+            ],
+            Arc::new(Field::new("indexed_not_equal", DataType::Boolean, true)),
+            Arc::new(datafusion_common::config::ConfigOptions::default()),
+        ));
+        let expr: Arc<dyn PhysicalExpr> = Arc::new(CaseExpr::try_new_with_equality(
+            col("x", &schema)?,
+            vec![(lit(2_i32), lit("first")), (lit(1_i32), lit("second"))],
+            Some(lit("else")),
+            equality,
+        )?);
+        let case = expr
+            .downcast_ref::<CaseExpr>()
+            .ok_or_else(|| internal_datafusion_err!("Expected CASE expression"))?;
+        assert!(matches!(
+            case.eval_method,
+            EvalMethod::WithExprScalarLookupTable(_)
+        ));
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![Arc::new(Int32Array::from(vec![
+                Some(1),
+                Some(2),
+                Some(3),
+                None,
+            ]))],
+        )?;
+        for candidate in [
+            Arc::clone(&expr),
+            Arc::clone(&expr)
+                .with_new_children(expr.children().into_iter().cloned().collect())?,
+        ] {
+            let result = candidate.evaluate(&batch)?.into_array(batch.num_rows())?;
+            assert_eq!(
+                as_string_array(&result),
+                &StringArray::from(vec!["first", "second", "first", "else"])
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn case_custom_equality_preserves_udf_array_arguments() -> Result<()> {
+        let schema = Schema::new(vec![Field::new("x", DataType::Int32, false)]);
+        let compare_schema = Schema::new(vec![
+            Field::new("case_base", DataType::Int32, false),
+            Field::new("case_when", DataType::Int32, false),
+        ]);
+        let udf = Arc::new(datafusion_expr::expr_fn::create_udf(
+            "scalar_when_eq",
+            vec![DataType::Int32, DataType::Int32],
+            DataType::Boolean,
+            Volatility::Immutable,
+            Arc::new(|args| {
+                let [ColumnarValue::Array(base), ColumnarValue::Array(when)] = args
+                else {
+                    return internal_err!(
+                        "CASE equality must pass two array arguments to UDFs"
+                    );
+                };
+                let base = as_int32_array(base)?;
+                let when = as_int32_array(when)?;
+                let result = BooleanArray::from_iter(
+                    base.values()
+                        .iter()
+                        .zip(when.values())
+                        .map(|(base, when)| Some(base == when)),
+                );
+                Ok(ColumnarValue::Array(Arc::new(result)))
+            }),
+        ));
+        let comparison: Arc<dyn PhysicalExpr> = Arc::new(ScalarFunctionExpr::new(
+            "scalar_when_eq",
+            udf,
+            vec![
+                col("case_base", &compare_schema)?,
+                col("case_when", &compare_schema)?,
+            ],
+            Arc::new(Field::new("scalar_when_eq", DataType::Boolean, false)),
+            Arc::new(datafusion_common::config::ConfigOptions::default()),
+        ));
+        let expr = CaseExpr::try_new_with_equality(
+            col("x", &schema)?,
+            vec![(lit(2_i32), lit("matched"))],
+            Some(lit("else")),
+            comparison,
+        )?;
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )?;
+        let result = expr.evaluate(&batch)?.into_array(batch.num_rows())?;
+        assert_eq!(
+            as_string_array(&result),
+            &StringArray::from(vec!["else", "matched", "else"])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn custom_equality_volatility_is_visible_without_exposing_synthetic_columns()
+    -> Result<()> {
+        let case: Arc<dyn PhysicalExpr> = Arc::new(CaseExpr::try_new_with_equality(
+            lit(1_i32),
+            vec![(lit(1_i32), lit("match"))],
+            Some(lit("other")),
+            Arc::new(VolatileComparator(lit(true))),
+        )?);
+        assert!(is_volatile(&case));
+        assert_eq!(case.children().len(), 4);
+        let children = case.children().into_iter().cloned().collect();
+        let rebuilt = case.with_new_children(children)?;
+        assert!(is_volatile(&rebuilt));
+        assert_eq!(rebuilt.children().len(), 4);
         Ok(())
     }
 
@@ -3933,16 +4389,34 @@ mod tests {
 #[cfg(all(test, feature = "proto"))]
 mod proto_tests {
     use super::*;
-    use crate::expressions::col;
+    use crate::expressions::{binary, col};
     use crate::proto_test_util::{
         StubDecoder, StubEncoder, UnreachableDecoder, column_node,
     };
     use arrow::datatypes::Field;
+    use datafusion_expr::Operator;
+    use datafusion_physical_expr_common::physical_expr::proto_decode::PhysicalExprDecode;
     use datafusion_physical_expr_common::physical_expr::proto_decode::PhysicalExprDecodeCtx;
     use datafusion_physical_expr_common::physical_expr::proto_encode::PhysicalExprEncodeCtx;
     use datafusion_proto_models::protobuf;
     use datafusion_proto_models::protobuf::{PhysicalExprNode, PhysicalWhenThen};
+    use std::cell::RefCell;
     use std::collections::HashMap;
+
+    struct SchemaRecordingDecoder {
+        field_counts: RefCell<Vec<usize>>,
+    }
+
+    impl PhysicalExprDecode for SchemaRecordingDecoder {
+        fn decode(
+            &self,
+            _node: &PhysicalExprNode,
+            schema: &Schema,
+        ) -> Result<Arc<dyn PhysicalExpr>> {
+            self.field_counts.borrow_mut().push(schema.fields().len());
+            Ok(Arc::new(Column::new("decoded", 0)))
+        }
+    }
 
     fn proto_case_fixture() -> CaseExpr {
         let schema = Schema::new(vec![Field::new("a", DataType::Boolean, true)]);
@@ -3978,6 +4452,7 @@ mod proto_tests {
                     else_expr,
                     logical_result_type: None,
                     logical_result_metadata: Default::default(),
+                    equality: None,
                 },
             ))),
         }
@@ -4006,6 +4481,47 @@ mod proto_tests {
         assert!(case_node.else_expr.is_some());
         assert!(case_node.logical_result_type.is_none());
         assert!(case_node.logical_result_metadata.is_empty());
+    }
+
+    #[test]
+    fn custom_equality_proto_field_roundtrip() -> Result<()> {
+        let comparison_schema = Schema::new(vec![
+            Field::new("case_base", DataType::Boolean, true),
+            Field::new("case_when", DataType::Boolean, true),
+        ]);
+        let comparison = binary(
+            col("case_base", &comparison_schema)?,
+            Operator::NotEq,
+            col("case_when", &comparison_schema)?,
+            &comparison_schema,
+        )?;
+        let schema = Schema::new(vec![Field::new("a", DataType::Boolean, true)]);
+        let case = CaseExpr::try_new_with_equality(
+            col("a", &schema)?,
+            vec![(lit(true), lit(1_i32))],
+            Some(lit(0_i32)),
+            comparison,
+        )?;
+        let encoder = StubEncoder::ok();
+        let node = case
+            .try_to_proto(&PhysicalExprEncodeCtx::new(&encoder))?
+            .expect("custom CASE should encode");
+        let Some(protobuf::physical_expr_node::ExprType::Case(encoded)) = &node.expr_type
+        else {
+            panic!("expected CASE node");
+        };
+        assert!(encoded.equality.is_some());
+        let decoder = SchemaRecordingDecoder {
+            field_counts: RefCell::new(Vec::new()),
+        };
+        let decoded = CaseExpr::try_from_proto(
+            &node,
+            &PhysicalExprDecodeCtx::new(&schema, &decoder),
+        )?;
+        let decoded = decoded.downcast_ref::<CaseExpr>().expect("CaseExpr");
+        assert!(decoded.equality.is_some());
+        assert_eq!(*decoder.field_counts.borrow(), vec![1, 1, 1, 2, 1]);
+        Ok(())
     }
 
     #[test]

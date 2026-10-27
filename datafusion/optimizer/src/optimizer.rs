@@ -21,6 +21,7 @@ use std::fmt::Debug;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
+use datafusion_expr::execution_props::CaseEqualityPlanner;
 use datafusion_expr::registry::FunctionRegistry;
 use datafusion_expr::{InvariantLevel, assert_expected_schema};
 use log::{debug, warn};
@@ -152,6 +153,12 @@ pub trait OptimizerConfig {
     fn alias_generator(&self) -> &Arc<AliasGenerator>;
 
     fn options(&self) -> Arc<ConfigOptions>;
+
+    /// Optional comparator used to fold simple CASE expressions consistently
+    /// with physical planning.
+    fn case_equality_planner(&self) -> Option<&Arc<dyn CaseEqualityPlanner>> {
+        None
+    }
 
     fn function_registry(&self) -> Option<&dyn FunctionRegistry> {
         None
