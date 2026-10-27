@@ -697,6 +697,16 @@ pub mod proto_decode {
             self.decoder.decode(node, self.schema)
         }
 
+        /// Decode an expression whose columns belong to a nested synthetic
+        /// scope rather than the enclosing input schema.
+        pub fn decode_with_schema(
+            &self,
+            node: &PhysicalExprNode,
+            schema: &Schema,
+        ) -> Result<Arc<dyn PhysicalExpr>> {
+            self.decoder.decode(node, schema)
+        }
+
         /// Decode a required child node, erroring if it is absent.
         ///
         /// Proto child expressions are encoded as `Option<Box<PhysicalExprNode>>`;

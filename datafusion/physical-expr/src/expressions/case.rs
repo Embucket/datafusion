@@ -48,6 +48,7 @@ use crate::expressions::case::literal_lookup_table::LiteralLookupTable;
 use arrow::compute::kernels::merge::{MergeIndex, merge, merge_n};
 use datafusion_common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion_physical_expr_common::datum::compare_with_eq;
+use datafusion_physical_expr_common::physical_expr::is_volatile;
 use datafusion_physical_expr_common::utils::scatter;
 use itertools::Itertools;
 use std::fmt::{Debug, Formatter};
@@ -1662,6 +1663,12 @@ impl PhysicalExpr for CaseExpr {
         }
     }
 
+    fn is_volatile_node(&self) -> bool {
+        // The comparator is evaluated against synthetic columns, not the outer
+        // input schema, so it cannot be exposed through `children()`.
+        self.equality.as_ref().is_some_and(is_volatile)
+    }
+
     fn children(&self) -> Vec<&Arc<dyn PhysicalExpr>> {
         let mut children = vec![];
         if let Some(expr) = &self.body.expr {
@@ -1675,25 +1682,17 @@ impl PhysicalExpr for CaseExpr {
         if let Some(else_expr) = &self.body.else_expr {
             children.push(else_expr)
         }
-        if let Some(equality) = &self.equality {
-            children.push(equality)
-        }
         children
     }
 
     // For physical CaseExpr, we do not allow modifying children size
     fn with_new_children(
         self: Arc<Self>,
-        mut children: Vec<Arc<dyn PhysicalExpr>>,
+        children: Vec<Arc<dyn PhysicalExpr>>,
     ) -> Result<Arc<dyn PhysicalExpr>> {
         if children.len() != self.children().len() {
             internal_err!("CaseExpr: Wrong number of children")
         } else {
-            let equality = if self.equality.is_some() {
-                children.pop()
-            } else {
-                None
-            };
             let (expr, when_then_expr, else_expr) =
                 match (self.expr().is_some(), self.body.else_expr.is_some()) {
                     (true, true) => (
@@ -1715,7 +1714,7 @@ impl PhysicalExpr for CaseExpr {
                 expr.cloned(),
                 when_then_expr.iter().cloned().tuples().collect(),
                 else_expr.cloned(),
-                equality,
+                self.equality.clone(),
             )?;
             rebuilt
                 .logical_result_field
@@ -1818,30 +1817,49 @@ impl CaseExpr {
             .as_deref()
             .map(|expr| ctx.decode(expr))
             .transpose()?;
-        let equality = case
-            .equality
-            .as_deref()
-            .map(|expr| ctx.decode(expr))
-            .transpose()?;
+        let when_then_expr = case
+            .when_then_expr
+            .iter()
+            .map(|when_then| {
+                Ok((
+                    ctx.decode_required_expression(
+                        when_then.when_expr.as_ref(),
+                        "CaseExpr",
+                        "when_expr",
+                    )?,
+                    ctx.decode_required_expression(
+                        when_then.then_expr.as_ref(),
+                        "CaseExpr",
+                        "then_expr",
+                    )?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let equality = if let Some(equality) = case.equality.as_deref() {
+            let base_field = base
+                .as_ref()
+                .ok_or_else(|| internal_datafusion_err!("Custom CASE requires a base"))?
+                .return_field(ctx.schema())?;
+            let when_field = when_then_expr
+                .first()
+                .ok_or_else(|| {
+                    internal_datafusion_err!("Custom CASE requires a WHEN branch")
+                })?
+                .0
+                .return_field(ctx.schema())?;
+            let schema = Schema::new(vec![
+                Field::new("case_base", base_field.data_type().clone(), true)
+                    .with_metadata(base_field.metadata().clone()),
+                Field::new("case_when", when_field.data_type().clone(), true)
+                    .with_metadata(when_field.metadata().clone()),
+            ]);
+            Some(ctx.decode_with_schema(equality, &schema)?)
+        } else {
+            None
+        };
         let mut expr = CaseExpr::try_new_internal(
             base,
-            case.when_then_expr
-                .iter()
-                .map(|when_then| {
-                    Ok((
-                        ctx.decode_required_expression(
-                            when_then.when_expr.as_ref(),
-                            "CaseExpr",
-                            "when_expr",
-                        )?,
-                        ctx.decode_required_expression(
-                            when_then.then_expr.as_ref(),
-                            "CaseExpr",
-                            "then_expr",
-                        )?,
-                    ))
-                })
-                .collect::<Result<Vec<_>>>()?,
+            when_then_expr,
             case.else_expr
                 .as_deref()
                 .map(|expr| ctx.decode(expr))
@@ -1982,6 +2000,65 @@ mod tests {
         ) -> Result<Arc<dyn PhysicalExpr>> {
             assert!(children.is_empty());
             Ok(self)
+        }
+
+        fn fmt_sql(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+            self.0.fmt_sql(f)
+        }
+    }
+
+    #[derive(Debug)]
+    struct VolatileComparator(Arc<dyn PhysicalExpr>);
+
+    impl Hash for VolatileComparator {
+        fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+            self.0.hash(state);
+        }
+    }
+
+    impl PartialEq for VolatileComparator {
+        fn eq(&self, other: &Self) -> bool {
+            self.0.as_ref() == other.0.as_ref()
+        }
+    }
+
+    impl Eq for VolatileComparator {}
+
+    impl std::fmt::Display for VolatileComparator {
+        fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+            std::fmt::Display::fmt(self.0.as_ref(), f)
+        }
+    }
+
+    impl PhysicalExpr for VolatileComparator {
+        fn data_type(&self, schema: &Schema) -> Result<DataType> {
+            self.0.data_type(schema)
+        }
+
+        fn nullable(&self, schema: &Schema) -> Result<bool> {
+            self.0.nullable(schema)
+        }
+
+        fn evaluate(&self, batch: &RecordBatch) -> Result<ColumnarValue> {
+            self.0.evaluate(batch)
+        }
+
+        fn is_volatile_node(&self) -> bool {
+            true
+        }
+
+        fn children(&self) -> Vec<&Arc<dyn PhysicalExpr>> {
+            vec![&self.0]
+        }
+
+        fn with_new_children(
+            self: Arc<Self>,
+            mut children: Vec<Arc<dyn PhysicalExpr>>,
+        ) -> Result<Arc<dyn PhysicalExpr>> {
+            if children.len() != 1 {
+                return internal_err!("VolatileComparator requires one child");
+            }
+            Ok(Arc::new(Self(children.remove(0))))
         }
 
         fn fmt_sql(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
@@ -2336,6 +2413,24 @@ mod tests {
             as_string_array(&result),
             &StringArray::from(vec!["first", "second", "else"])
         );
+        Ok(())
+    }
+
+    #[test]
+    fn custom_equality_volatility_is_visible_without_exposing_synthetic_columns()
+    -> Result<()> {
+        let case: Arc<dyn PhysicalExpr> = Arc::new(CaseExpr::try_new_with_equality(
+            lit(1_i32),
+            vec![(lit(1_i32), lit("match"))],
+            Some(lit("other")),
+            Arc::new(VolatileComparator(lit(true))),
+        )?);
+        assert!(is_volatile(&case));
+        assert_eq!(case.children().len(), 4);
+        let children = case.children().into_iter().cloned().collect();
+        let rebuilt = case.with_new_children(children)?;
+        assert!(is_volatile(&rebuilt));
+        assert_eq!(rebuilt.children().len(), 4);
         Ok(())
     }
 
@@ -4081,11 +4176,28 @@ mod proto_tests {
     };
     use arrow::datatypes::Field;
     use datafusion_expr::Operator;
+    use datafusion_physical_expr_common::physical_expr::proto_decode::PhysicalExprDecode;
     use datafusion_physical_expr_common::physical_expr::proto_decode::PhysicalExprDecodeCtx;
     use datafusion_physical_expr_common::physical_expr::proto_encode::PhysicalExprEncodeCtx;
     use datafusion_proto_models::protobuf;
     use datafusion_proto_models::protobuf::{PhysicalExprNode, PhysicalWhenThen};
+    use std::cell::RefCell;
     use std::collections::HashMap;
+
+    struct SchemaRecordingDecoder {
+        field_counts: RefCell<Vec<usize>>,
+    }
+
+    impl PhysicalExprDecode for SchemaRecordingDecoder {
+        fn decode(
+            &self,
+            _node: &PhysicalExprNode,
+            schema: &Schema,
+        ) -> Result<Arc<dyn PhysicalExpr>> {
+            self.field_counts.borrow_mut().push(schema.fields().len());
+            Ok(Arc::new(Column::new("decoded", 0)))
+        }
+    }
 
     fn proto_case_fixture() -> CaseExpr {
         let schema = Schema::new(vec![Field::new("a", DataType::Boolean, true)]);
@@ -4180,13 +4292,16 @@ mod proto_tests {
             panic!("expected CASE node");
         };
         assert!(encoded.equality.is_some());
-        let decoder = StubDecoder::ok();
+        let decoder = SchemaRecordingDecoder {
+            field_counts: RefCell::new(Vec::new()),
+        };
         let decoded = CaseExpr::try_from_proto(
             &node,
             &PhysicalExprDecodeCtx::new(&schema, &decoder),
         )?;
         let decoded = decoded.downcast_ref::<CaseExpr>().expect("CaseExpr");
         assert!(decoded.equality.is_some());
+        assert_eq!(*decoder.field_counts.borrow(), vec![1, 1, 1, 2, 1]);
         Ok(())
     }
 

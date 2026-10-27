@@ -1417,6 +1417,31 @@ mod tests {
     use crate::test::exec::StatisticsExec;
     use arrow::datatypes::{Field, Schema, UnionFields, UnionMode};
 
+    #[test]
+    fn custom_case_comparator_does_not_leak_synthetic_columns() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
+        let comparison_schema = Schema::new(vec![
+            Field::new("case_base", DataType::Int32, true),
+            Field::new("case_when", DataType::Int32, true),
+        ]);
+        let equality = binary(
+            col("case_base", &comparison_schema)?,
+            Operator::Eq,
+            col("case_when", &comparison_schema)?,
+            &comparison_schema,
+        )?;
+        let predicate: Arc<dyn PhysicalExpr> = Arc::new(CaseExpr::try_new_with_equality(
+            col("x", &schema)?,
+            vec![(lit(1_i32), lit(true))],
+            Some(lit(false)),
+            equality,
+        )?);
+        let input: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(Arc::clone(&schema)));
+        let filter = FilterExec::try_new(predicate, input)?;
+        assert_eq!(filter.schema().fields().len(), 1);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn collect_columns_predicates() -> Result<()> {
         let schema = test::aggr_test_schema();
