@@ -17835,6 +17835,9 @@ impl serde::Serialize for PhysicalCaseNode {
         if !self.logical_result_metadata.is_empty() {
             len += 1;
         }
+        if self.equality.is_some() {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("datafusion.PhysicalCaseNode", len)?;
         if let Some(v) = self.expr.as_ref() {
             struct_ser.serialize_field("expr", v)?;
@@ -17850,6 +17853,9 @@ impl serde::Serialize for PhysicalCaseNode {
         }
         if !self.logical_result_metadata.is_empty() {
             struct_ser.serialize_field("logicalResultMetadata", &self.logical_result_metadata)?;
+        }
+        if let Some(v) = self.equality.as_ref() {
+            struct_ser.serialize_field("equality", v)?;
         }
         struct_ser.end()
     }
@@ -17870,6 +17876,7 @@ impl<'de> serde::Deserialize<'de> for PhysicalCaseNode {
             "logicalResultType",
             "logical_result_metadata",
             "logicalResultMetadata",
+            "equality",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -17879,6 +17886,7 @@ impl<'de> serde::Deserialize<'de> for PhysicalCaseNode {
             ElseExpr,
             LogicalResultType,
             LogicalResultMetadata,
+            Equality,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -17905,6 +17913,7 @@ impl<'de> serde::Deserialize<'de> for PhysicalCaseNode {
                             "elseExpr" | "else_expr" => Ok(GeneratedField::ElseExpr),
                             "logicalResultType" | "logical_result_type" => Ok(GeneratedField::LogicalResultType),
                             "logicalResultMetadata" | "logical_result_metadata" => Ok(GeneratedField::LogicalResultMetadata),
+                            "equality" => Ok(GeneratedField::Equality),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -17929,6 +17938,7 @@ impl<'de> serde::Deserialize<'de> for PhysicalCaseNode {
                 let mut else_expr__ = None;
                 let mut logical_result_type__ = None;
                 let mut logical_result_metadata__ = None;
+                let mut equality__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::Expr => {
@@ -17963,6 +17973,12 @@ impl<'de> serde::Deserialize<'de> for PhysicalCaseNode {
                                 map_.next_value::<std::collections::HashMap<_, _>>()?
                             );
                         }
+                        GeneratedField::Equality => {
+                            if equality__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("equality"));
+                            }
+                            equality__ = map_.next_value()?;
+                        }
                     }
                 }
                 Ok(PhysicalCaseNode {
@@ -17971,6 +17987,7 @@ impl<'de> serde::Deserialize<'de> for PhysicalCaseNode {
                     else_expr: else_expr__,
                     logical_result_type: logical_result_type__,
                     logical_result_metadata: logical_result_metadata__.unwrap_or_default(),
+                    equality: equality__,
                 })
             }
         }

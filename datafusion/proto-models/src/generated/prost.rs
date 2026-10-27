@@ -1833,6 +1833,8 @@ pub struct PhysicalCaseNode {
         ::prost::alloc::string::String,
         ::prost::alloc::string::String,
     >,
+    #[prost(message, optional, boxed, tag = "6")]
+    pub equality: ::core::option::Option<::prost::alloc::boxed::Box<PhysicalExprNode>>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PhysicalTryCastNode {

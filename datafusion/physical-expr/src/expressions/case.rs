@@ -279,6 +279,8 @@ pub struct CaseExpr {
     body: CaseBody,
     /// Evaluation method to use
     eval_method: EvalMethod,
+    /// Optional equality expression over two synthetic columns: base and WHEN.
+    equality: Option<Arc<dyn PhysicalExpr>>,
     /// Logical result type and metadata inferred before physical lowering.
     logical_result_field: Option<(DataType, FieldMetadata)>,
 }
@@ -289,13 +291,16 @@ pub struct CaseExpr {
 impl Hash for CaseExpr {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.body.hash(state);
+        self.equality.hash(state);
         self.logical_result_field.hash(state);
     }
 }
 
 impl PartialEq for CaseExpr {
     fn eq(&self, other: &Self) -> bool {
-        self.body == other.body && self.logical_result_field == other.logical_result_field
+        self.body == other.body
+            && self.equality == other.equality
+            && self.logical_result_field == other.logical_result_field
     }
 }
 
@@ -660,6 +665,30 @@ impl CaseExpr {
         when_then_expr: Vec<WhenThen>,
         else_expr: Option<Arc<dyn PhysicalExpr>>,
     ) -> Result<Self> {
+        Self::try_new_internal(expr, when_then_expr, else_expr, None)
+    }
+
+    /// Create a simple CASE using a physical boolean comparator over synthetic
+    /// `case_base` and `case_when` columns. Null operands never match. Ordinary
+    /// CASEs retain native equality.
+    pub fn try_new_with_equality(
+        expr: Arc<dyn PhysicalExpr>,
+        when_then_expr: Vec<WhenThen>,
+        else_expr: Option<Arc<dyn PhysicalExpr>>,
+        equality: Arc<dyn PhysicalExpr>,
+    ) -> Result<Self> {
+        Self::try_new_internal(Some(expr), when_then_expr, else_expr, Some(equality))
+    }
+
+    fn try_new_internal(
+        expr: Option<Arc<dyn PhysicalExpr>>,
+        when_then_expr: Vec<WhenThen>,
+        else_expr: Option<Arc<dyn PhysicalExpr>>,
+        equality: Option<Arc<dyn PhysicalExpr>>,
+    ) -> Result<Self> {
+        if equality.is_some() && expr.is_none() {
+            return internal_err!("Custom CASE equality requires a base expression");
+        }
         // normalize null literals to None in the else_expr (this already happens
         // during SQL planning, but not necessarily for other use cases)
         let else_expr = match &else_expr {
@@ -680,11 +709,16 @@ impl CaseExpr {
             else_expr,
         };
 
-        let eval_method = Self::find_best_eval_method(&body)?;
+        let eval_method = if equality.is_some() {
+            EvalMethod::WithExpression(body.project()?)
+        } else {
+            Self::find_best_eval_method(&body)?
+        };
 
         Ok(Self {
             body,
             eval_method,
+            equality,
             logical_result_field: None,
         })
     }
@@ -769,6 +803,7 @@ impl CaseBody {
         &self,
         batch: &RecordBatch,
         return_type: &DataType,
+        equality: Option<&Arc<dyn PhysicalExpr>>,
     ) -> Result<ColumnarValue> {
         let mut result_builder = ResultBuilder::new(return_type, batch.num_rows());
 
@@ -839,14 +874,42 @@ impl CaseBody {
             // Evaluate the 'when' predicate for the remainder batch
             // This results in a boolean array with the same length as the remaining number of rows
             let when_expr = &self.when_then_expr[i].0;
-            let when_value = match when_expr.evaluate(&remainder_batch)? {
-                ColumnarValue::Array(a) => {
-                    compare_with_eq(&a, &base_values, base_value_is_nested)
+            let evaluated_when = when_expr.evaluate(&remainder_batch)?;
+            let when_value = if let Some(equality) = equality {
+                let when_array = evaluated_when.into_array(remainder_batch.num_rows())?;
+                if when_array.logical_null_count() == when_array.len() {
+                    continue;
                 }
-                ColumnarValue::Scalar(s) => {
-                    compare_with_eq(&s.to_scalar()?, &base_values, base_value_is_nested)
-                }
-            }?;
+                let Some(base_expr) = self.expr.as_ref() else {
+                    return internal_err!("Custom CASE equality requires a base");
+                };
+                let base_field = base_expr.return_field(batch.schema_ref())?;
+                let when_field = when_expr.return_field(remainder_batch.schema_ref())?;
+                let comparison_batch = RecordBatch::try_new(
+                    Arc::new(Schema::new(vec![
+                        Field::new("case_base", base_values.data_type().clone(), true)
+                            .with_metadata(base_field.metadata().clone()),
+                        Field::new("case_when", when_array.data_type().clone(), true)
+                            .with_metadata(when_field.metadata().clone()),
+                    ])),
+                    vec![Arc::clone(&base_values), when_array],
+                )?;
+                let compared = equality
+                    .evaluate(&comparison_batch)?
+                    .into_array(remainder_batch.num_rows())?;
+                as_boolean_array(&compared)?.clone()
+            } else {
+                match evaluated_when {
+                    ColumnarValue::Array(a) => {
+                        compare_with_eq(&a, &base_values, base_value_is_nested)
+                    }
+                    ColumnarValue::Scalar(s) => compare_with_eq(
+                        &s.to_scalar()?,
+                        &base_values,
+                        base_value_is_nested,
+                    ),
+                }?
+            };
 
             // If the 'when' predicate did not match any rows, continue to the next branch immediately.
             // Only counts valid slots that are true (masked-null predicate slots are ignored),
@@ -1077,11 +1140,14 @@ impl CaseExpr {
             .collect::<Vec<_>>();
         if projection.len() < batch.num_columns() {
             let projected_batch = batch.project(&projection)?;
-            projected
-                .body
-                .case_when_with_expr(&projected_batch, &return_type)
+            projected.body.case_when_with_expr(
+                &projected_batch,
+                &return_type,
+                self.equality.as_ref(),
+            )
         } else {
-            self.body.case_when_with_expr(batch, &return_type)
+            self.body
+                .case_when_with_expr(batch, &return_type, self.equality.as_ref())
         }
     }
 
@@ -1609,17 +1675,25 @@ impl PhysicalExpr for CaseExpr {
         if let Some(else_expr) = &self.body.else_expr {
             children.push(else_expr)
         }
+        if let Some(equality) = &self.equality {
+            children.push(equality)
+        }
         children
     }
 
     // For physical CaseExpr, we do not allow modifying children size
     fn with_new_children(
         self: Arc<Self>,
-        children: Vec<Arc<dyn PhysicalExpr>>,
+        mut children: Vec<Arc<dyn PhysicalExpr>>,
     ) -> Result<Arc<dyn PhysicalExpr>> {
         if children.len() != self.children().len() {
             internal_err!("CaseExpr: Wrong number of children")
         } else {
+            let equality = if self.equality.is_some() {
+                children.pop()
+            } else {
+                None
+            };
             let (expr, when_then_expr, else_expr) =
                 match (self.expr().is_some(), self.body.else_expr.is_some()) {
                     (true, true) => (
@@ -1637,10 +1711,11 @@ impl PhysicalExpr for CaseExpr {
                     ),
                     (false, false) => (None, &children[0..children.len()], None),
                 };
-            let mut rebuilt = CaseExpr::try_new(
+            let mut rebuilt = CaseExpr::try_new_internal(
                 expr.cloned(),
                 when_then_expr.iter().cloned().tuples().collect(),
                 else_expr.cloned(),
+                equality,
             )?;
             rebuilt
                 .logical_result_field
@@ -1711,6 +1786,11 @@ impl PhysicalExpr for CaseExpr {
                         .as_ref()
                         .map(|(_, metadata)| metadata.to_hashmap())
                         .unwrap_or_default(),
+                    equality: self
+                        .equality
+                        .as_ref()
+                        .map(|expr| ctx.encode_child(expr).map(Box::new))
+                        .transpose()?,
                 },
             ))),
         }))
@@ -1733,11 +1813,18 @@ impl CaseExpr {
             "CaseExpr",
         );
 
-        let mut expr = CaseExpr::try_new(
-            case.expr
-                .as_deref()
-                .map(|expr| ctx.decode(expr))
-                .transpose()?,
+        let base = case
+            .expr
+            .as_deref()
+            .map(|expr| ctx.decode(expr))
+            .transpose()?;
+        let equality = case
+            .equality
+            .as_deref()
+            .map(|expr| ctx.decode(expr))
+            .transpose()?;
+        let mut expr = CaseExpr::try_new_internal(
+            base,
             case.when_then_expr
                 .iter()
                 .map(|when_then| {
@@ -1759,6 +1846,7 @@ impl CaseExpr {
                 .as_deref()
                 .map(|expr| ctx.decode(expr))
                 .transpose()?,
+            equality,
         )?;
         if let Some(logical_type) = &case.logical_result_type {
             expr.logical_result_field = Some((
@@ -2194,6 +2282,60 @@ mod tests {
 
         assert_eq!(expected, result);
 
+        Ok(())
+    }
+
+    #[test]
+    fn case_with_custom_equality_preserves_first_match_and_nulls() -> Result<()> {
+        let schema = Schema::new(vec![Field::new("x", DataType::Int32, true)]);
+        let compare_schema = Schema::new(vec![
+            Field::new("case_base", DataType::Int32, true),
+            Field::new("case_when", DataType::Int32, true),
+        ]);
+        let comparison = binary(
+            col("case_base", &compare_schema)?,
+            Operator::NotEq,
+            col("case_when", &compare_schema)?,
+            &compare_schema,
+        )?;
+        let make_case = |equality| {
+            CaseExpr::try_new_internal(
+                Some(col("x", &schema)?),
+                vec![
+                    (lit(ScalarValue::Null), lit("null")),
+                    (lit(2_i32), lit("first")),
+                    (lit(1_i32), lit("second")),
+                ],
+                Some(lit("else")),
+                equality,
+            )
+        };
+        let ordinary = make_case(None)?;
+        let customized = make_case(Some(comparison))?;
+        assert_ne!(ordinary, customized);
+        assert!(matches!(
+            customized.eval_method,
+            EvalMethod::WithExpression(_)
+        ));
+
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![Arc::new(Int32Array::from(vec![Some(1), Some(2), None]))],
+        )?;
+        let customized: Arc<dyn PhysicalExpr> = Arc::new(customized);
+        let result = customized.evaluate(&batch)?.into_array(batch.num_rows())?;
+        assert_eq!(
+            as_string_array(&result),
+            &StringArray::from(vec!["first", "second", "else"])
+        );
+
+        let children = customized.children().into_iter().cloned().collect();
+        let rebuilt = customized.with_new_children(children)?;
+        let result = rebuilt.evaluate(&batch)?.into_array(batch.num_rows())?;
+        assert_eq!(
+            as_string_array(&result),
+            &StringArray::from(vec!["first", "second", "else"])
+        );
         Ok(())
     }
 
@@ -3933,11 +4075,12 @@ mod tests {
 #[cfg(all(test, feature = "proto"))]
 mod proto_tests {
     use super::*;
-    use crate::expressions::col;
+    use crate::expressions::{binary, col};
     use crate::proto_test_util::{
         StubDecoder, StubEncoder, UnreachableDecoder, column_node,
     };
     use arrow::datatypes::Field;
+    use datafusion_expr::Operator;
     use datafusion_physical_expr_common::physical_expr::proto_decode::PhysicalExprDecodeCtx;
     use datafusion_physical_expr_common::physical_expr::proto_encode::PhysicalExprEncodeCtx;
     use datafusion_proto_models::protobuf;
@@ -3978,6 +4121,7 @@ mod proto_tests {
                     else_expr,
                     logical_result_type: None,
                     logical_result_metadata: Default::default(),
+                    equality: None,
                 },
             ))),
         }
@@ -4006,6 +4150,44 @@ mod proto_tests {
         assert!(case_node.else_expr.is_some());
         assert!(case_node.logical_result_type.is_none());
         assert!(case_node.logical_result_metadata.is_empty());
+    }
+
+    #[test]
+    fn custom_equality_proto_field_roundtrip() -> Result<()> {
+        let comparison_schema = Schema::new(vec![
+            Field::new("case_base", DataType::Boolean, true),
+            Field::new("case_when", DataType::Boolean, true),
+        ]);
+        let comparison = binary(
+            col("case_base", &comparison_schema)?,
+            Operator::NotEq,
+            col("case_when", &comparison_schema)?,
+            &comparison_schema,
+        )?;
+        let schema = Schema::new(vec![Field::new("a", DataType::Boolean, true)]);
+        let case = CaseExpr::try_new_with_equality(
+            col("a", &schema)?,
+            vec![(lit(true), lit(1_i32))],
+            Some(lit(0_i32)),
+            comparison,
+        )?;
+        let encoder = StubEncoder::ok();
+        let node = case
+            .try_to_proto(&PhysicalExprEncodeCtx::new(&encoder))?
+            .expect("custom CASE should encode");
+        let Some(protobuf::physical_expr_node::ExprType::Case(encoded)) = &node.expr_type
+        else {
+            panic!("expected CASE node");
+        };
+        assert!(encoded.equality.is_some());
+        let decoder = StubDecoder::ok();
+        let decoded = CaseExpr::try_from_proto(
+            &node,
+            &PhysicalExprDecodeCtx::new(&schema, &decoder),
+        )?;
+        let decoded = decoded.downcast_ref::<CaseExpr>().expect("CaseExpr");
+        assert!(decoded.equality.is_some());
+        Ok(())
     }
 
     #[test]

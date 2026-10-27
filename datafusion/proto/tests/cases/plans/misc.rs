@@ -20,13 +20,18 @@
 
 use super::{roundtrip_test, roundtrip_test_and_return};
 use arrow::datatypes::{Fields, TimeUnit};
+use datafusion::arrow::array::{Int32Array, RecordBatch, StringArray};
 use datafusion::arrow::compute::kernels::sort::SortOptions;
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
+use datafusion::logical_expr::Operator;
 use datafusion::physical_expr::LexOrdering;
+use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::analyze::AnalyzeExec;
 use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_plan::explain::ExplainExec;
-use datafusion::physical_plan::expressions::{PhysicalSortExpr, col, lit};
+use datafusion::physical_plan::expressions::{
+    CaseExpr, PhysicalSortExpr, binary, col, lit,
+};
 use datafusion::physical_plan::metrics::MetricCategory;
 use datafusion::physical_plan::placeholder_row::PlaceholderRowExec;
 use datafusion::physical_plan::projection::{ProjectionExec, ProjectionExpr};
@@ -42,7 +47,10 @@ use datafusion::scalar::ScalarValue;
 use datafusion_common::display::{PlanType, StringifiedPlan};
 use datafusion_common::format::ExplainFormat;
 use datafusion_common::{DataFusionError, Result, UnnestOptions};
-use datafusion_proto::physical_plan::to_proto::serialize_physical_expr_with_converter;
+use datafusion_proto::physical_plan::from_proto::parse_physical_expr;
+use datafusion_proto::physical_plan::to_proto::{
+    serialize_physical_expr, serialize_physical_expr_with_converter,
+};
 use datafusion_proto::physical_plan::{
     AsExecutionPlan, DefaultPhysicalExtensionCodec, DefaultPhysicalProtoConverter,
     PhysicalPlanDecodeContext,
@@ -52,6 +60,46 @@ use datafusion_proto::protobuf::PhysicalPlanNode;
 use prost::Message;
 use std::sync::Arc;
 use std::vec;
+
+#[test]
+fn custom_case_equality_physical_expr_roundtrip() -> Result<()> {
+    let schema = Schema::new(vec![Field::new("x", DataType::Int32, false)]);
+    let compare_schema = Schema::new(vec![
+        Field::new("case_base", DataType::Int32, true),
+        Field::new("case_when", DataType::Int32, true),
+    ]);
+    let equality = binary(
+        col("case_base", &compare_schema)?,
+        Operator::NotEq,
+        col("case_when", &compare_schema)?,
+        &compare_schema,
+    )?;
+    let expr: Arc<dyn PhysicalExpr> = Arc::new(CaseExpr::try_new_with_equality(
+        col("x", &schema)?,
+        vec![(lit(2_i32), lit("first")), (lit(1_i32), lit("second"))],
+        Some(lit("else")),
+        equality,
+    )?);
+    let codec = DefaultPhysicalExtensionCodec {};
+    let encoded = serialize_physical_expr(&expr, &codec)?;
+    let ctx = SessionContext::new();
+    let decoded = parse_physical_expr(&encoded, &ctx.task_ctx(), &schema, &codec)?;
+    assert_eq!(expr.as_ref(), decoded.as_ref());
+
+    let batch = RecordBatch::try_new(
+        Arc::new(schema),
+        vec![Arc::new(Int32Array::from(vec![1, 2]))],
+    )?;
+    let result = decoded.evaluate(&batch)?.into_array(batch.num_rows())?;
+    assert_eq!(
+        result
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("strings"),
+        &StringArray::from(vec!["first", "second"])
+    );
+    Ok(())
+}
 
 #[test]
 fn roundtrip_analyze() -> Result<()> {
