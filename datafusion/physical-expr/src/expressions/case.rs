@@ -870,6 +870,29 @@ impl CaseBody {
         // The types of case and when expressions will be coerced to match.
         // We only need to check if the base_value is nested.
         let base_value_is_nested = base_values.data_type().is_nested();
+        let base_field = if equality.is_some() {
+            let Some(base_expr) = self.expr.as_ref() else {
+                return internal_err!("Custom CASE equality requires a base");
+            };
+            Some(base_expr.return_field(batch.schema_ref())?)
+        } else {
+            None
+        };
+        let direct_udf = equality
+            .and_then(|expr| expr.downcast_ref::<ScalarFunctionExpr>())
+            .filter(|udf| {
+                udf.args().len() == 2
+                    && udf.args()[0]
+                        .downcast_ref::<Column>()
+                        .is_some_and(|column| {
+                            column.index() == 0 && column.name() == "case_base"
+                        })
+                    && udf.args()[1]
+                        .downcast_ref::<Column>()
+                        .is_some_and(|column| {
+                            column.index() == 1 && column.name() == "case_when"
+                        })
+            });
 
         for i in 0..self.when_then_expr.len() {
             // Evaluate the 'when' predicate for the remainder batch
@@ -877,27 +900,45 @@ impl CaseBody {
             let when_expr = &self.when_then_expr[i].0;
             let evaluated_when = when_expr.evaluate(&remainder_batch)?;
             let when_value = if let Some(equality) = equality {
-                let when_array = evaluated_when.into_array(remainder_batch.num_rows())?;
-                if when_array.logical_null_count() == when_array.len() {
+                let all_null = match &evaluated_when {
+                    ColumnarValue::Array(array) => {
+                        array.logical_null_count() == array.len()
+                    }
+                    ColumnarValue::Scalar(value) => value.is_null(),
+                };
+                if all_null {
                     continue;
                 }
-                let Some(base_expr) = self.expr.as_ref() else {
-                    return internal_err!("Custom CASE equality requires a base");
+                let Some(base_field) = base_field.as_ref() else {
+                    return internal_err!("Custom CASE equality requires a base field");
                 };
-                let base_field = base_expr.return_field(batch.schema_ref())?;
                 let when_field = when_expr.return_field(remainder_batch.schema_ref())?;
-                let comparison_batch = RecordBatch::try_new(
-                    Arc::new(Schema::new(vec![
-                        Field::new("case_base", base_values.data_type().clone(), true)
-                            .with_metadata(base_field.metadata().clone()),
-                        Field::new("case_when", when_array.data_type().clone(), true)
-                            .with_metadata(when_field.metadata().clone()),
-                    ])),
-                    vec![Arc::clone(&base_values), when_array],
-                )?;
-                let compared = equality
-                    .evaluate(&comparison_batch)?
-                    .into_array(remainder_batch.num_rows())?;
+                let when_array = evaluated_when.into_array(remainder_batch.num_rows())?;
+                let base_field = Arc::new(
+                    Field::new("case_base", base_values.data_type().clone(), true)
+                        .with_metadata(base_field.metadata().clone()),
+                );
+                let when_field = Arc::new(
+                    Field::new("case_when", when_array.data_type().clone(), true)
+                        .with_metadata(when_field.metadata().clone()),
+                );
+                let compared = if let Some(udf) = direct_udf {
+                    udf.evaluate_with_args(
+                        vec![
+                            ColumnarValue::Array(Arc::clone(&base_values)),
+                            ColumnarValue::Array(when_array),
+                        ],
+                        vec![base_field, when_field],
+                        remainder_batch.num_rows(),
+                    )?
+                } else {
+                    let comparison_batch = RecordBatch::try_new(
+                        Arc::new(Schema::new(vec![base_field, when_field])),
+                        vec![Arc::clone(&base_values), when_array],
+                    )?;
+                    equality.evaluate(&comparison_batch)?
+                }
+                .into_array(remainder_batch.num_rows())?;
                 as_boolean_array(&compared)?.clone()
             } else {
                 match evaluated_when {
@@ -2412,6 +2453,64 @@ mod tests {
         assert_eq!(
             as_string_array(&result),
             &StringArray::from(vec!["first", "second", "else"])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn case_custom_equality_preserves_udf_array_arguments() -> Result<()> {
+        let schema = Schema::new(vec![Field::new("x", DataType::Int32, false)]);
+        let compare_schema = Schema::new(vec![
+            Field::new("case_base", DataType::Int32, false),
+            Field::new("case_when", DataType::Int32, false),
+        ]);
+        let udf = Arc::new(datafusion_expr::expr_fn::create_udf(
+            "scalar_when_eq",
+            vec![DataType::Int32, DataType::Int32],
+            DataType::Boolean,
+            datafusion_expr::Volatility::Immutable,
+            Arc::new(|args| {
+                let [ColumnarValue::Array(base), ColumnarValue::Array(when)] = args
+                else {
+                    return internal_err!(
+                        "CASE equality must pass two array arguments to UDFs"
+                    );
+                };
+                let base = as_int32_array(base)?;
+                let when = as_int32_array(when)?;
+                let result = BooleanArray::from_iter(
+                    base.values()
+                        .iter()
+                        .zip(when.values())
+                        .map(|(base, when)| Some(base == when)),
+                );
+                Ok(ColumnarValue::Array(Arc::new(result)))
+            }),
+        ));
+        let comparison: Arc<dyn PhysicalExpr> = Arc::new(ScalarFunctionExpr::new(
+            "scalar_when_eq",
+            udf,
+            vec![
+                col("case_base", &compare_schema)?,
+                col("case_when", &compare_schema)?,
+            ],
+            Arc::new(Field::new("scalar_when_eq", DataType::Boolean, false)),
+            Arc::new(datafusion_common::config::ConfigOptions::default()),
+        ));
+        let expr = CaseExpr::try_new_with_equality(
+            col("x", &schema)?,
+            vec![(lit(2_i32), lit("matched"))],
+            Some(lit("else")),
+            comparison,
+        )?;
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )?;
+        let result = expr.evaluate(&batch)?.into_array(batch.num_rows())?;
+        assert_eq!(
+            as_string_array(&result),
+            &StringArray::from(vec!["else", "matched", "else"])
         );
         Ok(())
     }

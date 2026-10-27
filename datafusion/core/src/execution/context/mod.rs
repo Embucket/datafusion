@@ -1577,6 +1577,9 @@ impl SessionContext {
         let context = SimplifyContext::builder()
             .with_schema(Arc::clone(prepared.plan.schema()))
             .with_config_options(Arc::clone(state.config_options()))
+            .with_case_equality_planner(
+                state.execution_props().case_equality_planner.clone(),
+            )
             .with_query_execution_start_time(
                 state.execution_props().query_execution_start_time,
             )

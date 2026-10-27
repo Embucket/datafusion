@@ -37,7 +37,9 @@ use datafusion_common::{
     HashMap,
     cast::{as_large_list_array, as_list_array},
     metadata::FieldMetadata,
-    tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeRewriter},
+    tree_node::{
+        Transformed, TransformedResult, TreeNode, TreeNodeRecursion, TreeNodeRewriter,
+    },
 };
 use datafusion_expr::expr::HigherOrderFunction;
 use datafusion_expr::physical_planning_context::PhysicalPlanningContext;
@@ -213,6 +215,8 @@ impl ExprSimplifier {
         let mut simplifier = Simplifier::new(&self.info);
         let config_options = Some(Arc::clone(self.info.config_options()));
         let mut const_evaluator = ConstEvaluator::try_new(config_options)?;
+        const_evaluator.execution_props.case_equality_planner =
+            self.info.case_equality_planner().cloned();
         let mut shorten_in_list_simplifier = ShortenInListSimplifier::new();
         let guarantees_map: HashMap<&Expr, &NullableInterval> =
             self.guarantees.iter().map(|(k, v)| (k, v)).collect();
@@ -717,6 +721,23 @@ impl ConstEvaluator {
             Ok(e) => e,
             Err(err) => return ConstSimplifyResult::SimplifyRuntimeError(err, expr),
         };
+        let mut volatile = false;
+        if let Err(err) = phys_expr.apply(|node| {
+            volatile |= node.is_volatile_node();
+            Ok(if volatile {
+                TreeNodeRecursion::Stop
+            } else {
+                TreeNodeRecursion::Continue
+            })
+        }) {
+            return ConstSimplifyResult::SimplifyRuntimeError(err, expr);
+        }
+        if volatile {
+            return ConstSimplifyResult::SimplifyRuntimeError(
+                exec_datafusion_err!("Cannot fold a volatile expression"),
+                expr,
+            );
+        }
         let metadata = phys_expr
             .return_field(DUMMY_BATCH.schema_ref())
             .ok()
@@ -2379,6 +2400,7 @@ mod tests {
         datatypes::{FieldRef, Fields},
     };
     use datafusion_common::{DFSchemaRef, ToDFSchema, assert_contains};
+    use datafusion_expr::execution_props::CaseEqualityPlanner;
     use datafusion_expr::{
         expr::WindowFunction,
         function::{
@@ -2413,6 +2435,71 @@ mod tests {
         let expr = lit(1) + lit(2);
         let expected = lit(3);
         assert_eq!(expected, simplifier.simplify(expr).unwrap());
+    }
+
+    #[derive(Debug)]
+    struct NotEqualCasePlanner;
+
+    impl CaseEqualityPlanner for NotEqualCasePlanner {
+        fn plan_equality(
+            &self,
+            _case: &Case,
+            _schema: &DFSchema,
+        ) -> Result<Option<Expr>> {
+            Ok(Some(col("case_base").not_eq(col("case_when"))))
+        }
+    }
+
+    #[test]
+    fn constant_case_uses_custom_equality_when_configured() -> Result<()> {
+        let expression = Expr::Case(Case::new(
+            Some(Box::new(lit(1_i32))),
+            vec![(Box::new(lit(2_i32)), Box::new(lit("match")))],
+            Some(Box::new(lit("miss"))),
+        ));
+        let ordinary = ExprSimplifier::new(SimplifyContext::default());
+        assert_eq!(ordinary.simplify(expression.clone())?, lit("miss"));
+
+        let custom = ExprSimplifier::new(
+            SimplifyContext::builder()
+                .with_case_equality_planner(Some(Arc::new(NotEqualCasePlanner)))
+                .build(),
+        );
+        assert_eq!(custom.simplify(expression)?, lit("match"));
+        Ok(())
+    }
+
+    #[derive(Debug)]
+    struct VolatileCasePlanner;
+
+    impl CaseEqualityPlanner for VolatileCasePlanner {
+        fn plan_equality(
+            &self,
+            _case: &Case,
+            _schema: &DFSchema,
+        ) -> Result<Option<Expr>> {
+            let udf = Arc::new(ScalarUDF::new_from_impl(VolatileUdf::new()));
+            let random = Expr::ScalarFunction(ScalarFunction::new_udf(udf, vec![]));
+            Ok(Some(
+                col("case_base").eq(col("case_when")).and(random.eq(lit(0))),
+            ))
+        }
+    }
+
+    #[test]
+    fn constant_case_with_volatile_comparator_is_not_folded() -> Result<()> {
+        let expression = Expr::Case(Case::new(
+            Some(Box::new(lit(1_i32))),
+            vec![(Box::new(lit(1_i32)), Box::new(lit("match")))],
+            Some(Box::new(lit("miss"))),
+        ));
+        let simplifier = ExprSimplifier::new(
+            SimplifyContext::builder()
+                .with_case_equality_planner(Some(Arc::new(VolatileCasePlanner)))
+                .build(),
+        );
+        assert_eq!(simplifier.simplify(expression.clone())?, expression);
+        Ok(())
     }
 
     #[test]
