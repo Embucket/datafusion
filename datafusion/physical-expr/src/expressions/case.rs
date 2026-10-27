@@ -55,6 +55,20 @@ use std::fmt::{Debug, Formatter};
 
 pub(super) type WhenThen = (Arc<dyn PhysicalExpr>, Arc<dyn PhysicalExpr>);
 
+fn direct_case_equality_udf(
+    equality: &Arc<dyn PhysicalExpr>,
+) -> Option<&ScalarFunctionExpr> {
+    equality.downcast_ref::<ScalarFunctionExpr>().filter(|udf| {
+        udf.args().len() == 2
+            && udf.args()[0]
+                .downcast_ref::<Column>()
+                .is_some_and(|column| column.index() == 0 && column.name() == "case_base")
+            && udf.args()[1]
+                .downcast_ref::<Column>()
+                .is_some_and(|column| column.index() == 1 && column.name() == "case_when")
+    })
+}
+
 #[derive(Debug, Hash, PartialEq, Eq)]
 enum EvalMethod {
     /// CASE WHEN condition THEN result
@@ -710,11 +724,7 @@ impl CaseExpr {
             else_expr,
         };
 
-        let eval_method = if equality.is_some() {
-            EvalMethod::WithExpression(body.project()?)
-        } else {
-            Self::find_best_eval_method(&body)?
-        };
+        let eval_method = Self::find_best_eval_method(&body, equality.as_ref())?;
 
         Ok(Self {
             body,
@@ -733,9 +743,12 @@ impl CaseExpr {
         self
     }
 
-    fn find_best_eval_method(body: &CaseBody) -> Result<EvalMethod> {
+    fn find_best_eval_method(
+        body: &CaseBody,
+        equality: Option<&Arc<dyn PhysicalExpr>>,
+    ) -> Result<EvalMethod> {
         if body.expr.is_some() {
-            if let Some(mapping) = LiteralLookupTable::maybe_new(body) {
+            if let Some(mapping) = LiteralLookupTable::maybe_new(body, equality) {
                 return Ok(EvalMethod::WithExprScalarLookupTable(mapping));
             }
 
@@ -878,21 +891,7 @@ impl CaseBody {
         } else {
             None
         };
-        let direct_udf = equality
-            .and_then(|expr| expr.downcast_ref::<ScalarFunctionExpr>())
-            .filter(|udf| {
-                udf.args().len() == 2
-                    && udf.args()[0]
-                        .downcast_ref::<Column>()
-                        .is_some_and(|column| {
-                            column.index() == 0 && column.name() == "case_base"
-                        })
-                    && udf.args()[1]
-                        .downcast_ref::<Column>()
-                        .is_some_and(|column| {
-                            column.index() == 1 && column.name() == "case_when"
-                        })
-            });
+        let direct_udf = equality.and_then(direct_case_equality_udf);
 
         for i in 0..self.when_then_expr.len() {
             // Evaluate the 'when' predicate for the remainder batch
@@ -2117,6 +2116,9 @@ mod tests {
     use datafusion_common::plan_err;
     use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
     use datafusion_expr::type_coercion::binary::type_union_coercion;
+    use datafusion_expr::{
+        CaseLiteralMatcher, ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility,
+    };
     use datafusion_expr_common::operator::Operator;
     use datafusion_physical_expr_common::physical_expr::fmt_sql;
     use half::f16;
@@ -2322,7 +2324,7 @@ mod tests {
             "marked_identity",
             vec![DataType::Binary],
             DataType::Binary,
-            datafusion_expr::Volatility::Immutable,
+            Volatility::Immutable,
             Arc::new(|args| Ok(args[0].clone())),
         ));
         let function_field: FieldRef = Arc::new(
@@ -2457,6 +2459,124 @@ mod tests {
         Ok(())
     }
 
+    #[derive(Debug)]
+    struct NotEqualLiteralMatcher(Vec<i32>);
+
+    impl CaseLiteralMatcher for NotEqualLiteralMatcher {
+        fn map_to_when_indices(
+            &self,
+            base: &ArrayRef,
+            else_index: u32,
+        ) -> Result<Vec<u32>> {
+            let values = as_int32_array(base)?;
+            Ok((0..values.len())
+                .map(|row| {
+                    if values.is_null(row) {
+                        return else_index;
+                    }
+                    self.0
+                        .iter()
+                        .position(|when| values.value(row) != *when)
+                        .and_then(|index| u32::try_from(index).ok())
+                        .unwrap_or(else_index)
+                })
+                .collect())
+        }
+    }
+
+    #[derive(Debug, PartialEq, Eq, Hash)]
+    struct IndexedNotEqualUdf(Signature);
+
+    impl ScalarUDFImpl for IndexedNotEqualUdf {
+        fn name(&self) -> &str {
+            "indexed_not_equal"
+        }
+
+        fn signature(&self) -> &Signature {
+            &self.0
+        }
+
+        fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
+            Ok(DataType::Boolean)
+        }
+
+        fn create_case_literal_matcher(
+            &self,
+            when_values: &[ScalarValue],
+        ) -> Result<Option<Arc<dyn CaseLiteralMatcher>>> {
+            let values = when_values
+                .iter()
+                .map(|value| match value {
+                    ScalarValue::Int32(Some(value)) => Some(*value),
+                    _ => None,
+                })
+                .collect::<Option<Vec<_>>>();
+            Ok(values.map(|values| {
+                Arc::new(NotEqualLiteralMatcher(values)) as Arc<dyn CaseLiteralMatcher>
+            }))
+        }
+
+        fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+            internal_err!("literal CASE should use the indexed matcher")
+        }
+    }
+
+    #[test]
+    fn custom_case_literal_lookup_preserves_first_match_and_rewrite() -> Result<()> {
+        let schema = Schema::new(vec![Field::new("x", DataType::Int32, true)]);
+        let compare_schema = Schema::new(vec![
+            Field::new("case_base", DataType::Int32, true),
+            Field::new("case_when", DataType::Int32, true),
+        ]);
+        let udf = Arc::new(datafusion_expr::ScalarUDF::new_from_impl(
+            IndexedNotEqualUdf(Signature::any(2, Volatility::Immutable)),
+        ));
+        let equality: Arc<dyn PhysicalExpr> = Arc::new(ScalarFunctionExpr::new(
+            "indexed_not_equal",
+            udf,
+            vec![
+                col("case_base", &compare_schema)?,
+                col("case_when", &compare_schema)?,
+            ],
+            Arc::new(Field::new("indexed_not_equal", DataType::Boolean, true)),
+            Arc::new(datafusion_common::config::ConfigOptions::default()),
+        ));
+        let expr: Arc<dyn PhysicalExpr> = Arc::new(CaseExpr::try_new_with_equality(
+            col("x", &schema)?,
+            vec![(lit(2_i32), lit("first")), (lit(1_i32), lit("second"))],
+            Some(lit("else")),
+            equality,
+        )?);
+        let case = expr
+            .downcast_ref::<CaseExpr>()
+            .ok_or_else(|| internal_datafusion_err!("Expected CASE expression"))?;
+        assert!(matches!(
+            case.eval_method,
+            EvalMethod::WithExprScalarLookupTable(_)
+        ));
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![Arc::new(Int32Array::from(vec![
+                Some(1),
+                Some(2),
+                Some(3),
+                None,
+            ]))],
+        )?;
+        for candidate in [
+            Arc::clone(&expr),
+            Arc::clone(&expr)
+                .with_new_children(expr.children().into_iter().cloned().collect())?,
+        ] {
+            let result = candidate.evaluate(&batch)?.into_array(batch.num_rows())?;
+            assert_eq!(
+                as_string_array(&result),
+                &StringArray::from(vec!["first", "second", "first", "else"])
+            );
+        }
+        Ok(())
+    }
+
     #[test]
     fn case_custom_equality_preserves_udf_array_arguments() -> Result<()> {
         let schema = Schema::new(vec![Field::new("x", DataType::Int32, false)]);
@@ -2468,7 +2588,7 @@ mod tests {
             "scalar_when_eq",
             vec![DataType::Int32, DataType::Int32],
             DataType::Boolean,
-            datafusion_expr::Volatility::Immutable,
+            Volatility::Immutable,
             Arc::new(|args| {
                 let [ColumnarValue::Array(base), ColumnarValue::Array(when)] = args
                 else {
