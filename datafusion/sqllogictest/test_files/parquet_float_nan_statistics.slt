@@ -51,7 +51,12 @@ SELECT column1 FROM t ORDER BY column1;
 1
 NaN
 
-# The minimum is still a bound: NaN is never below it.
+query R
+SELECT column1 FROM t ORDER BY column1 DESC LIMIT 1;
+----
+NaN
+
+# The minimum is still a bound: the 'NaN' literal is never below it.
 query I
 SELECT count(*) FROM t WHERE column1 < 1;
 ----
@@ -59,3 +64,24 @@ SELECT count(*) FROM t WHERE column1 < 1;
 
 statement ok
 DROP TABLE t;
+
+# Parquet writers record a zero minimum as -0.0, so MIN must not be answered from it.
+query I
+COPY (VALUES (0.0), (1.0))
+TO 'test_files/scratch/parquet_float_nan_statistics/zero/0.parquet'
+STORED AS PARQUET;
+----
+2
+
+statement ok
+CREATE EXTERNAL TABLE zero
+STORED AS PARQUET
+LOCATION 'test_files/scratch/parquet_float_nan_statistics/zero';
+
+query T
+SELECT CAST(min(column1) AS VARCHAR) FROM zero;
+----
+0.0
+
+statement ok
+DROP TABLE zero;

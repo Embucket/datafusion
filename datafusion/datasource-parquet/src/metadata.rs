@@ -587,11 +587,22 @@ fn min_max_aggregate_data_type(input_type: &DataType) -> &DataType {
 /// Whether a column's Parquet maximum may sit below some of its values.
 ///
 /// Parquet writers leave NaN out of floating-point statistics (the Parquet spec asks them to),
-/// while NaN sorts above every other value. A float column's maximum therefore only bounds the
-/// non-NaN values: it must not prune `col > x` or stand for the column's `MAX`. The minimum stays
-/// a valid lower bound, since NaN is never below it.
+/// while a NaN with its sign bit clear (the `'NaN'` literal) sorts above every other value. A
+/// float column's maximum therefore only bounds the non-NaN values: it must not prune `col > x`
+/// or stand for the column's `MAX`. The minimum stays a valid lower bound for such a NaN.
 pub(crate) fn max_statistic_may_omit_nan(data_type: &DataType) -> bool {
     min_max_aggregate_data_type(data_type).is_floating()
+}
+
+/// Whether a float minimum is a zero, which Parquet writers record as `-0.0` whatever the sign
+/// of the stored zeros: it bounds the column but is not its exact minimum.
+fn min_statistic_is_signed_zero(min: &ScalarValue) -> bool {
+    match min {
+        ScalarValue::Float16(Some(value)) => value.to_f32() == 0.0,
+        ScalarValue::Float32(Some(value)) => *value == 0.0,
+        ScalarValue::Float64(Some(value)) => *value == 0.0,
+        _ => false,
+    }
 }
 
 fn create_max_min_accs(
@@ -650,7 +661,13 @@ impl StatisticsAccumulators<'_> {
                     self.is_min_value_exact.get(i).unwrap(),
                 ) {
                     (Some(min_value), Some(true)) => {
-                        min_value.evaluate().ok().map(Precision::Exact)
+                        min_value.evaluate().ok().map(|min| {
+                            if min_statistic_is_signed_zero(&min) {
+                                Precision::Inexact(min)
+                            } else {
+                                Precision::Exact(min)
+                            }
+                        })
                     }
                     (Some(min_value), Some(false)) | (Some(min_value), None) => {
                         min_value.evaluate().ok().map(Precision::Inexact)
