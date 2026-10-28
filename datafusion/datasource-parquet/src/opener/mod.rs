@@ -301,6 +301,12 @@ pub(super) struct ParquetMorselizer {
     /// Per-scan virtual-column state (validation already performed). `None`
     /// when no virtual columns are requested — the common path.
     pub(crate) virtual_state: Option<Arc<VirtualColumnsState>>,
+    /// Counter for file ranges skipped by the dynamic-filter re-check that
+    /// runs right before a file's first data read. `Some` enables that
+    /// re-check (`datafusion.execution.recheck_dynamic_filter_before_read`
+    /// with a dynamic filter in the predicate); `None` keeps the default
+    /// behaviour of re-checking only after the first batch.
+    pub(crate) files_ranges_pruned_before_read: Option<Count>,
 }
 
 impl fmt::Debug for ParquetMorselizer {
@@ -460,6 +466,8 @@ struct PreparedParquetOpen {
     reverse_row_groups: bool,
     sort_order_for_reorder: Option<LexOrdering>,
     preserve_order: bool,
+    /// See [`ParquetMorselizer::files_ranges_pruned_before_read`].
+    files_ranges_pruned_before_read: Option<Count>,
     #[cfg(feature = "parquet_encryption")]
     file_decryption_properties: Option<Arc<FileDecryptionProperties>>,
 }
@@ -857,6 +865,7 @@ impl ParquetMorselizer {
             reverse_row_groups: self.reverse_row_groups,
             sort_order_for_reorder: self.sort_order_for_reorder.clone(),
             preserve_order: self.preserve_order,
+            files_ranges_pruned_before_read: self.files_ranges_pruned_before_read.clone(),
             #[cfg(feature = "parquet_encryption")]
             file_decryption_properties: None,
         })
@@ -1544,6 +1553,16 @@ impl RowGroupsPrunedParquetOpen {
             .file_metrics
             .row_groups_pruned_dynamic_filter
             .clone();
+        // The pre-read re-check only saves I/O for a range that has a row group
+        // left to fetch and no `RowGroupPruner` (which already checks before every
+        // row group): an empty byte-range sliver or a fully pruned range would
+        // otherwise be counted as pruned before read without saving anything.
+        let files_ranges_pruned_before_read =
+            if !rg_plan.is_empty() && row_group_pruner.is_none() {
+                prepared.files_ranges_pruned_before_read
+            } else {
+                None
+            };
 
         let stream = PushDecoderStreamState {
             decoder: Some(decoder),
@@ -1565,6 +1584,11 @@ impl RowGroupsPrunedParquetOpen {
         // mid-scan. For a static (or already-complete) predicate the up-front
         // `prune_file` check already captured everything that can be pruned, so
         // per-batch re-checking would only add overhead.
+        //
+        // With `files_ranges_pruned_before_read` set, the wrapper also re-checks
+        // once before the first data read, so a file opened ahead of time is
+        // skipped without any row-group I/O when the filter has tightened since
+        // `prune_file` ran.
         match prepared.file_pruner {
             Some(file_pruner) if file_pruner.is_watching() => {
                 Ok(EarlyStoppingStream::new(
@@ -1572,6 +1596,7 @@ impl RowGroupsPrunedParquetOpen {
                     file_pruner,
                     files_ranges_pruned_statistics,
                 )
+                .with_recheck_before_first_read(files_ranges_pruned_before_read)
                 .boxed())
             }
             _ => Ok(stream),
@@ -1809,6 +1834,7 @@ mod test {
         max_in_list_size: usize,
         reverse_row_groups: bool,
         preserve_order: bool,
+        files_ranges_pruned_before_read: Option<Count>,
     }
 
     #[test]
@@ -2020,6 +2046,7 @@ mod test {
                 max_in_list_size: MAX_IN_LIST_SIZE,
                 reverse_row_groups: false,
                 preserve_order: false,
+                files_ranges_pruned_before_read: None,
             }
         }
 
@@ -2118,6 +2145,13 @@ mod test {
             self
         }
 
+        /// Enable the dynamic-filter re-check before a file's first data
+        /// read, counting skipped files in `counter`.
+        fn with_recheck_before_first_read(mut self, counter: Count) -> Self {
+            self.files_ranges_pruned_before_read = Some(counter);
+            self
+        }
+
         /// Build the ParquetMorselizer instance, unwrapping validation errors.
         ///
         /// # Panics
@@ -2199,6 +2233,7 @@ mod test {
                 reverse_row_groups: self.reverse_row_groups,
                 sort_order_for_reorder: None,
                 virtual_state,
+                files_ranges_pruned_before_read: self.files_ranges_pruned_before_read,
             })
         }
     }
@@ -3438,6 +3473,225 @@ mod test {
 
         let values = collect_int32_values(open_file(&opener, file).await.unwrap()).await;
         assert_eq!(values, vec![7, 4, 5, 6, 3]);
+    }
+
+    /// [`ParquetFileReaderFactory`] that counts data reads (`get_bytes` and
+    /// `get_byte_ranges`) separately from metadata reads (`get_metadata`).
+    #[derive(Debug)]
+    struct DataReadCountingReaderFactory {
+        inner: DefaultParquetFileReaderFactory,
+        data_reads: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    struct DataReadCountingReader {
+        inner: Box<dyn AsyncFileReader + Send>,
+        data_reads: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl AsyncFileReader for DataReadCountingReader {
+        fn get_bytes(
+            &mut self,
+            range: std::ops::Range<u64>,
+        ) -> BoxFuture<'_, parquet::errors::Result<bytes::Bytes>> {
+            self.data_reads
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.get_bytes(range)
+        }
+
+        fn get_byte_ranges(
+            &mut self,
+            ranges: Vec<std::ops::Range<u64>>,
+        ) -> BoxFuture<'_, parquet::errors::Result<Vec<bytes::Bytes>>> {
+            self.data_reads
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.get_byte_ranges(ranges)
+        }
+
+        fn get_metadata<'a>(
+            &'a mut self,
+            options: Option<&'a ArrowReaderOptions>,
+        ) -> BoxFuture<'a, parquet::errors::Result<Arc<ParquetMetaData>>> {
+            self.inner.get_metadata(options)
+        }
+    }
+
+    impl ParquetFileReaderFactory for DataReadCountingReaderFactory {
+        fn create_reader(
+            &self,
+            partition_index: usize,
+            partitioned_file: PartitionedFile,
+            metadata_size_hint: Option<usize>,
+            metrics: &ExecutionPlanMetricsSet,
+        ) -> Result<Box<dyn AsyncFileReader + Send>> {
+            let inner = self.inner.create_reader(
+                partition_index,
+                partitioned_file,
+                metadata_size_hint,
+                metrics,
+            )?;
+            Ok(Box::new(DataReadCountingReader {
+                inner,
+                data_reads: Arc::clone(&self.data_reads),
+            }))
+        }
+    }
+
+    fn pruning_metric(
+        metrics: &ExecutionPlanMetricsSet,
+        name: &str,
+    ) -> Option<(usize, usize)> {
+        use datafusion_physical_plan::metrics::MetricValue;
+        metrics
+            .clone_inner()
+            .sum_by_name(name)
+            .and_then(|metric| match metric {
+                MetricValue::PruningMetrics {
+                    pruning_metrics, ..
+                } => Some((pruning_metrics.pruned(), pruning_metrics.matched())),
+                _ => None,
+            })
+    }
+
+    /// Outcome of [`open_then_tighten_dynamic_filter`].
+    struct TightenedOpen {
+        rows: usize,
+        data_reads_at_open: usize,
+        data_reads: usize,
+        /// `(pruned, matched)` of `files_ranges_pruned_statistics`.
+        files_ranges: Option<(usize, usize)>,
+        /// `files_ranges_pruned_before_read`, `None` when not registered.
+        pruned_before_read: Option<usize>,
+    }
+
+    /// Open a one-row-group file (`a` in `1..=100`) under a TopK-style dynamic
+    /// filter that is still `true`, then update the filter to `new_filter`
+    /// before reading the opened stream. This is the shape of a file opened
+    /// ahead of time (`file_stream_open_ahead`) and only read after the TopK
+    /// published a threshold.
+    async fn open_then_tighten_dynamic_filter(
+        recheck_before_first_read: bool,
+        new_filter: Option<Expr>,
+    ) -> TightenedOpen {
+        use datafusion_physical_plan::metrics::MetricBuilder;
+
+        let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let values: Vec<i32> = (1..=100).collect();
+        let batch = record_batch!((
+            "a",
+            Int32,
+            values.iter().map(|v| Some(*v)).collect::<Vec<_>>()
+        ))
+        .unwrap();
+        let schema = batch.schema();
+        let data_len =
+            write_parquet(Arc::clone(&store), "test.parquet", batch.clone()).await;
+        let file = PartitionedFile::new(
+            "test.parquet".to_string(),
+            u64::try_from(data_len).unwrap(),
+        )
+        .with_statistics(Arc::new(Statistics {
+            num_rows: Precision::Exact(100),
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![
+                ColumnStatistics::new_unknown()
+                    .with_min_value(Precision::Exact(ScalarValue::Int32(Some(1))))
+                    .with_max_value(Precision::Exact(ScalarValue::Int32(Some(100))))
+                    .with_null_count(Precision::Exact(0)),
+            ],
+        }));
+
+        let column = Arc::new(Column::new("a", 0)) as Arc<dyn PhysicalExpr>;
+        let filter = Arc::new(DynamicFilterPhysicalExpr::new(
+            vec![Arc::clone(&column)],
+            datafusion_physical_expr::expressions::lit(true),
+        ));
+        let predicate = Arc::clone(&filter) as Arc<dyn PhysicalExpr>;
+
+        let metrics = ExecutionPlanMetricsSet::new();
+        let data_reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut builder = ParquetMorselizerBuilder::new()
+            .with_store(Arc::clone(&store))
+            .with_schema(Arc::clone(&schema))
+            .with_predicate(predicate)
+            .with_row_group_stats_pruning(true)
+            .with_metrics(metrics.clone())
+            .with_parquet_file_reader_factory(Arc::new(DataReadCountingReaderFactory {
+                inner: DefaultParquetFileReaderFactory::new(Arc::clone(&store)),
+                data_reads: Arc::clone(&data_reads),
+            }));
+        if recheck_before_first_read {
+            builder = builder.with_recheck_before_first_read(
+                MetricBuilder::new(&metrics)
+                    .counter("files_ranges_pruned_before_read", 0),
+            );
+        }
+        let morselizer = builder.build();
+
+        // Opening reads only metadata: the row group is fetched by the stream.
+        let stream = open_file(&morselizer, file).await.unwrap();
+        let data_reads_at_open = data_reads.load(std::sync::atomic::Ordering::SeqCst);
+
+        if let Some(new_filter) = new_filter {
+            filter
+                .update(logical2physical(&new_filter, &schema))
+                .unwrap();
+        }
+        let (_, rows) = count_batches_and_rows(stream).await;
+
+        TightenedOpen {
+            rows,
+            data_reads_at_open,
+            data_reads: data_reads.load(std::sync::atomic::Ordering::SeqCst),
+            files_ranges: pruning_metric(&metrics, "files_ranges_pruned_statistics"),
+            pruned_before_read: metrics
+                .clone_inner()
+                .sum_by_name("files_ranges_pruned_before_read")
+                .map(|m| m.as_usize()),
+        }
+    }
+
+    /// A file opened before the dynamic filter tightened, and excluded by the
+    /// tightened filter, must be skipped without any data read when the
+    /// pre-read re-check is enabled.
+    #[tokio::test]
+    async fn test_recheck_before_first_read_skips_data_reads() {
+        let result =
+            open_then_tighten_dynamic_filter(true, Some(col("a").lt(lit(0i32)))).await;
+        assert_eq!(result.rows, 0);
+        assert_eq!(result.data_reads_at_open, 0);
+        assert_eq!(result.data_reads, 0, "stopped file must not read data");
+        // Counted like an early-stopped file: matched at open, then pruned.
+        assert_eq!(result.files_ranges, Some((1, 0)));
+        assert_eq!(result.pruned_before_read, Some(1));
+    }
+
+    /// Without the pre-read re-check the same file is only stopped after its
+    /// first batch, which requires fetching its row group.
+    #[tokio::test]
+    async fn test_without_recheck_stopped_file_reads_data_first() {
+        let result =
+            open_then_tighten_dynamic_filter(false, Some(col("a").lt(lit(0i32)))).await;
+        assert_eq!(result.rows, 0, "early stop drops the first batch");
+        assert_eq!(result.data_reads_at_open, 0);
+        assert!(
+            result.data_reads > 0,
+            "the early stop fires only after the row group was fetched"
+        );
+        assert_eq!(result.files_ranges, Some((1, 0)));
+        assert_eq!(result.pruned_before_read, None, "metric not registered");
+    }
+
+    /// The re-check must not skip a file that the current filter still admits,
+    /// whether or not the filter changed since the file was opened.
+    #[tokio::test]
+    async fn test_recheck_before_first_read_keeps_matching_files() {
+        for new_filter in [None, Some(col("a").lt(lit(50i32)))] {
+            let result = open_then_tighten_dynamic_filter(true, new_filter.clone()).await;
+            assert_eq!(result.rows, 100, "filter {new_filter:?}");
+            assert!(result.data_reads > 0, "filter {new_filter:?}");
+            assert_eq!(result.files_ranges, Some((0, 1)), "filter {new_filter:?}");
+            assert_eq!(result.pruned_before_read, Some(0), "filter {new_filter:?}");
+        }
     }
 
     /// Helpers for tests that exercise parquet virtual columns

@@ -28,7 +28,7 @@ use crate::file_stream::FileOpener;
 use crate::morsel::{FileOpenerMorselizer, Morselizer};
 #[expect(deprecated)]
 use crate::schema_adapter::SchemaAdapterFactory;
-use datafusion_common::config::ConfigOptions;
+use datafusion_common::config::{ConfigOptions, ExecutionOptions};
 use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_common::{Result, not_impl_err};
 use datafusion_physical_expr::projection::ProjectionExprs;
@@ -106,6 +106,27 @@ pub trait FileSource: Any + Send + Sync {
 
     /// Initialize new type with batch size configuration
     fn with_batch_size(&self, batch_size: usize) -> Arc<dyn FileSource>;
+
+    /// Returns a copy of this source that applies the execution-time settings
+    /// in `options`, or `None` when the source reads none of them (or already
+    /// has the same values), in which case it is used unchanged.
+    ///
+    /// [`FileScanConfig`] calls this each time it opens a scan partition,
+    /// passing the session's [`ExecutionOptions`] from the `TaskContext`.
+    /// Settings that only matter while a scan runs therefore reach the source
+    /// even when it was built without the session configuration, for example
+    /// by a custom `TableProvider` that constructs it with default options.
+    /// Implementations should only read settings that are not already part of
+    /// their own format options, so per-table configuration is not
+    /// overridden.
+    ///
+    /// The default implementation returns `None`.
+    fn with_execution_options(
+        &self,
+        _options: &ExecutionOptions,
+    ) -> Option<Arc<dyn FileSource>> {
+        None
+    }
 
     /// Returns the filter expression that will be applied *during* the file scan.
     ///

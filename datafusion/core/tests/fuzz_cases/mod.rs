@@ -26,6 +26,7 @@ mod sort_fuzz;
 #[expect(clippy::needless_pass_by_value)]
 mod sort_query_fuzz;
 mod topk_filter_pushdown;
+mod topk_recheck_before_read_fuzz;
 
 mod aggregation_fuzzer;
 #[expect(clippy::needless_pass_by_value)]
