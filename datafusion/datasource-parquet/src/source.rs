@@ -29,9 +29,9 @@ use crate::row_filter::can_expr_be_pushed_down_with_schemas;
 use arrow_schema::Fields;
 use arrow_schema::extension::ExtensionType;
 use arrow_schema::{DataType, Field};
-use datafusion_common::config::ConfigOptions;
 #[cfg(feature = "parquet_encryption")]
 use datafusion_common::config::EncryptionFactoryOptions;
+use datafusion_common::config::{ConfigOptions, ExecutionOptions};
 use datafusion_datasource::as_file_source;
 use datafusion_datasource::file_stream::FileOpener;
 use datafusion_datasource::morsel::Morselizer;
@@ -62,6 +62,7 @@ use datafusion_physical_plan::filter_pushdown::{
 };
 use datafusion_physical_plan::metrics::Count;
 use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
+use datafusion_physical_plan::metrics::{MetricBuilder, MetricType};
 use log::warn;
 
 #[cfg(feature = "parquet_encryption")]
@@ -314,6 +315,11 @@ pub struct ParquetSource {
     /// Sort order driving `PreparedAccessPlan::reorder_by_statistics`
     /// in the opener.
     sort_order_for_reorder: Option<LexOrdering>,
+    /// Re-check a still-changing dynamic filter against each file's
+    /// statistics right before the file's first data read. Set at open time
+    /// from `datafusion.execution.recheck_dynamic_filter_before_read` via
+    /// [`FileSource::with_execution_options`].
+    recheck_dynamic_filter_before_read: bool,
 }
 
 impl ParquetSource {
@@ -340,6 +346,7 @@ impl ParquetSource {
             encryption_factory: None,
             reverse_row_groups: false,
             sort_order_for_reorder: None,
+            recheck_dynamic_filter_before_read: false,
         }
     }
 
@@ -629,6 +636,19 @@ impl FileSource for ParquetSource {
             self.pushdown_filters(),
         )?;
 
+        // Registered only when the pre-read re-check is enabled and the
+        // predicate carries a dynamic filter, so EXPLAIN ANALYZE output of
+        // every other scan is unchanged. `Some` also switches the re-check on.
+        let files_ranges_pruned_before_read = (self.recheck_dynamic_filter_before_read
+            && self.predicate.as_ref().is_some_and(|predicate| {
+                DynamicFilterTracking::classify(predicate).contains_dynamic_filter()
+            }))
+        .then(|| {
+            MetricBuilder::new(self.metrics())
+                .with_type(MetricType::Summary)
+                .counter("files_ranges_pruned_before_read", partition)
+        });
+
         Ok(Box::new(ParquetMorselizer {
             partition_index: partition,
             projection: self.projection.clone(),
@@ -660,6 +680,7 @@ impl FileSource for ParquetSource {
             reverse_row_groups: self.reverse_row_groups,
             sort_order_for_reorder: self.sort_order_for_reorder.clone(),
             virtual_state,
+            files_ranges_pruned_before_read,
         }))
     }
 
@@ -687,6 +708,19 @@ impl FileSource for ParquetSource {
         let mut conf = self.clone();
         conf.batch_size = Some(batch_size);
         Arc::new(conf)
+    }
+
+    fn with_execution_options(
+        &self,
+        options: &ExecutionOptions,
+    ) -> Option<Arc<dyn FileSource>> {
+        let recheck = options.recheck_dynamic_filter_before_read;
+        if self.recheck_dynamic_filter_before_read == recheck {
+            return None;
+        }
+        let mut conf = self.clone();
+        conf.recheck_dynamic_filter_before_read = recheck;
+        Some(Arc::new(conf))
     }
 
     fn try_pushdown_projection(

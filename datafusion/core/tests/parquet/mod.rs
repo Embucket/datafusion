@@ -58,6 +58,7 @@ mod page_pruning;
 mod row_group_pruning;
 mod schema;
 mod schema_coercion;
+mod topk_recheck_before_read;
 mod utils;
 
 #[cfg(test)]

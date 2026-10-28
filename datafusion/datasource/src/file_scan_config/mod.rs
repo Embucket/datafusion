@@ -709,6 +709,11 @@ impl DataSource for FileScanConfig {
             .unwrap_or_else(|| context.session_config().batch_size());
 
         let source = self.file_source.with_batch_size(batch_size);
+        // Apply execution-time settings from the session. Reading them here,
+        // rather than when the source is built, also covers sources that a
+        // custom table provider constructed with default options.
+        let execution = &context.session_config().options().execution;
+        let source = source.with_execution_options(execution).unwrap_or(source);
 
         let morselizer = source.create_morselizer(object_store, self, partition)?;
 
@@ -720,11 +725,7 @@ impl DataSource for FileScanConfig {
             .and_then(|state| state.downcast_ref::<SharedWorkSource>())
             .cloned();
 
-        let open_ahead = context
-            .session_config()
-            .options()
-            .execution
-            .file_stream_open_ahead;
+        let open_ahead = execution.file_stream_open_ahead;
 
         let stream = FileStreamBuilder::new(self)
             .with_partition(partition)

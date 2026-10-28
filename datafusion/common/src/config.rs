@@ -1057,6 +1057,22 @@ config_namespace! {
         /// file only after the current one is fully consumed.
         pub file_stream_open_ahead: bool, default = false
 
+        /// When `true`, a Parquet scan whose predicate holds a dynamic filter
+        /// that can still change (for example the threshold pushed down by an
+        /// `ORDER BY ... LIMIT` TopK) re-checks the file's statistics against
+        /// the current filter right before reading the file's first data
+        /// pages. A file range that was opened early (by
+        /// `file_stream_open_ahead`, or while the filter was still empty) is
+        /// then skipped without fetching or decoding its row groups if the
+        /// filter has since been updated to exclude it. The check reuses the
+        /// scan's per-batch early-stop pruner, so the pruning predicate is
+        /// only rebuilt when the filter changed. Skipped ranges are counted by
+        /// the `files_ranges_pruned_before_read` metric, which is registered
+        /// only for scans with a dynamic filter while this option is enabled.
+        /// When `false` (the default) the filter is re-checked only after the
+        /// file's first batch has been read.
+        pub recheck_dynamic_filter_before_read: bool, default = false
+
         /// Aggregation ratio (number of distinct groups / number of input rows)
         /// threshold for skipping partial aggregation. If the value is greater
         /// then partial aggregation will skip aggregation for further input
