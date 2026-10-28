@@ -22,6 +22,7 @@ use std::sync::Arc;
 
 use super::metrics::ParquetFileMetrics;
 use crate::ParquetAccessPlan;
+use crate::metadata::max_statistic_may_omit_nan;
 
 use arrow::array::BooleanArray;
 use arrow::{
@@ -577,6 +578,9 @@ impl PruningStatistics for PagesPruningStatistics<'_> {
     }
 
     fn max_values(&self, _column: &datafusion_common::Column) -> Option<ArrayRef> {
+        if max_statistic_may_omit_nan(self.converter.arrow_field().data_type()) {
+            return None;
+        }
         match self.converter.data_page_maxes(
             self.column_index,
             self.offset_index,

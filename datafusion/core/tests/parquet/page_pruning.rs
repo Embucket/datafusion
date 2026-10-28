@@ -765,12 +765,13 @@ async fn prune_f64_lt() {
 #[tokio::test]
 async fn prune_f64_scalar_fun_and_gt() {
     // result of sql "SELECT * FROM t where abs(f - 1) <= 0.000001  and f >= 0.1"
-    // only use "f >= 0" to prune
+    // only "f >= 0.1" could prune, and only by the float maximum, which Parquet statistics
+    // compute without NaN (NaN sorts above every number), so no page is pruned
     test_prune(
         Scenario::Float64,
         "SELECT * FROM t where abs(f - 1) <= 0.000001  and f >= 0.1",
         Some(0),
-        Some(10),
+        Some(0),
         1,
         5,
     )

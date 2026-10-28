@@ -2489,8 +2489,9 @@ mod test {
         assert_eq!(num_batches, 1);
         assert_eq!(num_rows, 3);
 
-        // A filter on `b = 5.0` should exclude all rows
-        let expr = col("b").eq(lit(ScalarValue::Float32(Some(5.0))));
+        // A filter on `b = 0.5` should exclude all rows (by the minimum: a float maximum is not a
+        // bound, since Parquet statistics leave NaN out)
+        let expr = col("b").eq(lit(ScalarValue::Float32(Some(0.5))));
         let predicate = logical2physical(&expr, &schema);
         let opener = make_opener(predicate);
         let stream = open_file(&opener, file).await.unwrap();
@@ -2627,7 +2628,7 @@ mod test {
         assert_eq!(num_rows, 0);
 
         // Should prune based on file statistics but not partition value
-        let expr = col("part").eq(lit(1)).and(col("b").eq(lit(7.0)));
+        let expr = col("part").eq(lit(1)).and(col("b").eq(lit(0.5)));
         let predicate = logical2physical(&expr, &table_schema);
         let opener = make_opener(predicate);
         let stream = open_file(&opener, file.clone()).await.unwrap();
@@ -2636,7 +2637,7 @@ mod test {
         assert_eq!(num_rows, 0);
 
         // Should prune based on both partition value and file statistics
-        let expr = col("part").eq(lit(2)).and(col("b").eq(lit(7.0)));
+        let expr = col("part").eq(lit(2)).and(col("b").eq(lit(0.5)));
         let predicate = logical2physical(&expr, &table_schema);
         let opener = make_opener(predicate);
         let stream = open_file(&opener, file).await.unwrap();

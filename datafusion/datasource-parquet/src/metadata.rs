@@ -584,6 +584,27 @@ fn min_max_aggregate_data_type(input_type: &DataType) -> &DataType {
     }
 }
 
+/// Whether a column's Parquet maximum may sit below some of its values.
+///
+/// Parquet writers leave NaN out of floating-point statistics (the Parquet spec asks them to),
+/// while a NaN with its sign bit clear (the `'NaN'` literal) sorts above every other value. A
+/// float column's maximum therefore only bounds the non-NaN values: it must not prune `col > x`
+/// or stand for the column's `MAX`. The minimum stays a valid lower bound for such a NaN.
+pub(crate) fn max_statistic_may_omit_nan(data_type: &DataType) -> bool {
+    min_max_aggregate_data_type(data_type).is_floating()
+}
+
+/// Whether a float minimum is a zero, which Parquet writers record as `-0.0` whatever the sign
+/// of the stored zeros: it bounds the column but is not its exact minimum.
+fn min_statistic_is_signed_zero(min: &ScalarValue) -> bool {
+    match min {
+        ScalarValue::Float16(Some(value)) => value.to_f32() == 0.0,
+        ScalarValue::Float32(Some(value)) => *value == 0.0,
+        ScalarValue::Float64(Some(value)) => *value == 0.0,
+        _ => false,
+    }
+}
+
 fn create_max_min_accs(
     schema: &Schema,
 ) -> (Vec<Option<MaxAccumulator>>, Vec<Option<MinAccumulator>>) {
@@ -591,6 +612,9 @@ fn create_max_min_accs(
         .fields()
         .iter()
         .map(|field| {
+            if max_statistic_may_omit_nan(field.data_type()) {
+                return None;
+            }
             MaxAccumulator::try_new(min_max_aggregate_data_type(field.data_type())).ok()
         })
         .collect();
@@ -637,7 +661,13 @@ impl StatisticsAccumulators<'_> {
                     self.is_min_value_exact.get(i).unwrap(),
                 ) {
                     (Some(min_value), Some(true)) => {
-                        min_value.evaluate().ok().map(Precision::Exact)
+                        min_value.evaluate().ok().map(|min| {
+                            if min_statistic_is_signed_zero(&min) {
+                                Precision::Inexact(min)
+                            } else {
+                                Precision::Exact(min)
+                            }
+                        })
                     }
                     (Some(min_value), Some(false)) | (Some(min_value), None) => {
                         min_value.evaluate().ok().map(Precision::Inexact)
@@ -1135,6 +1165,43 @@ mod tests {
             ]
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn float_maximum_is_absent_from_file_statistics() -> Result<()> {
+        use arrow::array::{Float64Array, RecordBatch};
+        use parquet::arrow::ArrowWriter;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("f", DataType::Float64, true),
+            Field::new("i", DataType::Int32, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Float64Array::from(vec![1.0, f64::NAN])),
+                Arc::new(Int32Array::from(vec![1, 2])),
+            ],
+        )?;
+        let mut buffer = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut buffer, Arc::clone(&schema), None)?;
+        writer.write(&batch)?;
+        writer.close()?;
+        let metadata =
+            ParquetMetaDataReader::new().parse_and_finish(&bytes::Bytes::from(buffer))?;
+        let statistics =
+            DFParquetMetadata::statistics_from_parquet_metadata(&metadata, &schema)?;
+        // The writer left NaN out of the float statistics, so max 1.0 would hide the NaN row.
+        let float = &statistics.column_statistics[0];
+        assert_eq!(float.max_value, Precision::Absent);
+        assert_eq!(
+            float.min_value.get_value(),
+            Some(&ScalarValue::Float64(Some(1.0)))
+        );
+        assert_eq!(
+            statistics.column_statistics[1].max_value.get_value(),
+            Some(&ScalarValue::Int32(Some(2)))
+        );
         Ok(())
     }
 
