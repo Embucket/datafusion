@@ -836,15 +836,16 @@ async fn prune_f64_lt() {
 #[tokio::test]
 async fn prune_f64_scalar_fun_and_gt() {
     // result of sql "SELECT * FROM t where abs(f - 1) <= 0.000001  and f >= 0.1"
-    // only use "f >= 0" to prune
+    // only "f >= 0.1" could prune, and only by the float maximum, which Parquet statistics
+    // compute without NaN (NaN sorts above every number), so no row group is pruned
     RowGroupPruningTest::new()
         .with_scenario(Scenario::Float64)
         .with_query("SELECT * FROM t where abs(f - 1) <= 0.000001  and f >= 0.1")
         .with_expected_errors(Some(0))
-        .with_matched_by_stats(Some(2))
-        .with_pruned_by_stats(Some(2))
+        .with_matched_by_stats(Some(4))
+        .with_pruned_by_stats(Some(0))
         .with_pruned_files(Some(0))
-        .with_matched_by_bloom_filter(Some(2))
+        .with_matched_by_bloom_filter(Some(4))
         .with_pruned_by_bloom_filter(Some(0))
         .with_expected_rows(1)
         .test_row_group_prune()

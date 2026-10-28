@@ -20,6 +20,7 @@ use std::sync::Arc;
 
 use super::{ParquetAccessPlan, ParquetFileMetrics, RowGroupAccess};
 use crate::bloom_filter::BloomFilterStatistics;
+use crate::metadata::max_statistic_may_omit_nan;
 use arrow::array::{ArrayRef, BooleanArray, UInt64Array};
 use arrow::datatypes::Schema;
 use datafusion_common::pruning::PruningStatistics;
@@ -495,9 +496,11 @@ impl PruningStatistics for RowGroupPruningStatistics<'_> {
     }
 
     fn max_values(&self, column: &Column) -> Option<ArrayRef> {
-        self.statistics_converter(column)
-            .and_then(|c| Ok(c.row_group_maxes(self.metadata_iter())?))
-            .ok()
+        let converter = self.statistics_converter(column).ok()?;
+        if max_statistic_may_omit_nan(converter.arrow_field().data_type()) {
+            return None;
+        }
+        converter.row_group_maxes(self.metadata_iter()).ok()
     }
 
     fn num_containers(&self) -> usize {
@@ -658,6 +661,52 @@ mod tests {
             &metrics,
         );
         assert_pruned(row_groups, ExpectedPruning::Some(vec![1]))
+    }
+
+    #[test]
+    fn row_group_float_maximum_does_not_prune() {
+        use datafusion_expr::{col, lit};
+        // Parquet statistics leave NaN out, and NaN sorts above every number: a row group
+        // holding 1.0 and NaN has max 1.0 but a row matching `c1 > 15`. The minimum still prunes.
+        let schema =
+            Arc::new(Schema::new(vec![Field::new("c1", DataType::Float64, true)]));
+        let field = PrimitiveTypeField::new("c1", PhysicalType::DOUBLE);
+        let schema_descr = get_test_schema_descr(vec![field]);
+        let row_group = |min: f64, max: f64| {
+            get_row_group_meta_data(
+                &schema_descr,
+                vec![ParquetStatistics::double(
+                    Some(min),
+                    Some(max),
+                    None,
+                    Some(0),
+                    false,
+                )],
+            )
+        };
+        let row_groups_for = |expr: datafusion_expr::Expr| {
+            let expr = logical2physical(&expr, &schema);
+            let pruning_predicate =
+                build_test_pruning_predicate(expr, Arc::clone(&schema));
+            let mut row_groups =
+                RowGroupAccessPlanFilter::new(ParquetAccessPlan::new_all(2));
+            row_groups.prune_by_statistics(
+                &schema,
+                &schema_descr,
+                &[row_group(1.0, 10.0), row_group(11.0, 20.0)],
+                &pruning_predicate,
+                &parquet_file_metrics(),
+            );
+            row_groups
+        };
+        assert_pruned(
+            row_groups_for(col("c1").gt(lit(15.0))),
+            ExpectedPruning::None,
+        );
+        assert_pruned(
+            row_groups_for(col("c1").lt(lit(5.0))),
+            ExpectedPruning::Some(vec![0]),
+        );
     }
 
     #[test]

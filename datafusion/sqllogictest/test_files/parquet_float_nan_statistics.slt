@@ -1,0 +1,61 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+
+#   http://www.apache.org/licenses/LICENSE-2.0
+
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# NaN rows of a float column must survive Parquet statistics.
+#
+# Parquet writers leave NaN out of float min/max statistics, while NaN sorts above every
+# number. A file holding 1.0 and NaN therefore has min = max = 1.0; trusting that maximum
+# prunes the file for `column1 > 2`, answers MAX with 1.0, and reads the column as the
+# constant 1.0.
+
+query I
+COPY (VALUES (1.0), ('NaN'::double), (1.0))
+TO 'test_files/scratch/parquet_float_nan_statistics/t/0.parquet'
+STORED AS PARQUET;
+----
+3
+
+statement ok
+CREATE EXTERNAL TABLE t
+STORED AS PARQUET
+LOCATION 'test_files/scratch/parquet_float_nan_statistics/t';
+
+query I
+SELECT count(*) FROM t WHERE column1 > 2;
+----
+1
+
+query R
+SELECT max(column1) FROM t;
+----
+NaN
+
+query R
+SELECT column1 FROM t ORDER BY column1;
+----
+1
+1
+NaN
+
+# The minimum is still a bound: NaN is never below it.
+query I
+SELECT count(*) FROM t WHERE column1 < 1;
+----
+0
+
+statement ok
+DROP TABLE t;
