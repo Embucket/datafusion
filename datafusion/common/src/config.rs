@@ -1069,8 +1069,13 @@ config_namespace! {
         /// only rebuilt when the filter changed. Skipped ranges are counted by
         /// the `files_ranges_pruned_before_read` metric, which is registered
         /// only for scans with a dynamic filter while this option is enabled.
-        /// When `false` (the default) the filter is re-checked only after the
-        /// file's first batch has been read.
+        /// The check uses the file's `PartitionedFile` statistics, so it does
+        /// nothing for files without them, and it applies to every dynamic
+        /// filter that can still change (TopK thresholds and aggregate MIN/MAX
+        /// bounds; hash-join filters are complete before the probe side runs).
+        /// When `false` (the default) a single-row-group file is re-checked only
+        /// after its first batch; a file with several row groups is already
+        /// re-checked before each row group.
         pub recheck_dynamic_filter_before_read: bool, default = false
 
         /// Aggregation ratio (number of distinct groups / number of input rows)

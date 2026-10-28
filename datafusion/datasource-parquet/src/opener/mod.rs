@@ -1553,6 +1553,16 @@ impl RowGroupsPrunedParquetOpen {
             .file_metrics
             .row_groups_pruned_dynamic_filter
             .clone();
+        // The pre-read re-check only saves I/O for a range that has a row group
+        // left to fetch and no `RowGroupPruner` (which already checks before every
+        // row group): an empty byte-range sliver or a fully pruned range would
+        // otherwise be counted as pruned before read without saving anything.
+        let files_ranges_pruned_before_read =
+            if !rg_plan.is_empty() && row_group_pruner.is_none() {
+                prepared.files_ranges_pruned_before_read
+            } else {
+                None
+            };
 
         let stream = PushDecoderStreamState {
             decoder: Some(decoder),
@@ -1586,7 +1596,7 @@ impl RowGroupsPrunedParquetOpen {
                     file_pruner,
                     files_ranges_pruned_statistics,
                 )
-                .with_recheck_before_first_read(prepared.files_ranges_pruned_before_read)
+                .with_recheck_before_first_read(files_ranges_pruned_before_read)
                 .boxed())
             }
             _ => Ok(stream),
