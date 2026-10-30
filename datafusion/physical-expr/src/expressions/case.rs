@@ -18,11 +18,10 @@
 mod literal_lookup_table;
 
 use super::{Column, Literal};
-use crate::PhysicalExpr;
 use crate::expressions::{
     CastExpr, LambdaVariable, NegativeExpr, NotExpr, TryCastExpr, lit, try_cast,
 };
-use crate::{HigherOrderFunctionExpr, ScalarFunctionExpr};
+use crate::{PhysicalExpr, ScalarFunctionExpr};
 use arrow::array::*;
 use arrow::compute::kernels::zip::zip;
 use arrow::compute::{
@@ -1381,21 +1380,6 @@ fn case_result_field_metadata(
     case: &CaseExpr,
     input_schema: &Schema,
 ) -> Result<(DataType, Metadata)> {
-    const MAX_EXACT_BRANCH_DEPTH: usize = 8;
-
-    fn can_infer_exact_function_branch(expr: &dyn PhysicalExpr) -> bool {
-        let mut work = vec![(expr, 1)];
-        while let Some((node, depth)) = work.pop() {
-            if depth > MAX_EXACT_BRANCH_DEPTH {
-                return false;
-            }
-            for child in node.children() {
-                work.push((child.as_ref(), depth + 1));
-            }
-        }
-        true
-    }
-
     struct BranchField {
         data_type: DataType,
         metadata: Metadata,
@@ -1461,22 +1445,6 @@ fn case_result_field_metadata(
                     fields.push(BranchField {
                         data_type: DataType::Boolean,
                         metadata: Metadata::new(),
-                        certainly_null: false,
-                    });
-                } else if expr.is::<ScalarFunctionExpr>()
-                    || expr.is::<HigherOrderFunctionExpr>()
-                {
-                    let field = expr.return_field(input_schema)?;
-                    let metadata = if field.metadata().is_empty()
-                        || can_infer_exact_function_branch(expr)
-                    {
-                        field.metadata().clone()
-                    } else {
-                        Metadata::new()
-                    };
-                    fields.push(BranchField {
-                        data_type: field.data_type().clone(),
-                        metadata,
                         certainly_null: false,
                     });
                 } else {
@@ -2273,6 +2241,43 @@ mod tests {
     }
 
     #[test]
+    fn case_not_null_is_a_contributor() -> Result<()> {
+        let metadata = HashMap::from([("logical".to_owned(), "boolean".to_owned())]);
+        let schema = Schema::new(vec![
+            Field::new("value", DataType::Boolean, false).with_metadata(metadata.clone()),
+        ]);
+        let nulls: [Arc<dyn PhysicalExpr>; 3] = [
+            lit(ScalarValue::Null),
+            lit(ScalarValue::Boolean(None)),
+            Arc::new(Literal::new_with_metadata(
+                ScalarValue::Boolean(None),
+                Some(FieldMetadata::from(metadata.clone())),
+            )),
+        ];
+        for null in nulls {
+            let plain = case(
+                None,
+                vec![(lit(true), Arc::clone(&null))],
+                Some(col("value", &schema)?),
+            )?;
+            assert_eq!(plain.return_field(&schema)?.metadata(), &metadata);
+
+            let negated: Arc<dyn PhysicalExpr> = Arc::new(NotExpr::new(null));
+            for (then_expr, else_expr) in [
+                (Arc::clone(&negated), col("value", &schema)?),
+                (col("value", &schema)?, negated),
+            ] {
+                let expr = case(None, vec![(lit(true), then_expr)], Some(else_expr))?;
+                let field = expr.return_field(&schema)?;
+                assert_eq!(field.data_type(), &DataType::Boolean);
+                assert!(field.is_nullable());
+                assert!(field.metadata().is_empty());
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn case_explicitly_marked_null_cast_matches_logical_field() -> Result<()> {
         let metadata = HashMap::from([(
             EXTENSION_TYPE_NAME_KEY.to_string(),
@@ -2314,7 +2319,7 @@ mod tests {
     }
 
     #[test]
-    fn case_function_metadata_respects_logical_depth_limit() -> Result<()> {
+    fn case_function_metadata_preserves_cached_fields_at_any_depth() -> Result<()> {
         let metadata = HashMap::from([("logical".to_string(), "binary".to_string())]);
         let schema = Schema::new(vec![
             Field::new("a", DataType::Binary, false).with_metadata(metadata.clone()),
@@ -2332,7 +2337,7 @@ mod tests {
                 .with_metadata(metadata.clone()),
         );
         let options = Arc::new(datafusion_common::config::ConfigOptions::default());
-        for (depth, expected_marked) in [(2, true), (9, false)] {
+        for depth in [2, 9, 32, 128] {
             let mut branch = col("a", &schema)?;
             for _ in 0..depth {
                 branch = Arc::new(ScalarFunctionExpr::new(
@@ -2345,11 +2350,7 @@ mod tests {
             }
             let expr = case(None, vec![(lit(true), branch)], Some(col("b", &schema)?))?;
             let field = expr.return_field(&schema)?;
-            if expected_marked {
-                assert_eq!(field.metadata(), &metadata);
-            } else {
-                assert!(field.metadata().is_empty());
-            }
+            assert_eq!(field.metadata(), &metadata, "depth {depth}");
         }
         Ok(())
     }

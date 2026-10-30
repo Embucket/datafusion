@@ -1147,6 +1147,13 @@ impl ScalarUDFImpl for AliasedScalarUDFImpl {
         self.inner.name()
     }
 
+    fn create_case_literal_matcher(
+        &self,
+        when_values: &[ScalarValue],
+    ) -> Result<Option<Arc<dyn CaseLiteralMatcher>>> {
+        self.inner.create_case_literal_matcher(when_values)
+    }
+
     fn display_name(&self, args: &[Expr]) -> Result<String> {
         #[expect(deprecated)]
         self.inner.display_name(args)
@@ -1273,6 +1280,9 @@ impl ScalarUDFImpl for AliasedScalarUDFImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::Int32Array;
+    use datafusion_common::cast::as_int32_array;
+    use datafusion_common::plan_err;
     use datafusion_expr_common::signature::Volatility;
     use std::hash::DefaultHasher;
 
@@ -1298,6 +1308,113 @@ mod tests {
         fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> Result<ColumnarValue> {
             unimplemented!()
         }
+    }
+
+    #[derive(Debug)]
+    struct TestCaseLiteralMatcher;
+
+    impl CaseLiteralMatcher for TestCaseLiteralMatcher {
+        fn map_to_when_indices(
+            &self,
+            base: &ArrayRef,
+            else_index: u32,
+        ) -> Result<Vec<u32>> {
+            Ok(as_int32_array(base.as_ref())?
+                .iter()
+                .map(|value| if value == Some(7) { 0 } else { else_index })
+                .collect())
+        }
+    }
+
+    #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
+    enum MatcherMode {
+        Indexed,
+        Fallback,
+        Reject,
+    }
+
+    #[derive(Debug, PartialEq, Eq, Hash)]
+    struct TestCaseMatcherUdf {
+        signature: Signature,
+        mode: MatcherMode,
+    }
+
+    impl ScalarUDFImpl for TestCaseMatcherUdf {
+        fn name(&self) -> &str {
+            "test_case_matcher"
+        }
+
+        fn signature(&self) -> &Signature {
+            &self.signature
+        }
+
+        fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
+            Ok(DataType::Boolean)
+        }
+
+        fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+            unreachable!("this test only exercises matcher construction")
+        }
+
+        fn create_case_literal_matcher(
+            &self,
+            when_values: &[ScalarValue],
+        ) -> Result<Option<Arc<dyn CaseLiteralMatcher>>> {
+            assert_eq!(
+                when_values,
+                &[
+                    ScalarValue::Int32(Some(7)),
+                    ScalarValue::Int32(None),
+                    ScalarValue::Int32(Some(7))
+                ]
+            );
+            match self.mode {
+                MatcherMode::Indexed => Ok(Some(Arc::new(TestCaseLiteralMatcher))),
+                MatcherMode::Fallback => Ok(None),
+                MatcherMode::Reject => plan_err!("test matcher rejected literals"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_case_literal_matcher_through_aliases() -> Result<()> {
+        let when_values = [
+            ScalarValue::Int32(Some(7)),
+            ScalarValue::Int32(None),
+            ScalarValue::Int32(Some(7)),
+        ];
+        let base: ArrayRef = Arc::new(Int32Array::from(vec![Some(7), Some(8), None]));
+        for mode in [
+            MatcherMode::Indexed,
+            MatcherMode::Fallback,
+            MatcherMode::Reject,
+        ] {
+            let udf = ScalarUDF::from(TestCaseMatcherUdf {
+                signature: Signature::any(2, Volatility::Immutable),
+                mode,
+            });
+            let alias = udf.clone().with_aliases(["alternate"]);
+            let nested_alias = alias.clone().with_aliases(["another"]);
+            for udf in [udf, alias, nested_alias] {
+                let matcher = udf.inner().create_case_literal_matcher(&when_values);
+                match mode {
+                    MatcherMode::Indexed => assert_eq!(
+                        matcher?
+                            .expect("aliases must preserve the matcher")
+                            .map_to_when_indices(&base, 3)?,
+                        vec![0, 3, 3]
+                    ),
+                    MatcherMode::Fallback => assert!(matcher?.is_none()),
+                    MatcherMode::Reject => assert!(
+                        matcher
+                            .expect_err("aliases must preserve errors")
+                            .to_string()
+                            .contains("test matcher rejected literals")
+                    ),
+                }
+            }
+        }
+        Ok(())
     }
 
     // PartialEq and Hash must be consistent, and also PartialEq and PartialOrd
