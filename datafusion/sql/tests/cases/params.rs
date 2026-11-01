@@ -825,6 +825,40 @@ fn test_insert_infer_with_metadata() {
         ScalarAndMetadata::from(ScalarValue::from("Turing")),
     ];
 
+    let assert_uuid_metadata = |test: &ParameterTestWithMetadata<'_>| {
+        let initial = logical_plan(test.sql).unwrap();
+        let bound = initial
+            .clone()
+            .with_param_values(ParamValues::List(test.param_values.clone()))
+            .unwrap();
+        for plan in [&initial, &bound] {
+            let plan = match plan {
+                LogicalPlan::Statement(Statement::Prepare(prepare)) => {
+                    prepare.input.as_ref()
+                }
+                plan => plan,
+            };
+            let LogicalPlan::Dml(dml) = plan else {
+                panic!("expected an INSERT plan");
+            };
+            let LogicalPlan::Projection(projection) = dml.input.as_ref() else {
+                panic!("expected an INSERT projection");
+            };
+            let LogicalPlan::Values(values) = projection.input.as_ref() else {
+                panic!("expected INSERT VALUES");
+            };
+            for (schema, name) in
+                [(&projection.schema, "id"), (&values.schema, "column1")]
+            {
+                let field = schema.field(0);
+                assert_eq!(field.name(), name);
+                assert_eq!(field.data_type(), uuid_field.data_type());
+                assert_eq!(field.is_nullable(), uuid_field.is_nullable());
+                assert_eq!(field.metadata(), uuid_field.metadata());
+            }
+        }
+    };
+
     // Check a normal insert
     let test = ParameterTestWithMetadata {
         sql: "insert into person_with_uuid_extension (id, first_name, last_name) values ($1, $2, $3)",
@@ -832,16 +866,18 @@ fn test_insert_infer_with_metadata() {
         param_values: param_values.clone(),
     };
 
+    assert_uuid_metadata(&test);
+
     assert_snapshot!(
         test.run(),
         @r#"
     ** Initial Plan:
     Dml: op=[Insert Into] table=[person_with_uuid_extension]
-      Projection: CAST(column1 AS FixedSizeBinary(16)<{"ARROW:extension:name": "arrow.uuid"}>) AS id, column2 AS first_name, column3 AS last_name
+      Projection: column1 AS id, column2 AS first_name, column3 AS last_name
         Values: ($1, $2, $3)
     ** Final Plan:
     Dml: op=[Insert Into] table=[person_with_uuid_extension]
-      Projection: CAST(column1 AS FixedSizeBinary(16)<{"ARROW:extension:name": "arrow.uuid"}>) AS id, column2 AS first_name, column3 AS last_name
+      Projection: column1 AS id, column2 AS first_name, column3 AS last_name
         Values: (FixedSizeBinary(16, "1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16") FieldMetadata { inner: {"ARROW:extension:name": "arrow.uuid"} } AS $1, Utf8("Alan") AS $2, Utf8("Turing") AS $3)
     "#
     );
@@ -853,17 +889,19 @@ fn test_insert_infer_with_metadata() {
         param_values,
     };
 
+    assert_uuid_metadata(&test);
+
     assert_snapshot!(
         test.run(),
         @r#"
     ** Initial Plan:
     Prepare: "my_plan" [FixedSizeBinary(16)<{"ARROW:extension:name": "arrow.uuid"}>, Utf8, Utf8]
       Dml: op=[Insert Into] table=[person_with_uuid_extension]
-        Projection: CAST(column1 AS FixedSizeBinary(16)<{"ARROW:extension:name": "arrow.uuid"}>) AS id, column2 AS first_name, column3 AS last_name
+        Projection: column1 AS id, column2 AS first_name, column3 AS last_name
           Values: ($1, $2, $3)
     ** Final Plan:
     Dml: op=[Insert Into] table=[person_with_uuid_extension]
-      Projection: CAST(column1 AS FixedSizeBinary(16)<{"ARROW:extension:name": "arrow.uuid"}>) AS id, column2 AS first_name, column3 AS last_name
+      Projection: column1 AS id, column2 AS first_name, column3 AS last_name
         Values: (FixedSizeBinary(16, "1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16") FieldMetadata { inner: {"ARROW:extension:name": "arrow.uuid"} } AS $1, Utf8("Alan") AS $2, Utf8("Turing") AS $3)
     "#
     );

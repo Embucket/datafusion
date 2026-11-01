@@ -275,8 +275,9 @@ impl LogicalPlanBuilder {
         let n_cols = values[0].len();
         let mut fields = ValuesFields::new();
         for j in 0..n_cols {
-            let field_type = schema.field(j).data_type();
-            let field_nullable = schema.field(j).is_nullable();
+            let field = schema.field(j);
+            let field_type = field.data_type();
+            let field_nullable = field.is_nullable();
             for row in values.iter() {
                 let value = &row[j];
                 let data_type = value.get_type(schema)?;
@@ -291,7 +292,15 @@ impl LogicalPlanBuilder {
                     );
                 }
             }
-            fields.push(field_type.to_owned(), field_nullable);
+            if field.metadata().is_empty() {
+                fields.push(field_type.to_owned(), field_nullable);
+            } else {
+                fields.push_with_metadata(
+                    field_type.to_owned(),
+                    field_nullable,
+                    Some(FieldMetadata::new_from_field(field)),
+                );
+            }
         }
 
         Self::infer_inner(values, fields, schema)
@@ -3314,6 +3323,82 @@ mod tests {
                 Some("a:1:1".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn test_values_with_schema_preserves_field_metadata() -> Result<()> {
+        use arrow::array::{Int16Array, StructArray, TimestampMicrosecondArray};
+        use arrow::datatypes::TimeUnit;
+        use arrow_schema::extension::TimestampWithOffset;
+
+        let storage = DataType::Struct(Fields::from(vec![
+            Field::new(
+                "timestamp",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                false,
+            ),
+            Field::new("offset_minutes", DataType::Int16, false),
+        ]));
+        let DataType::Struct(children) = &storage else {
+            unreachable!();
+        };
+        let value = ScalarValue::Struct(Arc::new(StructArray::new(
+            children.clone(),
+            vec![
+                Arc::new(
+                    TimestampMicrosecondArray::from(vec![1577934245123456])
+                        .with_timezone("UTC"),
+                ),
+                Arc::new(Int16Array::from(vec![-480])),
+            ],
+            None,
+        )));
+        let plain = Field::new("declared_timestamp", storage, true);
+        let mut tagged = plain.clone();
+        tagged.try_with_extension_type(TimestampWithOffset)?;
+        let numeric = Field::new("declared_number", DataType::Int64, false)
+            .with_metadata(HashMap::from([("custom".into(), "target".into())]));
+        for timestamp in [tagged, plain] {
+            let schema = Arc::new(DFSchema::from_unqualified_fields(
+                vec![timestamp.clone(), numeric.clone()].into(),
+                HashMap::new(),
+            )?);
+            let plan = LogicalPlanBuilder::values_with_schema(
+                vec![
+                    vec![lit(ScalarValue::Null), lit(42_i32)],
+                    vec![lit(value.clone()), lit(7_i32)],
+                ],
+                &schema,
+            )?
+            .build()?;
+            for (index, target) in [timestamp, numeric.clone()].iter().enumerate() {
+                let actual = plan.schema().field(index);
+                assert_eq!(actual.name(), &format!("column{}", index + 1));
+                assert_eq!(actual.data_type(), target.data_type());
+                assert_eq!(actual.is_nullable(), target.is_nullable());
+                assert_eq!(actual.metadata(), target.metadata());
+            }
+            assert_eq!(
+                plan.schema()
+                    .field(0)
+                    .try_extension_type::<TimestampWithOffset>()
+                    .is_ok(),
+                schema.field(0).extension_type_name().is_some()
+            );
+            let LogicalPlan::Values(values) = plan else {
+                unreachable!();
+            };
+            assert_eq!(values.values.len(), 2);
+            assert_eq!(
+                values.values[1][0].get_type(&DFSchema::empty())?,
+                *schema.field(0).data_type()
+            );
+            assert_eq!(
+                values.values[1][1].get_type(&DFSchema::empty())?,
+                DataType::Int64
+            );
+        }
+        Ok(())
     }
 
     #[test]
