@@ -2037,10 +2037,27 @@ impl LogicalPlan {
         self,
         param_values: &ParamValues,
     ) -> Result<LogicalPlan> {
-        self.transform_up_with_subqueries(|plan| {
+        self.replace_params_with_values_impl(param_values)
+            .map(|res| res.data)
+    }
+
+    #[cfg_attr(feature = "recursive_protection", recursive::recursive)]
+    fn replace_params_with_values_impl(
+        self,
+        param_values: &ParamValues,
+    ) -> Result<Transformed<LogicalPlan>> {
+        let plan = self
+            .map_subqueries(|plan| plan.replace_params_with_values_impl(param_values))?
+            .transform_sibling(|plan| {
+                plan.map_children(|input| {
+                    input.replace_params_with_values_impl(param_values)
+                })
+            })?;
+        let inputs_changed = plan.transformed;
+        plan.transform_parent(|plan| {
             let schema = Arc::clone(plan.schema());
             let name_preserver = NamePreserver::new(&plan);
-            plan.map_expressions(|e| {
+            let expressions = plan.map_expressions(|e| {
                 let (e, has_placeholder) = e.infer_placeholder_types(&schema)?;
                 if !has_placeholder {
                     // Performance optimization:
@@ -2094,9 +2111,16 @@ impl LogicalPlan {
                     // Preserve name to avoid breaking column references to this expression
                     Ok(transformed_expr.update_data(|expr| original_name.restore(expr)))
                 }
-            })?
-            .map_data(|plan| {
-                let plan = plan.update_schema_data_type()?;
+            })?;
+            let values_changed = inputs_changed || expressions.transformed;
+            expressions.map_data(|plan| {
+                // A no-op bind must retain supplied VALUES metadata, rather than
+                // re-inferring it from type-only storage casts in the rows.
+                let plan = if !values_changed && matches!(&plan, LogicalPlan::Values(_)) {
+                    plan
+                } else {
+                    plan.update_schema_data_type()?
+                };
                 if let LogicalPlan::Dml(dml) = &plan {
                     validate_bound_object_insert_source(dml)?;
                 } else if let LogicalPlan::Union(union) = &plan {
@@ -2105,7 +2129,6 @@ impl LogicalPlan {
                 Ok(plan)
             })
         })
-        .map(|res| res.data)
     }
 
     /// Recompute schema fields' data type after replacing params, ensuring fields data type can be
@@ -6427,6 +6450,236 @@ mod tests {
             .unwrap()
             .build()
             .unwrap()
+    }
+
+    fn timestamp_values_with_child_metadata(tagged: bool) -> Result<LogicalPlan> {
+        use crate::expr::Cast;
+        use arrow::array::{Int16Array, StructArray, TimestampMicrosecondArray};
+        use arrow::datatypes::{Fields, TimeUnit};
+        use arrow_schema::extension::{EXTENSION_TYPE_NAME_KEY, TimestampWithOffset};
+
+        let children = Fields::from(vec![
+            Field::new(
+                "timestamp",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                false,
+            ),
+            Field::new("offset_minutes", DataType::Int16, false),
+        ]);
+        let mut source =
+            Field::new("source_timestamp", DataType::Struct(children.clone()), true);
+        source.try_with_extension_type(TimestampWithOffset)?;
+        let mut metadata = source.metadata().clone();
+        metadata.insert("embucket.datetime_precision".into(), "6".into());
+        source.set_metadata(metadata.clone());
+        let target_children = children
+            .iter()
+            .enumerate()
+            .map(|(index, child)| {
+                let mut metadata =
+                    HashMap::from([("PARQUET:field_id".into(), (index + 2).to_string())]);
+                if index == 0 {
+                    metadata.insert("embucket.datetime_precision".into(), "6".into());
+                }
+                child.as_ref().clone().with_metadata(metadata)
+            })
+            .collect::<Vec<_>>();
+        metadata.insert("embucket.datetime_precision".into(), "9".into());
+        metadata.insert("PARQUET:field_id".into(), "1".into());
+        if !tagged {
+            metadata.remove(EXTENSION_TYPE_NAME_KEY);
+        }
+        let target = Field::new(
+            "declared_timestamp",
+            DataType::Struct(target_children.into()),
+            true,
+        )
+        .with_metadata(metadata);
+        let schema = Arc::new(DFSchema::from_unqualified_fields(
+            vec![target].into(),
+            HashMap::new(),
+        )?);
+        let value = ScalarValue::Struct(Arc::new(StructArray::new(
+            children,
+            vec![
+                Arc::new(
+                    TimestampMicrosecondArray::from(vec![1_577_963_045_123_456])
+                        .with_timezone("UTC"),
+                ),
+                Arc::new(Int16Array::from(vec![-480])),
+            ],
+            None,
+        )));
+        let source = Arc::new(source);
+        LogicalPlanBuilder::values_with_schema(
+            [value, ScalarValue::Null]
+                .into_iter()
+                .map(|value| {
+                    vec![Expr::Cast(Cast::new_from_field(
+                        Box::new(lit(value)),
+                        Arc::clone(&source),
+                    ))]
+                })
+                .collect(),
+            &schema,
+        )?
+        .build()
+    }
+
+    #[test]
+    fn test_replace_params_preserves_unchanged_values_schema() -> Result<()> {
+        use arrow_schema::extension::{EXTENSION_TYPE_NAME_KEY, TimestampWithOffset};
+
+        for tagged in [true, false] {
+            let plan = timestamp_values_with_child_metadata(tagged)?;
+            let schema = Arc::clone(plan.schema());
+            let LogicalPlan::Values(values) = &plan else {
+                unreachable!();
+            };
+            // The storage casts have already stripped the row expression's extension.
+            for row in &values.values {
+                let metadata = row[0].metadata(&DFSchema::empty())?;
+                assert!(!metadata.inner().contains_key(EXTENSION_TYPE_NAME_KEY));
+                assert_eq!(metadata.inner()["embucket.datetime_precision"], "6");
+            }
+            for prepared in [false, true] {
+                for params in [
+                    ParamValues::List(vec![]),
+                    ParamValues::Map(HashMap::new()),
+                    ParamValues::from(HashMap::from([(
+                        "timezone",
+                        ScalarValue::from("America/Los_Angeles"),
+                    )])),
+                ] {
+                    let input = if prepared {
+                        LogicalPlanBuilder::from(plan.clone())
+                            .prepare("unchanged_values".into(), vec![])?
+                            .build()?
+                    } else {
+                        plan.clone()
+                    };
+                    let bound = input.with_param_values(params)?;
+                    assert_eq!(bound, plan);
+                    assert!(Arc::ptr_eq(bound.schema(), &schema));
+                    let field = bound.schema().field(0);
+                    assert_eq!(field.name(), "column1");
+                    assert!(field.is_nullable());
+                    assert_eq!(field.metadata()["embucket.datetime_precision"], "9");
+                    assert_eq!(
+                        field.try_extension_type::<TimestampWithOffset>().is_ok(),
+                        tagged
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_replace_params_preserves_unchanged_values_below_projection() -> Result<()> {
+        let input = timestamp_values_with_child_metadata(true)?;
+        let schema = Arc::clone(input.schema());
+        let plan = LogicalPlanBuilder::from(input)
+            .project(vec![col("column1"), placeholder("$1").alias("bound")])?
+            .build()?
+            .with_param_values(vec![ScalarValue::Int32(Some(42))])?;
+        let LogicalPlan::Projection(projection) = plan else {
+            unreachable!();
+        };
+        assert!(Arc::ptr_eq(projection.input.schema(), &schema));
+        assert_eq!(projection.schema.field(0), schema.field(0));
+        assert_eq!(projection.schema.field(1).data_type(), &DataType::Int32);
+        assert!(!projection.schema.field(1).is_nullable());
+        Ok(())
+    }
+
+    #[test]
+    fn test_replace_params_reinfers_changed_values_schema() -> Result<()> {
+        let declared = Arc::new(
+            Field::new("declared", DataType::Int32, true)
+                .with_metadata(HashMap::from([("origin".into(), "declared".into())])),
+        );
+        let schema = Arc::new(DFSchema::from_unqualified_fields(
+            vec![Arc::clone(&declared)].into(),
+            HashMap::new(),
+        )?);
+        let metadata = HashMap::from([("origin".into(), "bound".into())]);
+        let plan = LogicalPlanBuilder::values_with_schema(
+            vec![vec![Expr::Placeholder(Placeholder {
+                id: "$1".into(),
+                field: Some(declared),
+            })]],
+            &schema,
+        )?
+        .project(vec![col("column1").alias("answer")])?
+        .build()?
+        .with_param_values(ParamValues::List(vec![ScalarAndMetadata::new(
+            ScalarValue::Int64(Some(42)),
+            Some(metadata.clone().into()),
+        )]))?;
+        assert!(plan.get_parameter_names()?.is_empty());
+        let LogicalPlan::Projection(projection) = plan else {
+            unreachable!();
+        };
+        for (schema, name) in [
+            (&projection.schema, "answer"),
+            (projection.input.schema(), "column1"),
+        ] {
+            let field = schema.field(0);
+            assert_eq!(field.name(), name);
+            assert_eq!(field.data_type(), &DataType::Int64);
+            assert!(!field.is_nullable());
+            assert_eq!(field.metadata(), &metadata);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_replace_params_reinfers_values_after_subquery_binding() -> Result<()> {
+        for typed in [false, true] {
+            let field =
+                typed.then(|| {
+                    Arc::new(Field::new("declared", DataType::Int32, true).with_metadata(
+                        HashMap::from([("origin".into(), "declared".into())]),
+                    ))
+                });
+            let subquery = LogicalPlanBuilder::empty(true)
+                .project(vec![Expr::Placeholder(Placeholder {
+                    id: "$1".into(),
+                    field,
+                })])?
+                .build()?;
+            let metadata = HashMap::from([("origin".into(), "bound".into())]);
+            let value = if typed {
+                ScalarValue::Int32(Some(7))
+            } else {
+                ScalarValue::Int64(Some(7))
+            };
+            let data_type = value.data_type();
+            let plan = LogicalPlanBuilder::values(vec![vec![scalar_subquery(
+                Arc::new(subquery),
+            )]])?
+            .project(vec![col("column1").alias("answer")])?
+            .build()?
+            .with_param_values(ParamValues::List(vec![
+                ScalarAndMetadata::new(value, Some(metadata.clone().into())),
+            ]))?;
+            assert!(plan.get_parameter_names()?.is_empty());
+            let LogicalPlan::Projection(projection) = plan else {
+                unreachable!();
+            };
+            for (schema, name) in [
+                (&projection.schema, "answer"),
+                (projection.input.schema(), "column1"),
+            ] {
+                let field = schema.field(0);
+                assert_eq!(field.name(), name);
+                assert_eq!(field.data_type(), &data_type);
+                assert!(field.is_nullable());
+                assert_eq!(field.metadata(), &metadata);
+            }
+        }
+        Ok(())
     }
 
     #[test]
