@@ -1004,16 +1004,42 @@ pub fn remove_unnecessary_projections(
         // Swapping a projection with observable metadata can change query results
         // by changing the metadata visible to its child expressions.
         if projection.overrides_metadata() {
-            return Ok(Transformed::no(plan));
+            if let Some(inner) = projection.input().downcast_ref::<ProjectionExec>()
+                && is_column_only_projection(projection)
+                && is_column_only_projection(inner)
+            {
+                try_collapse_projection_chain(projection)?
+            } else {
+                return Ok(Transformed::no(plan));
+            }
+        } else {
+            // Otherwise, check if we can push it under its child(ren):
+            projection
+                .input()
+                .try_swapping_with_projection(projection)?
         }
-        // Otherwise, check if we can push it under its child(ren):
-        projection
-            .input()
-            .try_swapping_with_projection(projection)?
     } else {
         return Ok(Transformed::no(plan));
     };
+    let maybe_modified = maybe_modified.filter(|replacement| {
+        root_dictionary_properties_match(&plan.schema(), &replacement.schema())
+    });
     Ok(maybe_modified.map_or_else(|| Transformed::no(plan), Transformed::yes))
+}
+
+/// Column projections rebuild root fields but clone nested storage types.
+/// Arrow schema equality deliberately excludes these root IPC properties.
+#[expect(deprecated, reason = "Preserve observable IPC dictionary properties")]
+fn root_dictionary_properties_match(left: &Schema, right: &Schema) -> bool {
+    left.fields().len() == right.fields().len()
+        && left
+            .fields()
+            .iter()
+            .zip(right.fields())
+            .all(|(left, right)| {
+                left.dict_id() == right.dict_id()
+                    && left.dict_is_ordered() == right.dict_is_ordered()
+            })
 }
 
 /// Compare the inputs and outputs of the projection. All expressions must be
@@ -1029,7 +1055,11 @@ fn is_projection_removable(projection: &ProjectionExec) -> bool {
         };
         col.name() == proj_expr.alias && col.index() == idx
     }) && exprs.len() == projection.input().schema().fields().len()
-        && projection.schema() == projection.input().schema()
+        && {
+            let output = projection.schema();
+            let input = projection.input().schema();
+            output == input && root_dictionary_properties_match(&output, &input)
+        }
 }
 
 /// Given the expression set of a projection, checks if the projection causes
@@ -1338,7 +1368,8 @@ pub fn update_join_filter(
 /// The projection-removal optimizer checks `outer.overrides_metadata()` before
 /// reaching this helper. The unified projection also keeps `outer`'s schema, so
 /// collapsing cannot lose its output metadata. Inner projections still need the
-/// check below because outer expressions may observe their metadata.
+/// check below because outer expressions may observe their metadata. Column-only
+/// chains cannot inspect metadata and retain the outer schema when collapsed.
 fn try_collapse_projection_chain(
     outer: &ProjectionExec,
 ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
@@ -1348,7 +1379,12 @@ fn try_collapse_projection_chain(
     let mut collapsed_any = false;
 
     'outer: while let Some(inner_proj) = current_input.downcast_ref::<ProjectionExec>() {
-        if inner_proj.overrides_metadata() {
+        if inner_proj.overrides_metadata()
+            && !(current_exprs
+                .iter()
+                .all(|expr| expr.expr.downcast_ref::<Column>().is_some())
+                && is_column_only_projection(inner_proj))
+        {
             break;
         }
 
@@ -1409,6 +1445,13 @@ fn try_collapse_projection_chain(
             outer.schema().as_ref(),
         )?);
     remove_unnecessary_projections(unified).data().map(Some)
+}
+
+fn is_column_only_projection(projection: &ProjectionExec) -> bool {
+    projection
+        .expr()
+        .iter()
+        .all(|expr| expr.expr.downcast_ref::<Column>().is_some())
 }
 
 /// Collect all column indices from the given projection expressions.
@@ -1716,13 +1759,43 @@ mod tests {
                 expr: Arc::new(arrow_metadata),
                 alias: "metadata".to_string(),
             }],
-            inner,
+            Arc::clone(&inner),
         )?);
 
         let outer_projection = outer
             .downcast_ref::<ProjectionExec>()
             .expect("test plan should be a ProjectionExec");
         assert!(try_collapse_projection_chain(outer_projection)?.is_none());
+
+        // Collapsing a column wrapper first must not move the resulting
+        // metadata-observing expression through the next inner projection.
+        let renamed: Arc<dyn ExecutionPlan> = Arc::new(ProjectionExec::try_new(
+            [ProjectionExpr {
+                expr: Arc::new(Column::new("metadata", 0)),
+                alias: "renamed_metadata".to_string(),
+            }],
+            Arc::clone(&outer),
+        )?);
+        let rewritten = remove_unnecessary_projections(renamed)?;
+        assert!(rewritten.transformed);
+        let projection = rewritten
+            .data
+            .downcast_ref::<ProjectionExec>()
+            .expect("metadata-observing projection remains");
+        assert!(Arc::ptr_eq(projection.input(), &inner));
+        assert_eq!(projection.schema().field(0).name(), "renamed_metadata");
+        let batches = collect(
+            rewritten
+                .data
+                .execute(0, Arc::new(TaskContext::default()))?,
+        )
+        .await?;
+        let values = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("metadata expression should return Utf8");
+        assert_eq!(values.value(0), "true");
 
         let optimized = remove_unnecessary_projections(outer)?.data;
         let batches =
@@ -1889,6 +1962,131 @@ mod tests {
         };
         assert_eq!(collapsed.schema(), outer.schema());
         assert!(collapsed.schema().field(0).metadata().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_column_projection_chain_collapses_preserving_metadata_and_rows()
+    -> Result<()> {
+        for (field_metadata, schema_metadata) in [
+            (
+                HashMap::from([("event_field".to_string(), "outer".to_string())]),
+                HashMap::new(),
+            ),
+            (
+                HashMap::new(),
+                HashMap::from([("scope".to_string(), "outer".to_string())]),
+            ),
+        ] {
+            let input = test::scan_partitioned(1);
+            let inner = identity_projection_with_metadata(
+                Arc::clone(&input),
+                HashMap::from([("event_field".to_string(), "inner".to_string())]),
+                HashMap::from([("scope".to_string(), "inner".to_string())]),
+            )?;
+            let outer = identity_projection_with_metadata(
+                inner,
+                field_metadata.clone(),
+                schema_metadata.clone(),
+            )?;
+            let expected =
+                collect(outer.execute(0, Arc::new(TaskContext::default()))?).await?;
+
+            let optimized = remove_unnecessary_projections(Arc::clone(&outer))?;
+            assert!(optimized.transformed, "column-only chain should collapse");
+            let projection = optimized
+                .data
+                .downcast_ref::<ProjectionExec>()
+                .expect("outer metadata still requires a projection");
+            assert!(Arc::ptr_eq(projection.input(), &input));
+            assert_eq!(projection.schema(), outer.schema());
+            assert_eq!(projection.schema().field(0).metadata(), &field_metadata);
+            assert_eq!(projection.schema().metadata(), &schema_metadata);
+            let actual = collect(
+                optimized
+                    .data
+                    .execute(0, Arc::new(TaskContext::default()))?,
+            )
+            .await?;
+            assert_eq!(actual, expected);
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[expect(deprecated, reason = "Verify exact IPC dictionary properties")]
+    fn test_clearing_projection_metadata_keeps_dictionary_properties() -> Result<()> {
+        let source_field = Field::new_dict(
+            "i",
+            DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+            true,
+            7,
+            true,
+        );
+        let input: Arc<dyn ExecutionPlan> =
+            Arc::new(EmptyExec::new(Arc::new(Schema::new(vec![source_field]))));
+        let inner = identity_projection_with_metadata(
+            input,
+            HashMap::from([("scope".to_string(), "inner".to_string())]),
+            HashMap::new(),
+        )?;
+        let outer =
+            identity_projection_with_metadata(inner, HashMap::new(), HashMap::new())?;
+        let expected = outer.schema();
+        assert_eq!(expected.field(0).dict_id(), Some(0));
+        assert_eq!(expected.field(0).dict_is_ordered(), Some(false));
+        let optimized = remove_unnecessary_projections(outer)?;
+        let actual = optimized.data.schema();
+        assert_eq!(actual.field(0).dict_id(), expected.field(0).dict_id());
+        assert_eq!(
+            actual.field(0).dict_is_ordered(),
+            expected.field(0).dict_is_ordered()
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[expect(deprecated, reason = "Verify exact IPC dictionary properties")]
+    fn test_column_projection_chain_preserves_dictionary_properties() -> Result<()> {
+        let dictionary = Field::new_dict(
+            "member",
+            DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+            true,
+            7,
+            true,
+        );
+        let fields = [
+            dictionary.clone().with_name("i"),
+            Field::new("i", DataType::Struct(vec![dictionary.clone()].into()), true),
+            Field::new("i", DataType::List(Arc::new(dictionary)), true),
+        ];
+        for field in fields {
+            let input: Arc<dyn ExecutionPlan> =
+                Arc::new(EmptyExec::new(Arc::new(Schema::new(vec![field]))));
+            let inner = identity_projection_with_metadata(
+                Arc::clone(&input),
+                HashMap::from([("scope".to_string(), "inner".to_string())]),
+                HashMap::new(),
+            )?;
+            let outer = identity_projection_with_metadata(
+                inner,
+                HashMap::from([("scope".to_string(), "outer".to_string())]),
+                HashMap::new(),
+            )?;
+            let optimized = remove_unnecessary_projections(Arc::clone(&outer))?;
+            assert!(optimized.transformed);
+            let actual = optimized.data.schema();
+            let expected = outer.schema();
+            assert_eq!(actual, expected);
+            for (actual, expected) in actual
+                .flattened_fields()
+                .into_iter()
+                .zip(expected.flattened_fields())
+            {
+                assert_eq!(actual.dict_id(), expected.dict_id());
+                assert_eq!(actual.dict_is_ordered(), expected.dict_is_ordered());
+            }
+        }
         Ok(())
     }
 
