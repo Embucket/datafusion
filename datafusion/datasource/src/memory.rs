@@ -1024,6 +1024,74 @@ mod tests {
     use datafusion_physical_plan::ExecutionPlan;
 
     #[tokio::test]
+    #[expect(deprecated, reason = "Verify exact IPC dictionary properties")]
+    async fn projection_collapse_preserves_dictionary_stream_schema() -> Result<()> {
+        use arrow::array::StringDictionaryBuilder;
+        use arrow::datatypes::Int8Type;
+        use datafusion_physical_expr::expressions::Column;
+        use datafusion_physical_expr::projection::ProjectionExpr;
+        use datafusion_physical_plan::common::collect;
+        use datafusion_physical_plan::projection::{
+            ProjectionExec, remove_unnecessary_projections,
+        };
+        use std::collections::HashMap;
+
+        let field = Field::new_dict(
+            "i",
+            DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+            true,
+            7,
+            true,
+        );
+        let schema = Arc::new(Schema::new(vec![field.clone()]));
+        let mut values = StringDictionaryBuilder::<Int8Type>::new();
+        values.append("first")?;
+        values.append_null();
+        values.append("second")?;
+        let batch =
+            RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(values.finish())])?;
+        let input: Arc<dyn ExecutionPlan> =
+            MemorySourceConfig::try_new_exec(&[vec![batch]], schema, None)?;
+        let expression = || ProjectionExpr {
+            expr: Arc::new(Column::new("i", 0)),
+            alias: "i".to_string(),
+        };
+        let marked =
+            Schema::new(vec![field.clone().with_metadata(HashMap::from([(
+                "scope".to_string(),
+                "inner".to_string(),
+            )]))]);
+        let inner: Arc<dyn ExecutionPlan> = Arc::new(
+            ProjectionExec::try_new_with_schema_metadata([expression()], input, &marked)?,
+        );
+        let outer: Arc<dyn ExecutionPlan> =
+            Arc::new(ProjectionExec::try_new_with_schema_metadata(
+                [expression()],
+                inner,
+                &Schema::new(vec![field]),
+            )?);
+        let expected_schema = outer.schema();
+        assert_eq!(expected_schema.field(0).dict_id(), Some(0));
+        assert_eq!(expected_schema.field(0).dict_is_ordered(), Some(false));
+        let expected =
+            collect(outer.execute(0, Arc::new(TaskContext::default()))?).await?;
+
+        let optimized = remove_unnecessary_projections(outer)?.data;
+        let stream = optimized.execute(0, Arc::new(TaskContext::default()))?;
+        for schema in [optimized.schema(), stream.schema()] {
+            assert_eq!(schema.field(0).dict_id(), Some(0));
+            assert_eq!(schema.field(0).dict_is_ordered(), Some(false));
+        }
+        let actual = collect(stream).await?;
+        assert_eq!(actual, expected);
+        for batch in actual {
+            assert_eq!(batch.schema().field(0).dict_id(), Some(0));
+            assert_eq!(batch.schema().field(0).dict_is_ordered(), Some(false));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn exec_with_limit() -> Result<()> {
         let task_ctx = Arc::new(TaskContext::default());
         let batch = make_partition(7);
