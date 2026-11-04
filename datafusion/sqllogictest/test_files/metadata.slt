@@ -450,6 +450,29 @@ from (
 ----
 the id field
 
+# An always-false CASE keeps the extension metadata on its folded typed NULL.
+query T
+select arrow_metadata(
+    case when 1 = 0 then with_metadata(name, 'ARROW:extension:name', 'a.type') end,
+    'ARROW:extension:name')
+from table_with_metadata;
+----
+a.type
+a.type
+a.type
+
+# A preceding untyped NULL must not determine the folded CASE's type or metadata.
+query T
+select arrow_metadata(
+    case when false then NULL
+         when false then with_metadata(name, 'ARROW:extension:name', 'a.type') end,
+    'ARROW:extension:name')
+from table_with_metadata;
+----
+a.type
+a.type
+a.type
+
 # with_metadata: new keys overwrite existing on collision
 query T
 select arrow_metadata(with_metadata(id, 'metadata_key', 'overridden'), 'metadata_key') from table_with_metadata limit 1;

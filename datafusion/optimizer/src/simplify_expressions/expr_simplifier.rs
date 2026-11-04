@@ -1506,7 +1506,20 @@ impl TreeNodeRewriter for Simplifier<'_> {
                 .iter()
                 .any(|(when, _)| is_true(when.as_ref()) || is_false(when.as_ref())) =>
             {
-                let out_type = info.get_data_type(&when_then_expr[0].1)?;
+                if else_expr.is_none()
+                    && when_then_expr
+                        .iter()
+                        .all(|(when, _)| is_false(when.as_ref()))
+                {
+                    let (data_type, metadata) = Case::new(None, when_then_expr, None)
+                        .result_type_and_metadata(info.schema().as_ref())?;
+                    let metadata =
+                        (!metadata.is_empty()).then(|| FieldMetadata::from(metadata));
+                    let null =
+                        Expr::Literal(ScalarValue::try_new_null(&data_type)?, metadata);
+                    return Ok(Transformed::yes(null));
+                }
+
                 let mut new_when_then_expr = Vec::with_capacity(when_then_expr.len());
 
                 for (when, then) in when_then_expr.into_iter() {
@@ -1522,16 +1535,11 @@ impl TreeNodeRewriter for Simplifier<'_> {
                 }
 
                 // Exclude CASE statement altogether if there are no when-then expressions left
-                if new_when_then_expr.is_empty() {
-                    // CASE WHEN false THEN A ELSE B END --> B
-                    if let Some(else_expr) = else_expr {
-                        return Ok(Transformed::yes(*else_expr));
-                    // CASE WHEN false THEN A END --> NULL
-                    } else {
-                        let null =
-                            Expr::Literal(ScalarValue::try_new_null(&out_type)?, None);
-                        return Ok(Transformed::yes(null));
-                    }
+                // CASE WHEN false THEN A ELSE B END --> B
+                if new_when_then_expr.is_empty()
+                    && let Some(else_expr) = else_expr
+                {
+                    return Ok(Transformed::yes(*else_expr));
                 }
 
                 Transformed::yes(Expr::Case(Case {
@@ -4257,6 +4265,116 @@ mod tests {
             Some(Box::new(lit(2))),
         ));
         assert_eq!(simplify(expr.clone()), expr);
+    }
+
+    #[test]
+    fn simplify_expr_case_when_false_preserves_result_field() -> Result<()> {
+        for metadata in [
+            HashMap::new(),
+            HashMap::from([
+                ("ARROW:extension:name".to_owned(), "a.type".to_owned()),
+                ("ARROW:extension:metadata".to_owned(), "{}".to_owned()),
+                ("unit".to_owned(), "ms".to_owned()),
+            ]),
+        ] {
+            for data_type in [
+                DataType::Utf8,
+                DataType::Int64,
+                DataType::Decimal128(22, 3),
+                DataType::Timestamp(
+                    arrow::datatypes::TimeUnit::Nanosecond,
+                    Some("UTC".into()),
+                ),
+                DataType::Struct(
+                    vec![Arc::new(Field::new("nested", DataType::Int32, true))].into(),
+                ),
+            ] {
+                let schema = Arc::new(DFSchema::from_unqualified_fields(
+                    vec![
+                        Field::new("ext", data_type.clone(), false)
+                            .with_metadata(metadata.clone()),
+                    ]
+                    .into(),
+                    HashMap::new(),
+                )?);
+                let simplifier = ExprSimplifier::new(
+                    SimplifyContext::builder().with_schema(schema).build(),
+                );
+                let expr = Expr::Case(Case::new(
+                    None,
+                    vec![(Box::new(lit(false)), Box::new(col("ext")))],
+                    None,
+                ));
+                let expected = Expr::Literal(
+                    ScalarValue::try_new_null(&data_type)?,
+                    (!metadata.is_empty()).then(|| FieldMetadata::from(metadata.clone())),
+                );
+                assert_eq!(simplifier.simplify(expr)?, expected);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn simplify_expr_case_when_false_uses_whole_case_type() -> Result<()> {
+        let metadata =
+            HashMap::from([("ARROW:extension:name".to_owned(), "a.type".to_owned())]);
+        let schema = Arc::new(DFSchema::from_unqualified_fields(
+            vec![Field::new("ext", DataType::Utf8, true).with_metadata(metadata.clone())]
+                .into(),
+            HashMap::new(),
+        )?);
+        let simplifier =
+            ExprSimplifier::new(SimplifyContext::builder().with_schema(schema).build());
+        let expr = Expr::Case(Case::new(
+            None,
+            vec![
+                (Box::new(lit(false)), Box::new(lit(ScalarValue::Null))),
+                (Box::new(lit(false)), Box::new(col("ext"))),
+            ],
+            None,
+        ));
+        assert_eq!(
+            simplifier.simplify(expr)?,
+            Expr::Literal(ScalarValue::Utf8(None), Some(FieldMetadata::from(metadata))),
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn simplify_expr_case_when_false_keeps_metadata_conflicts_unmarked() -> Result<()> {
+        let marked = |name: &str, extension: &str| {
+            Field::new(name, DataType::Utf8, true).with_metadata(HashMap::from([(
+                "ARROW:extension:name".to_owned(),
+                extension.to_owned(),
+            )]))
+        };
+        let schema = Arc::new(DFSchema::from_unqualified_fields(
+            vec![
+                marked("a", "a.type"),
+                marked("b", "b.type"),
+                Field::new("plain", DataType::Utf8, true),
+            ]
+            .into(),
+            HashMap::new(),
+        )?);
+        let simplifier =
+            ExprSimplifier::new(SimplifyContext::builder().with_schema(schema).build());
+        for (left, right) in [("a", "b"), ("b", "a"), ("a", "plain"), ("plain", "a")] {
+            let expr = Expr::Case(Case::new(
+                None,
+                vec![
+                    (Box::new(lit(false)), Box::new(col(left))),
+                    (Box::new(lit(false)), Box::new(col(right))),
+                ],
+                None,
+            ));
+            assert_eq!(
+                simplifier.simplify(expr)?,
+                Expr::Literal(ScalarValue::Utf8(None), None),
+            );
+        }
+        Ok(())
     }
 
     #[test]
