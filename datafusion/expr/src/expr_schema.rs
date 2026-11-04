@@ -42,7 +42,7 @@ use datafusion_common::{
 };
 use datafusion_expr_common::type_coercion::binary::BinaryTypeCoercer;
 use datafusion_functions_window_common::field::WindowUDFFieldArgs;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 /// Trait to allow expr to typable with respect to a schema
 pub trait ExprSchemable {
@@ -133,6 +133,51 @@ fn case_result_type(case: &Case, schema: &dyn ExprSchema) -> Result<(DataType, b
         .as_ref()
         .map_or(Ok(DataType::Null), |expr| expr.get_type(schema))?;
     Ok((data_type, false))
+}
+
+impl Case {
+    /// Resolve the result storage type and field metadata using the same policy
+    /// as [`ExprSchemable::to_field`], without rendering a field name or inferring
+    /// the CASE's nullability. This does not validate the WHEN predicates.
+    pub fn result_type_and_metadata(
+        &self,
+        schema: &dyn ExprSchema,
+    ) -> Result<(DataType, HashMap<String, String>)> {
+        let (data_type, first_result_is_typed) = case_result_type(self, schema)?;
+        let metadata =
+            case_result_metadata(self, schema, &data_type, first_result_is_typed)?;
+        Ok((data_type, metadata))
+    }
+}
+
+fn case_result_metadata(
+    case: &Case,
+    schema: &dyn ExprSchema,
+    data_type: &DataType,
+    first_result_is_typed: bool,
+) -> Result<HashMap<String, String>> {
+    if let Some((_, first_result)) = case.when_then_expr.first() {
+        let empty_metadata = match first_result.as_ref() {
+            // Strict merging discards all metadata for a typed, unmarked result.
+            Expr::BinaryExpr(_) | Expr::Not(_) => first_result_is_typed,
+            Expr::Column(_) | Expr::Literal(_, _) => {
+                let field = first_result.to_field(schema)?.1;
+                !field.data_type().is_null()
+                    && !matches!(first_result.as_ref(), Expr::Literal(value, _) if value.is_null())
+                    && field.metadata().is_empty()
+            }
+            _ => false,
+        };
+        if empty_metadata {
+            return Ok(HashMap::new());
+        }
+    }
+    let branch_field = case_field_metadata(case, schema)?;
+    Ok(if branch_field.data_type() == data_type {
+        branch_field.metadata().clone()
+    } else {
+        HashMap::new()
+    })
 }
 
 fn binary_output_field(
@@ -837,32 +882,12 @@ impl ExprSchemable for Expr {
             Expr::Case(case) => {
                 let (data_type, first_result_is_typed) = case_result_type(case, schema)?;
                 let nullable = self.nullable(schema)?;
-                if let Some((_, first_result)) = case.when_then_expr.first() {
-                    let empty_metadata = match first_result.as_ref() {
-                        // Strict merging discards all metadata for a typed,
-                        // unmarked result; do not re-infer nested binary CASE fields.
-                        Expr::BinaryExpr(_) | Expr::Not(_) => first_result_is_typed,
-                        Expr::Column(_) | Expr::Literal(_, _) => {
-                            let field = first_result.to_field(schema)?.1;
-                            !field.data_type().is_null()
-                                && !matches!(first_result.as_ref(), Expr::Literal(value, _) if value.is_null())
-                                && field.metadata().is_empty()
-                        }
-                        _ => false,
-                    };
-                    if empty_metadata {
-                        return Ok((
-                            relation,
-                            Arc::new(Field::new(&schema_name, data_type, nullable)),
-                        ));
-                    }
-                }
-                let branch_field = case_field_metadata(case, schema)?;
-                let metadata = if branch_field.data_type() == &data_type {
-                    branch_field.metadata().clone()
-                } else {
-                    Default::default()
-                };
+                let metadata = case_result_metadata(
+                    case,
+                    schema,
+                    &data_type,
+                    first_result_is_typed,
+                )?;
                 Ok(Arc::new(
                     Field::new(&schema_name, data_type, nullable).with_metadata(metadata),
                 ))
@@ -1536,6 +1561,133 @@ mod tests {
             Column::from_name("foo"),
         );
         assert_eq!(meta, outer_ref.metadata(&schema).unwrap());
+    }
+
+    #[test]
+    fn test_case_result_type_and_metadata() -> Result<()> {
+        let shared =
+            HashMap::from([("ARROW:extension:name".to_owned(), "a.type".to_owned())]);
+        let schema = DFSchema::from_unqualified_fields(
+            vec![
+                Field::new("a", DataType::Utf8, false).with_metadata(shared.clone()),
+                Field::new("b", DataType::Utf8, true).with_metadata(shared.clone()),
+                Field::new("plain", DataType::Utf8, true),
+                Field::new("flag", DataType::Boolean, true),
+            ]
+            .into(),
+            HashMap::new(),
+        )?;
+        for (branches, otherwise, metadata, nullable) in [
+            (vec![(lit(false), col("a"))], None, shared.clone(), true),
+            (
+                vec![(lit(false), lit(ScalarValue::Null)), (lit(false), col("a"))],
+                None,
+                shared.clone(),
+                true,
+            ),
+            (
+                vec![(col("flag"), col("b"))],
+                Some(col("a")),
+                shared.clone(),
+                true,
+            ),
+            (
+                vec![(col("flag"), col("a"))],
+                Some(col("a")),
+                shared.clone(),
+                false,
+            ),
+            (
+                vec![(col("flag"), col("a"))],
+                Some(col("plain")),
+                HashMap::new(),
+                true,
+            ),
+        ] {
+            let case = Case::new(
+                None,
+                branches
+                    .into_iter()
+                    .map(|(w, t)| (Box::new(w), Box::new(t)))
+                    .collect(),
+                otherwise.map(Box::new),
+            );
+            assert_eq!(
+                case.result_type_and_metadata(&schema)?,
+                (DataType::Utf8, metadata.clone()),
+            );
+            let field = Expr::Case(case).to_field(&schema)?.1;
+            assert_eq!(field.data_type(), &DataType::Utf8);
+            assert_eq!(field.metadata(), &metadata);
+            assert_eq!(field.is_nullable(), nullable);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_case_result_inference_avoids_outer_nullability() -> Result<()> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+
+        #[derive(Debug, PartialEq, Eq, Hash)]
+        struct CountedIdentity {
+            signature: crate::Signature,
+        }
+
+        impl crate::ScalarUDFImpl for CountedIdentity {
+            fn name(&self) -> &str {
+                "counted_identity"
+            }
+
+            fn signature(&self) -> &crate::Signature {
+                &self.signature
+            }
+
+            fn return_type(&self, _types: &[DataType]) -> Result<DataType> {
+                Ok(DataType::Utf8)
+            }
+
+            fn return_field_from_args(&self, args: ReturnFieldArgs) -> Result<FieldRef> {
+                CALLS.fetch_add(1, Ordering::Relaxed);
+                Ok(Arc::clone(&args.arg_fields[0]))
+            }
+
+            fn invoke_with_args(
+                &self,
+                _args: crate::ScalarFunctionArgs,
+            ) -> Result<crate::ColumnarValue> {
+                internal_err!("Inference-only test function")
+            }
+        }
+
+        let metadata = HashMap::from([("marker".to_owned(), "kept".to_owned())]);
+        let schema = DFSchema::from_unqualified_fields(
+            vec![Field::new("a", DataType::Utf8, true).with_metadata(metadata.clone())]
+                .into(),
+            HashMap::new(),
+        )?;
+        let output = crate::ScalarUDF::new_from_impl(CountedIdentity {
+            signature: crate::Signature::exact(
+                vec![DataType::Utf8],
+                crate::Volatility::Immutable,
+            ),
+        })
+        .call(vec![col("a")]);
+        let case = Case::new(None, vec![(Box::new(lit(false)), Box::new(output))], None);
+        CALLS.store(0, Ordering::Relaxed);
+        assert_eq!(
+            case.result_type_and_metadata(&schema)?,
+            (DataType::Utf8, metadata.clone())
+        );
+        let component_calls = CALLS.swap(0, Ordering::Relaxed);
+        let field = Expr::Case(case).to_field(&schema)?.1;
+        assert_eq!(field.data_type(), &DataType::Utf8);
+        assert_eq!(field.metadata(), &metadata);
+        assert!(field.is_nullable());
+        assert!(component_calls > 0);
+        assert_eq!(CALLS.load(Ordering::Relaxed), component_calls + 1);
+        Ok(())
     }
 
     #[test]
