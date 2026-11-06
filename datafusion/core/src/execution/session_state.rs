@@ -857,6 +857,18 @@ impl SessionState {
         &self.runtime_env
     }
 
+    /// Replace the runtime environment while preserving all other session state.
+    ///
+    /// Function registrations, aliases, configuration and planners retain their
+    /// existing values and instances. Previously created clones are unchanged.
+    /// This does not rebuild existing plans or catalog/table providers, which may
+    /// retain resources from the previous runtime. The caller must provide the
+    /// object stores and other runtime resources required by the preserved state.
+    pub fn with_runtime_env(mut self, runtime_env: Arc<RuntimeEnv>) -> Self {
+        self.runtime_env = runtime_env;
+        self
+    }
+
     /// Return the execution properties
     pub fn execution_props(&self) -> &ExecutionProps {
         &self.execution_props
@@ -2830,3 +2842,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "session_state_runtime_env_tests.rs"]
+mod runtime_env_tests;
