@@ -25,6 +25,12 @@ project that requires a SQL query planner and does not make any assumptions abou
 will be translated to a physical plan. For example, there is no concept of row-based versus columnar execution in the
 logical plan.
 
+The optional `TypePlanner::plan_values_column_metadata` hook can resolve an
+inferred VALUES column's conflicting metadata. Its default implementation declines
+resolution, retaining the strict error. The SQL planner delegates to the logical
+builder's cold resolver once per conflicting column. It does not embed a
+product-specific width policy or change VALUES with a target schema.
+
 Note that the [`datafusion`] crate re-exports this module. If you are already
 using the [`datafusion`] crate in your project, there is no reason to use this
 crate directly in your project as well.

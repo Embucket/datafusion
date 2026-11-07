@@ -23,6 +23,12 @@
 
 This crate is a submodule of DataFusion that provides data types and utilities for logical plans and expressions.
 
+The `values_with_metadata_resolver` builder provides an opt-in cold policy
+for conflicting VALUES metadata. Default inference remains strict; equal metadata
+never invokes the policy. A successful policy validates a borrowed full column
+once, while the builder retains type union, nullability and coercion. SQL's existing
+`TypePlanner` can supply the policy without changing target-schema VALUES or CASE.
+
 Most projects should use the [`datafusion`] crate directly, which re-exports
 this module. If you are already using the [`datafusion`] crate, there is no
 reason to use this crate directly in your project as well.

@@ -55,6 +55,12 @@ For modified code identify local benchmarks(if any) and run them against `main`.
 
 ## Agent Skills
 
+VALUES metadata resolution is opt-in through `TypePlanner` and
+`LogicalPlanBuilder::values_with_metadata_resolver`. Keep the ordinary builder
+strict and the equal-metadata path free of policy calls. A successful cold
+resolver validates a borrowed complete column once; it owns metadata policy,
+never VALUES type coercion/nullability, expression evaluation or CASE semantics.
+
 Repository-specific agent skills live under `.ai/skills/`. Each subdirectory is
 a single skill with a `SKILL.md` (YAML frontmatter + body). Check that
 directory for applicable skills before working on a task; new skills go in

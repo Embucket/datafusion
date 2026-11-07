@@ -7091,6 +7091,82 @@ fn test_no_substring_registered_alt_syntax() {
 }
 
 #[test]
+fn test_values_metadata_uses_opt_in_type_planner() -> Result<()> {
+    use datafusion_common::metadata::FieldMetadata;
+    use datafusion_expr::planner::TypePlanner;
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Debug)]
+    struct WidthPlanner {
+        calls: AtomicUsize,
+        accept: bool,
+    }
+
+    impl TypePlanner for WidthPlanner {
+        fn plan_type_field(
+            &self,
+            sql_type: &sqlparser::ast::DataType,
+        ) -> Result<Option<FieldRef>> {
+            if matches!(sql_type, sqlparser::ast::DataType::Varchar(Some(_))) {
+                return Ok(Some(Arc::new(
+                    Field::new("", DataType::Utf8, true).with_metadata(HashMap::from([
+                        ("example.width".to_owned(), "10".to_owned()),
+                    ])),
+                )));
+            }
+            Ok(None)
+        }
+
+        fn plan_values_column_metadata(
+            &self,
+            rows: &[Vec<Expr>],
+            column: usize,
+        ) -> Result<Option<FieldMetadata>> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            assert_eq!(column, 0);
+            assert_eq!(rows.len(), 3);
+            assert_eq!(rows[1][0], datafusion_expr::lit("longer"));
+            Ok(self.accept.then(|| {
+                FieldMetadata::from(HashMap::from([(
+                    "example.width".to_owned(),
+                    "10".to_owned(),
+                )]))
+            }))
+        }
+    }
+
+    for accept in [false, true] {
+        let type_planner = Arc::new(WidthPlanner {
+            calls: AtomicUsize::new(0),
+            accept,
+        });
+        let context = MockContextProvider {
+            state: MockSessionState::default().with_type_planner(type_planner.clone()),
+        };
+        let planner = SqlToRel::new(&context);
+        let statement =
+            DFParser::parse_sql("VALUES ('a'), ('longer'), (CAST(NULL AS VARCHAR(10)))")?
+                .pop_front()
+                .unwrap();
+        let result = planner.statement_to_plan(statement);
+        assert_eq!(type_planner.calls.load(Ordering::Relaxed), 1);
+        if accept {
+            let plan = result?;
+            assert_eq!(plan.schema().field(0).data_type(), &DataType::Utf8);
+            assert!(plan.schema().field(0).is_nullable());
+            assert_eq!(
+                plan.schema().field(0).metadata().get("example.width"),
+                Some(&"10".to_owned())
+            );
+        } else {
+            assert_contains!(result.unwrap_err().to_string(), "Inconsistent metadata");
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn test_custom_type_plan() -> Result<()> {
     let sql = "SELECT DATETIME '2001-01-01 18:00:00'";
 
