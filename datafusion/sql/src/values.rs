@@ -422,7 +422,17 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             .collect::<Vec<_>>();
         if array_columns.is_empty() {
             let plan = if schema.fields().is_empty() {
-                LogicalPlanBuilder::values(values)?.build()
+                if let Some(type_planner) = self.context_provider.get_type_planner() {
+                    LogicalPlanBuilder::values_with_metadata_resolver(
+                        values,
+                        &|rows, column| {
+                            type_planner.plan_values_column_metadata(rows, column)
+                        },
+                    )?
+                    .build()
+                } else {
+                    LogicalPlanBuilder::values(values)?.build()
+                }
             } else {
                 LogicalPlanBuilder::values_with_schema(values, &schema)?.build()
             };

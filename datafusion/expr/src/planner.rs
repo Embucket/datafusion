@@ -29,6 +29,8 @@ use crate::{
 };
 use arrow::datatypes::{DataType, Field, FieldRef, SchemaRef};
 use datafusion_common::datatype::DataTypeExt;
+#[cfg(feature = "sql")]
+use datafusion_common::metadata::FieldMetadata;
 use datafusion_common::{
     DFSchema, Result, TableReference, config::ConfigOptions,
     file_options::file_type::FileType, not_impl_err,
@@ -472,6 +474,22 @@ pub trait RelationPlannerContext {
 ///
 /// [Extending SQL in DataFusion: from ->> to TABLESAMPLE blog]: https://datafusion.apache.org/blog/2026/01/12/extending-sql
 pub trait TypePlanner: Debug + Send + Sync {
+    /// Resolve conflicting metadata for one inferred VALUES column.
+    ///
+    /// Called only on a metadata mismatch, at most once for each column. Input
+    /// rows are borrowed and already planned expressions; inspect the complete
+    /// selected column before returning a replacement. `None` preserves the
+    /// builder's strict error. `Some`, even empty metadata, accepts a complete
+    /// replacement; an error refuses planning. This does not alter expressions,
+    /// type union/coercion, nullability, CASE, or target-schema VALUES semantics.
+    fn plan_values_column_metadata(
+        &self,
+        _rows: &[Vec<Expr>],
+        _column: usize,
+    ) -> Result<Option<FieldMetadata>> {
+        Ok(None)
+    }
+
     /// Plan SQL [`sqlparser::ast::DataType`] to DataFusion [`DataType`]
     ///
     /// Returns None if not possible

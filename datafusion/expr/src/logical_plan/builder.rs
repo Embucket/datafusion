@@ -68,6 +68,16 @@ use indexmap::IndexSet;
 /// Default table name for unnamed table
 pub const UNNAMED_TABLE: &str = "?table?";
 
+/// Optional VALUES column-metadata policy. Called at most once per column, only
+/// after unequal metadata is found. The complete input rows are borrowed so a
+/// policy can validate every contributor without cloning expressions.
+///
+/// `None` declines resolution and retains the original strict metadata error.
+/// `Some`, including empty metadata, replaces that column's inferred metadata.
+/// Errors are propagated. Type coercion and nullability remain builder-owned.
+pub type ValuesMetadataResolver<'a> =
+    dyn Fn(&[Vec<Expr>], usize) -> Result<Option<FieldMetadata>> + 'a;
+
 /// Options for [`LogicalPlanBuilder`]
 #[derive(Default, Debug, Clone)]
 pub struct LogicalPlanBuilderOptions {
@@ -211,6 +221,25 @@ impl LogicalPlanBuilder {
     ///
     /// If the values include params/binders such as $1, $2, $3, etc, then the `param_data_types` should be provided.
     pub fn values(values: Vec<Vec<Expr>>) -> Result<Self> {
+        Self::values_impl(values, None)
+    }
+
+    /// Build VALUES using an opt-in policy for otherwise conflicting metadata.
+    ///
+    /// Equal-metadata columns retain the ordinary path and never call `resolver`.
+    /// A successful resolver must validate the complete requested column: it is
+    /// not called again for later rows. Other columns remain independent.
+    pub fn values_with_metadata_resolver(
+        values: Vec<Vec<Expr>>,
+        resolver: &ValuesMetadataResolver<'_>,
+    ) -> Result<Self> {
+        Self::values_impl(values, Some(resolver))
+    }
+
+    fn values_impl(
+        values: Vec<Vec<Expr>>,
+        resolver: Option<&ValuesMetadataResolver<'_>>,
+    ) -> Result<Self> {
         if values.is_empty() {
             return plan_err!("Values list cannot be empty");
         }
@@ -230,7 +259,7 @@ impl LogicalPlanBuilder {
         }
 
         // Infer from data itself
-        Self::infer_data(values)
+        Self::infer_data(values, resolver)
     }
 
     /// Create a values list based relation, and the schema is inferred from data itself or table schema if provided, consuming
@@ -306,7 +335,10 @@ impl LogicalPlanBuilder {
         Self::infer_inner(values, fields, schema)
     }
 
-    fn infer_data(values: Vec<Vec<Expr>>) -> Result<Self> {
+    fn infer_data(
+        values: Vec<Vec<Expr>>,
+        resolver: Option<&ValuesMetadataResolver<'_>>,
+    ) -> Result<Self> {
         let n_cols = values[0].len();
         let schema = DFSchema::empty();
         let mut fields = ValuesFields::new();
@@ -314,6 +346,7 @@ impl LogicalPlanBuilder {
         for j in 0..n_cols {
             let mut common_type: Option<DataType> = None;
             let mut common_metadata: Option<FieldMetadata> = None;
+            let mut metadata_resolved = false;
             let mut nullable = false;
             for (i, row) in values.iter().enumerate() {
                 let value = &row[j];
@@ -327,15 +360,22 @@ impl LogicalPlanBuilder {
 
                 let is_null_literal =
                     matches!(value, Expr::Literal(value, _) if value.is_null());
-                if !is_null_literal {
+                if !is_null_literal && !metadata_resolved {
                     let metadata = value.metadata(&schema)?;
                     if let Some(ref cm) = common_metadata {
                         if &metadata != cm {
-                            return plan_err!(
-                                "Inconsistent metadata across values list at row {i} column {j}. Was {:?} but found {:?}",
-                                cm,
-                                metadata
-                            );
+                            if let Some(resolver) = resolver
+                                && let Some(resolved) = resolver(&values, j)?
+                            {
+                                common_metadata = Some(resolved);
+                                metadata_resolved = true;
+                            } else {
+                                return plan_err!(
+                                    "Inconsistent metadata across values list at row {i} column {j}. Was {:?} but found {:?}",
+                                    cm,
+                                    metadata
+                                );
+                            }
                         }
                     } else {
                         common_metadata = Some(metadata.clone());
@@ -3287,6 +3327,129 @@ mod tests {
             }
         }
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_values_metadata_resolver_is_cold_and_borrows_full_column() -> Result<()> {
+        use std::cell::Cell;
+
+        let calls = Cell::new(0);
+        let metadata = FieldMetadata::from(HashMap::from([(
+            "example.width".to_owned(),
+            "10".to_owned(),
+        )]));
+        let values = vec![
+            vec![lit("a")],
+            vec![lit("longer")],
+            vec![Expr::Cast(expr::Cast::new_from_field(
+                Box::new(lit(ScalarValue::Null)),
+                Arc::new(
+                    Field::new("", DataType::Utf8, true)
+                        .with_metadata(metadata.to_hashmap()),
+                ),
+            ))],
+        ];
+        let first = &raw const values[0][0];
+        let resolver = |rows: &[Vec<Expr>], column| {
+            calls.set(calls.get() + 1);
+            assert_eq!(column, 0);
+            assert_eq!(rows.len(), 3);
+            assert_eq!(&raw const rows[0][0], first);
+            assert_eq!(rows[1][0], lit("longer"));
+            Ok(Some(metadata.clone()))
+        };
+        let plan = LogicalPlanBuilder::values_with_metadata_resolver(values, &resolver)?
+            .build()?;
+        assert_eq!(calls.get(), 1);
+        assert_eq!(plan.schema().field(0).data_type(), &DataType::Utf8);
+        assert!(plan.schema().field(0).is_nullable());
+        assert_eq!(plan.schema().field(0).metadata(), &metadata.to_hashmap());
+
+        calls.set(0);
+        LogicalPlanBuilder::values_with_metadata_resolver(
+            vec![vec![lit("a")], vec![lit("b")]],
+            &resolver,
+        )?;
+        assert_eq!(calls.get(), 0, "equal metadata must not call the policy");
+        Ok(())
+    }
+
+    #[test]
+    fn test_values_metadata_resolver_declines_or_errors_without_fallback() -> Result<()> {
+        let metadata = FieldMetadata::from(HashMap::from([(
+            "example.width".to_owned(),
+            "10".to_owned(),
+        )]));
+        let values = || {
+            vec![
+                vec![lit_with_metadata("a", Some(metadata.clone()))],
+                vec![lit("b")],
+            ]
+        };
+        let original = LogicalPlanBuilder::values(values()).unwrap_err();
+        let declined =
+            LogicalPlanBuilder::values_with_metadata_resolver(values(), &|_, _| Ok(None))
+                .unwrap_err();
+        assert_eq!(original.strip_backtrace(), declined.strip_backtrace());
+        let rejected =
+            LogicalPlanBuilder::values_with_metadata_resolver(values(), &|_, _| {
+                plan_err!("metadata policy refused")
+            })
+            .unwrap_err();
+        assert_eq!(
+            rejected.strip_backtrace(),
+            "Error during planning: metadata policy refused"
+        );
+
+        let empty =
+            LogicalPlanBuilder::values_with_metadata_resolver(values(), &|_, _| {
+                Ok(Some(FieldMetadata::default()))
+            })?
+            .build()?;
+        assert!(empty.schema().field(0).metadata().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn test_values_metadata_resolver_runs_once_per_conflicting_column() -> Result<()> {
+        use std::cell::Cell;
+
+        let calls = Cell::new(0);
+        let values = (0..8)
+            .map(|index| {
+                (0..2)
+                    .map(|column| {
+                        lit_with_metadata(
+                            index,
+                            Some(FieldMetadata::from(HashMap::from([(
+                                "example".to_owned(),
+                                format!("{column}:{index}"),
+                            )]))),
+                        )
+                    })
+                    .collect()
+            })
+            .collect();
+        let plan = LogicalPlanBuilder::values_with_metadata_resolver(
+            values,
+            &|rows, column| {
+                calls.set(calls.get() + 1);
+                assert_eq!(rows.len(), 8);
+                Ok(Some(FieldMetadata::from(HashMap::from([(
+                    "example".to_owned(),
+                    column.to_string(),
+                )]))))
+            },
+        )?
+        .build()?;
+        assert_eq!(calls.get(), 2);
+        for column in 0..2 {
+            assert_eq!(
+                plan.schema().field(column).metadata().get("example"),
+                Some(&column.to_string())
+            );
+        }
         Ok(())
     }
 
