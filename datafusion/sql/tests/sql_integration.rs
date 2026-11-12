@@ -712,6 +712,213 @@ fn plan_create_table_check_constraint() {
     );
 }
 
+fn logical_plan_with_ctas_metadata(sql: &str) -> Result<LogicalPlan> {
+    use datafusion_expr::planner::TypePlanner;
+    use sqlparser::ast::{CharacterLength, DataType as SQLDataType};
+    use std::collections::HashMap;
+
+    #[derive(Debug)]
+    struct DeclaredMetadataPlanner;
+
+    impl TypePlanner for DeclaredMetadataPlanner {
+        fn plan_type_field(&self, sql_type: &SQLDataType) -> Result<Option<FieldRef>> {
+            let SQLDataType::Varchar(Some(CharacterLength::IntegerLength {
+                length, ..
+            })) = sql_type
+            else {
+                return Ok(None);
+            };
+            let (key, value) = if *length == 10 {
+                ("example.source_only", "source")
+            } else {
+                ("example.target_only", "target")
+            };
+            Ok(Some(Arc::new(
+                Field::new("", DataType::Utf8, true).with_metadata(HashMap::from([
+                    ("example.width".to_owned(), length.to_string()),
+                    (key.to_owned(), value.to_owned()),
+                ])),
+            )))
+        }
+    }
+
+    logical_plan_from_state(
+        sql,
+        &GenericDialect {},
+        ParserOptions::default(),
+        MockSessionState::default().with_type_planner(Arc::new(DeclaredMetadataPlanner)),
+    )
+}
+
+#[rstest]
+#[case("SELECT 'longer' AS source_value", false)]
+#[case("SELECT CAST(NULL AS VARCHAR(10)) AS source_value", true)]
+#[case(
+    "SELECT p.first_name AS source_value FROM person AS p WHERE FALSE",
+    false
+)]
+fn plan_ctas_preserves_declared_field_metadata(
+    #[case] query: &str,
+    #[case] nullable: bool,
+) -> Result<()> {
+    let plan = logical_plan_with_ctas_metadata(&format!(
+        "CREATE TABLE output (\"Target Name\" VARCHAR(1) NOT NULL) AS {query}"
+    ))?;
+    let LogicalPlan::Ddl(DdlStatement::CreateMemoryTable(create)) = &plan else {
+        panic!("expected CREATE TABLE plan");
+    };
+    let LogicalPlan::Projection(projection) = create.input.as_ref() else {
+        panic!("expected CTAS projection");
+    };
+    let field = projection.schema.field(0);
+    assert_eq!(field.name(), "Target Name");
+    assert_eq!(field.data_type(), &DataType::Utf8);
+    assert_eq!(field.is_nullable(), nullable);
+    assert_eq!(field.metadata()["example.width"], "1");
+    assert_eq!(field.metadata()["example.target_only"], "target");
+    let Expr::Alias(alias) = &projection.expr[0] else {
+        panic!("expected target alias");
+    };
+    assert!(alias.metadata.is_some());
+    assert!(alias.relation.is_none());
+    let Expr::Cast(cast) = alias.expr.as_ref() else {
+        panic!("expected strict type-only cast");
+    };
+    assert!(cast.field.metadata().is_empty());
+    assert!(cast.field.name().is_empty());
+    assert!(cast.field.is_nullable());
+    Ok(())
+}
+
+#[test]
+fn plan_ctas_declared_metadata_overrides_source_keys() -> Result<()> {
+    use std::collections::HashMap;
+
+    let plan = logical_plan_with_ctas_metadata(
+        "CREATE TABLE output (target_value VARCHAR(1)) AS \
+         SELECT CAST(p.first_name AS VARCHAR(10)) AS source_value FROM person AS p",
+    )?;
+    let LogicalPlan::Ddl(DdlStatement::CreateMemoryTable(create)) = &plan else {
+        panic!("expected CREATE TABLE plan");
+    };
+    let LogicalPlan::Projection(projection) = create.input.as_ref() else {
+        panic!("expected CTAS projection");
+    };
+    let source = projection.input.schema().field(0);
+    assert_eq!(source.metadata()["example.width"], "10");
+    assert_eq!(source.metadata()["example.source_only"], "source");
+    // Alias merges declared keys over inherited keys, retaining unrelated source keys.
+    assert_eq!(
+        projection.schema.field(0).metadata(),
+        &HashMap::from([
+            ("example.width".to_owned(), "1".to_owned()),
+            ("example.source_only".to_owned(), "source".to_owned()),
+            ("example.target_only".to_owned(), "target".to_owned()),
+        ])
+    );
+    Ok(())
+}
+
+#[rstest]
+#[case("SELECT p.* FROM j1 AS p", false)]
+#[case(
+    "SELECT p.* FROM j1 AS p RIGHT JOIN j2 AS q ON p.j1_id = q.j2_id",
+    true
+)]
+fn plan_ctas_metadata_preserves_strict_casts_and_qualified_columns(
+    #[case] query: &str,
+    #[case] nullable: bool,
+) -> Result<()> {
+    let plan = logical_plan_with_ctas_metadata(&format!(
+        "CREATE TABLE output (target_number BIGINT NOT NULL, \"Target Name\" VARCHAR(1)) AS {query}"
+    ))?;
+    let LogicalPlan::Ddl(DdlStatement::CreateMemoryTable(create)) = &plan else {
+        panic!("expected CREATE TABLE plan");
+    };
+    let LogicalPlan::Projection(projection) = create.input.as_ref() else {
+        panic!("expected CTAS projection");
+    };
+    assert_eq!(
+        projection.expr,
+        vec![
+            datafusion_expr::cast(col("p.j1_id"), DataType::Int64).alias("target_number"),
+            datafusion_expr::cast(col("p.j1_string"), DataType::Utf8)
+                .alias_with_metadata(
+                    "Target Name",
+                    Some(datafusion_common::metadata::FieldMetadata::from(
+                        projection.schema.field(1).metadata(),
+                    )),
+                ),
+        ]
+    );
+    assert_eq!(projection.schema.field(0).data_type(), &DataType::Int64);
+    assert_eq!(projection.schema.field(0).is_nullable(), nullable);
+    assert_eq!(projection.schema.field(1).is_nullable(), nullable);
+    assert!(projection.schema.field(0).metadata().is_empty());
+    assert_eq!(projection.schema.field(1).metadata()["example.width"], "1");
+    assert!(
+        projection
+            .schema
+            .iter()
+            .all(|(qualifier, _)| qualifier.is_none())
+    );
+    Ok(())
+}
+
+#[test]
+fn plan_ctas_metadata_keeps_unannotated_and_inferred_paths() -> Result<()> {
+    let query = "SELECT CAST(p.first_name AS VARCHAR(10)) AS source_value, \
+                 p.age AS source_number FROM person AS p";
+    let source = logical_plan_with_ctas_metadata(query)?;
+    let inferred =
+        logical_plan_with_ctas_metadata(&format!("CREATE TABLE output AS {query}"))?;
+    let LogicalPlan::Ddl(DdlStatement::CreateMemoryTable(create)) = &inferred else {
+        panic!("expected inferred CREATE TABLE plan");
+    };
+    assert_eq!(create.input.as_ref(), &source);
+
+    let explicit = logical_plan_with_ctas_metadata(&format!(
+        "CREATE TABLE output (target_value VARCHAR, target_number BIGINT) AS {query}"
+    ))?;
+    let LogicalPlan::Ddl(DdlStatement::CreateMemoryTable(create)) = &explicit else {
+        panic!("expected explicit CREATE TABLE plan");
+    };
+    let LogicalPlan::Projection(projection) = create.input.as_ref() else {
+        panic!("expected CTAS projection");
+    };
+    assert_eq!(
+        projection.expr,
+        vec![
+            datafusion_expr::cast(col("source_value"), DataType::Utf8View)
+                .alias("target_value"),
+            datafusion_expr::cast(col("source_number"), DataType::Int64)
+                .alias("target_number"),
+        ]
+    );
+    assert_eq!(
+        projection.schema.field(0).metadata(),
+        source.schema().field(0).metadata()
+    );
+    assert!(!projection.schema.field(0).is_nullable());
+    assert!(!projection.schema.field(1).is_nullable());
+
+    let plain =
+        logical_plan_with_ctas_metadata("CREATE TABLE output (target_value VARCHAR(1))")?;
+    let LogicalPlan::Ddl(DdlStatement::CreateMemoryTable(create)) = &plain else {
+        panic!("expected plain CREATE TABLE plan");
+    };
+    assert!(matches!(
+        create.input.as_ref(),
+        LogicalPlan::EmptyRelation(_)
+    ));
+    assert_eq!(
+        create.input.schema().field(0).metadata()["example.width"],
+        "1"
+    );
+    assert!(create.input.schema().field(0).is_nullable());
+    Ok(())
+}
+
 #[test]
 fn plan_start_transaction() {
     let sql = "start transaction";

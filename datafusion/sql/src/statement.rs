@@ -33,6 +33,7 @@ use crate::utils::normalize_ident;
 use arrow::datatypes::{Field, FieldRef, Fields};
 use datafusion_common::error::_plan_err;
 use datafusion_common::format::ExplainStatementOptions;
+use datafusion_common::metadata::FieldMetadata;
 use datafusion_common::parsers::CompressionTypeVariant;
 use datafusion_common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion_common::{
@@ -605,11 +606,19 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                                 .iter()
                                 .zip(input_columns)
                                 .map(|(field, input_column)| {
-                                    cast(
+                                    let expr = cast(
                                         Expr::Column(input_column),
                                         field.data_type().clone(),
-                                    )
-                                    .alias(field.name())
+                                    );
+                                    if field.metadata().is_empty() {
+                                        expr.alias(field.name())
+                                    } else {
+                                        // Preserve declared keys without changing cast semantics.
+                                        expr.alias_with_metadata(
+                                            field.name(),
+                                            Some(FieldMetadata::from(field.metadata())),
+                                        )
+                                    }
                                 })
                                 .collect::<Vec<_>>();
 
