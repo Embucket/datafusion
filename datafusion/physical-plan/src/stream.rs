@@ -26,6 +26,7 @@ use std::task::Poll;
 use super::metrics::ExecutionPlanMetricsSet;
 use super::metrics::{BaselineMetrics, SplitMetrics};
 use super::{ExecutionPlan, RecordBatchStream, SendableRecordBatchStream};
+use crate::coop::CooperativeBudget;
 use crate::displayable;
 use crate::spill::get_record_batch_memory_size;
 
@@ -635,6 +636,7 @@ pub struct BatchSplitStream {
         metrics: SplitMetrics,
         current_batch: Option<RecordBatch>,
         offset: usize,
+        budget: CooperativeBudget,
     }
 }
 
@@ -653,6 +655,7 @@ impl BatchSplitStream {
             metrics,
             current_batch: None,
             offset: 0,
+            budget: CooperativeBudget::new(),
         }
     }
 
@@ -730,9 +733,11 @@ impl Stream for BatchSplitStream {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Self::Item>> {
-        // First, try to produce a slice from the current batch
-        if let Some(result) = self.next_sliced_batch() {
-            return Poll::Ready(Some(result));
+        if self.current_batch.is_some() {
+            // Cached slices bypass upstream yield points. Charge only these extra outputs;
+            // the first slice and unsplit batches already poll the upstream stream.
+            ready!(self.budget.poll(cx, |_| Poll::Ready(())));
+            return Poll::Ready(self.next_sliced_batch());
         }
 
         // No current batch or current batch exhausted, poll upstream
@@ -943,6 +948,317 @@ mod test {
 
         assert_eq!(total_rows, 2000, "All rows should be preserved");
         assert_eq!(batch_count, 4, "Should have 4 batches of 500 rows each");
+    }
+
+    async fn split_with_cached_yield(
+        batch: RecordBatch,
+        batch_size: usize,
+    ) -> Vec<RecordBatch> {
+        use crate::coop::cooperative;
+        use futures::task::{ArcWake, waker};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Default)]
+        struct WakeCounter(AtomicUsize);
+
+        impl ArcWake for WakeCounter {
+            fn wake_by_ref(counter: &Arc<Self>) {
+                counter.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let expected_rows = batch.num_rows();
+        let schema = batch.schema();
+        let input =
+            RecordBatchStreamAdapter::new(schema, futures::stream::iter([Ok(batch)]));
+        let metrics = ExecutionPlanMetricsSet::new();
+        let mut split = BatchSplitStream::new(
+            Box::pin(cooperative(input)),
+            batch_size,
+            SplitMetrics::new(&metrics, 0),
+        );
+        tokio::task::yield_now().await;
+        let counter = Arc::new(WakeCounter::default());
+        let mut batches = {
+            let waker = waker(Arc::clone(&counter));
+            let mut cx = Context::from_waker(&waker);
+            let mut batches = Vec::new();
+            loop {
+                match split.poll_next_unpin(&mut cx) {
+                    Poll::Ready(Some(Ok(batch))) => batches.push(batch),
+                    Poll::Pending => break,
+                    other => {
+                        panic!("cached slices must yield before exhaustion: {other:?}")
+                    }
+                }
+            }
+            // The first slice polls upstream; the cached-slice budget allows at most
+            // 128 more outputs, independently of the configured cooperation policy.
+            assert!(!batches.is_empty());
+            assert!(batches.len() <= 129);
+            assert_eq!(split.offset, batches.len() * batch_size);
+            assert_eq!(split.metrics.batches_split.value(), batches.len());
+            batches
+        };
+        // Tokio may defer the wake until the current task returns to the scheduler.
+        tokio::task::yield_now().await;
+        assert!(
+            counter.0.load(Ordering::Relaxed) > 0,
+            "yield must wake its task"
+        );
+        while let Some(batch) = split.next().await {
+            batches.push(batch.unwrap());
+        }
+        assert_eq!(
+            batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+            expected_rows
+        );
+        assert_eq!(split.metrics.batches_split.value(), batches.len());
+        assert!(split.current_batch.is_none());
+        assert_eq!(split.offset, 0);
+        batches
+    }
+
+    #[tokio::test]
+    async fn batch_split_stream_cached_slices_yield_without_losing_rows() {
+        use arrow::array::{ArrayRef, Int32Array};
+
+        let values = Int32Array::from((0..1001).collect::<Vec<_>>());
+        let column: ArrayRef = Arc::new(values.clone());
+        let batch = RecordBatch::try_from_iter([("a", column)]).unwrap();
+        let batches = split_with_cached_yield(batch, 2).await;
+        let mut offset = 0;
+        for batch in batches {
+            let column = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            assert_eq!(
+                column.values().as_ref(),
+                &values.values()[offset..offset + batch.num_rows()]
+            );
+            assert_eq!(
+                column.values().as_ptr(),
+                values.values().as_ptr().wrapping_add(offset)
+            );
+            offset += batch.num_rows();
+        }
+        assert_eq!(offset, 1001);
+    }
+
+    #[tokio::test]
+    async fn batch_split_stream_zero_column_cached_slices_yield() {
+        use arrow::array::RecordBatchOptions;
+
+        let batch = RecordBatch::try_new_with_options(
+            Arc::new(Schema::empty()),
+            vec![],
+            &RecordBatchOptions::new().with_row_count(Some(1000)),
+        )
+        .unwrap();
+        let batches = split_with_cached_yield(batch, 1).await;
+        assert_eq!(batches.len(), 1000);
+        assert!(batches.iter().all(|batch| batch.num_columns() == 0));
+    }
+
+    #[tokio::test]
+    async fn batch_split_stream_unsplit_preserves_upstream_budget() {
+        async fn before_yield(split: bool) -> usize {
+            datafusion_common_runtime::SpawnedTask::spawn(async move {
+                let schema = Arc::new(Schema::empty());
+                let batch = RecordBatch::new_empty(Arc::clone(&schema));
+                let input = crate::coop::cooperative(RecordBatchStreamAdapter::new(
+                    schema,
+                    futures::stream::iter((0..256).map(move |_| Ok(batch.clone()))),
+                ));
+                let mut input: SendableRecordBatchStream = Box::pin(input);
+                if split {
+                    let metrics = ExecutionPlanMetricsSet::new();
+                    input = Box::pin(BatchSplitStream::new(
+                        input,
+                        1,
+                        SplitMetrics::new(&metrics, 0),
+                    ));
+                }
+                futures::future::poll_fn(|cx| {
+                    let mut count = 0;
+                    loop {
+                        match input.poll_next_unpin(cx) {
+                            Poll::Ready(Some(Ok(_))) => count += 1,
+                            Poll::Pending => return Poll::Ready(count),
+                            other => panic!("upstream must yield: {other:?}"),
+                        }
+                    }
+                })
+                .await
+            })
+            .await
+            .unwrap()
+        }
+
+        let upstream = before_yield(false).await;
+        assert_eq!(upstream, 128);
+        assert_eq!(before_yield(true).await, upstream);
+    }
+
+    #[tokio::test]
+    async fn batch_split_stream_unsplit_keeps_array_identity() {
+        use arrow::array::{ArrayRef, Int32Array};
+
+        for batch_size in [3, 4] {
+            let column: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3]));
+            let batch = RecordBatch::try_from_iter([("a", Arc::clone(&column))]).unwrap();
+            let schema = batch.schema();
+            let input = RecordBatchStreamAdapter::new(
+                Arc::clone(&schema),
+                futures::stream::iter([Ok(batch)]),
+            );
+            let metrics = ExecutionPlanMetricsSet::new();
+            let mut split = BatchSplitStream::new(
+                Box::pin(input),
+                batch_size,
+                SplitMetrics::new(&metrics, 0),
+            );
+            let batch = split.next().await.unwrap().unwrap();
+            assert!(Arc::ptr_eq(batch.column(0), &column));
+            assert!(Arc::ptr_eq(&batch.schema(), &schema));
+            assert_eq!(split.metrics.batches_split.value(), 0);
+            assert!(split.next().await.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_split_stream_preserves_errors_and_empty_batches() {
+        use arrow::array::RecordBatchOptions;
+
+        let schema = Arc::new(Schema::empty());
+        let batch = |rows| {
+            RecordBatch::try_new_with_options(
+                Arc::clone(&schema),
+                vec![],
+                &RecordBatchOptions::new().with_row_count(Some(rows)),
+            )
+            .unwrap()
+        };
+        let input = RecordBatchStreamAdapter::new(
+            Arc::clone(&schema),
+            futures::stream::iter([
+                Ok(batch(5)),
+                Ok(batch(0)),
+                exec_err!("first input error"),
+                Ok(batch(1)),
+                exec_err!("second input error"),
+            ]),
+        );
+        let metrics = ExecutionPlanMetricsSet::new();
+        let mut split =
+            BatchSplitStream::new(Box::pin(input), 2, SplitMetrics::new(&metrics, 0));
+        let mut output = Vec::new();
+        while let Some(batch) = split.next().await {
+            output.push(
+                batch
+                    .map(|batch| batch.num_rows())
+                    .map_err(|error| error.strip_backtrace()),
+            );
+        }
+        assert_eq!(
+            output,
+            vec![
+                Ok(2),
+                Ok(2),
+                Ok(1),
+                Ok(0),
+                Err("Execution error: first input error".to_owned()),
+                Ok(1),
+                Err("Execution error: second input error".to_owned()),
+            ]
+        );
+        assert_eq!(split.metrics.batches_split.value(), 3);
+
+        let empty = RecordBatchStreamAdapter::new(schema, futures::stream::empty());
+        let mut split =
+            BatchSplitStream::new(Box::pin(empty), 2, SplitMetrics::new(&metrics, 1));
+        assert!(split.next().await.is_none());
+        assert_eq!(split.metrics.batches_split.value(), 0);
+    }
+
+    #[tokio::test]
+    async fn batch_split_stream_multiple_batches_pending_and_terminal_error() {
+        use arrow::array::{ArrayRef, Int32Array};
+        use std::collections::VecDeque;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let columns = [0..1001, 1001..2004].map(Int32Array::from_iter_values);
+        let batch = |column: &Int32Array| {
+            let column: ArrayRef = Arc::new(column.clone());
+            RecordBatch::try_from_iter([("a", column)]).unwrap()
+        };
+        let first = batch(&columns[0]);
+        let schema = first.schema();
+        let mut input = VecDeque::from([
+            Some(Ok(first)),
+            None,
+            Some(Ok(batch(&columns[1]))),
+            Some(exec_err!("terminal sentinel")),
+        ]);
+        let upstream_pending = Arc::new(AtomicUsize::new(0));
+        let pending = Arc::clone(&upstream_pending);
+        let input = futures::stream::poll_fn(move |cx| match input.pop_front() {
+            Some(Some(batch)) => Poll::Ready(Some(batch)),
+            Some(None) => {
+                pending.fetch_add(1, Ordering::Relaxed);
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+            None => Poll::Ready(None),
+        });
+        let input =
+            crate::coop::cooperative(RecordBatchStreamAdapter::new(schema, input));
+        let metrics = ExecutionPlanMetricsSet::new();
+        let mut split =
+            BatchSplitStream::new(Box::pin(input), 2, SplitMetrics::new(&metrics, 0));
+        let mut rows = Vec::new();
+        let mut batches = 0;
+        let mut errors = 0;
+        while let Some(result) = split.next().await {
+            match result {
+                Ok(batch) => {
+                    assert_eq!(errors, 0, "no rows may follow the sentinel");
+                    assert!(batch.num_rows() <= 2);
+                    let column = batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .unwrap();
+                    let (original, offset) = if rows.len() < 1001 {
+                        (&columns[0], rows.len())
+                    } else {
+                        (&columns[1], rows.len() - 1001)
+                    };
+                    assert_eq!(
+                        column.values().as_ptr(),
+                        original.values().as_ptr().wrapping_add(offset)
+                    );
+                    rows.extend_from_slice(column.values());
+                    batches += 1;
+                }
+                Err(error) => {
+                    assert_eq!(rows.len(), 2004, "sentinel must follow every row");
+                    assert_eq!(
+                        error.strip_backtrace(),
+                        "Execution error: terminal sentinel"
+                    );
+                    errors += 1;
+                }
+            }
+        }
+        assert_eq!(rows, (0..2004).collect::<Vec<_>>());
+        assert_eq!(errors, 1);
+        assert_eq!(batches, 1003);
+        assert_eq!(upstream_pending.load(Ordering::Relaxed), 1);
+        assert_eq!(split.metrics.batches_split.value(), 1003);
+        assert!(split.next().await.is_none());
     }
 
     /// Consumes all the input's partitions into a
