@@ -3934,6 +3934,31 @@ fn create_schema_with_quoted_name() {
 }
 
 #[test]
+fn create_schema_modifiers_are_not_silently_discarded() {
+    for sql in [
+        "CREATE OR REPLACE SCHEMA s",
+        "CREATE TRANSIENT SCHEMA s",
+        "CREATE SCHEMA s WITH MANAGED ACCESS",
+        "CREATE OR REPLACE TRANSIENT SCHEMA s WITH MANAGED ACCESS",
+        "CREATE TRANSIENT SCHEMA IF NOT EXISTS s",
+    ] {
+        let error = logical_plan_with_dialect(sql, &SnowflakeDialect {})
+            .expect_err("unsupported schema modifiers must not become plain CREATE");
+        assert_contains!(
+            error.to_string(),
+            "CREATE SCHEMA OR REPLACE, TRANSIENT and WITH MANAGED ACCESS are not supported"
+        );
+    }
+    let plan =
+        logical_plan_with_dialect("CREATE SCHEMA IF NOT EXISTS s", &SnowflakeDialect {})
+            .expect("ordinary conditional CREATE remains supported");
+    let LogicalPlan::Ddl(DdlStatement::CreateCatalogSchema(create)) = plan else {
+        panic!("expected catalog schema plan");
+    };
+    assert!(create.if_not_exists);
+}
+
+#[test]
 fn create_schema_with_quoted_unnormalized_name() {
     let sql = "CREATE SCHEMA \"Foo\"";
     let plan = logical_plan(sql).unwrap();
