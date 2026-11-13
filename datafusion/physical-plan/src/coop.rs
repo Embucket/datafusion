@@ -101,50 +101,31 @@ use crate::stream::RecordBatchStreamAdapter;
 use datafusion_physical_expr_common::sort_expr::PhysicalSortExpr;
 use futures::{Stream, StreamExt};
 
-/// A stream that passes record batches through unchanged while cooperating with the Tokio runtime.
-/// It consumes cooperative scheduling budget for each returned [`RecordBatch`],
-/// allowing other tasks to execute when the budget is exhausted.
-///
-/// See the [module level documentation](crate::coop) for an in-depth discussion.
-pub struct CooperativeStream<T>
-where
-    T: RecordBatchStream + Unpin,
-{
-    inner: T,
+/// Cooperative scheduling policy shared by upstream polls and locally produced items.
+pub(crate) struct CooperativeBudget {
     #[cfg(datafusion_coop = "per_stream")]
-    budget: u8,
+    remaining: u8,
 }
 
 #[cfg(datafusion_coop = "per_stream")]
 // Magic value that matches Tokio's task budget value
 const YIELD_FREQUENCY: u8 = 128;
 
-impl<T> CooperativeStream<T>
-where
-    T: RecordBatchStream + Unpin,
-{
-    /// Creates a new `CooperativeStream` that wraps the provided stream.
-    /// The resulting stream will cooperate with the Tokio scheduler by consuming a unit of
-    /// scheduling budget when the wrapped `Stream` returns a record batch.
-    pub fn new(inner: T) -> Self {
+impl CooperativeBudget {
+    #[inline]
+    pub(crate) const fn new() -> Self {
         Self {
-            inner,
             #[cfg(datafusion_coop = "per_stream")]
-            budget: YIELD_FREQUENCY,
+            remaining: YIELD_FREQUENCY,
         }
     }
-}
 
-impl<T> Stream for CooperativeStream<T>
-where
-    T: RecordBatchStream + Unpin,
-{
-    type Item = Result<RecordBatch>;
-
-    fn poll_next(
-        mut self: Pin<&mut Self>,
+    #[inline]
+    pub(crate) fn poll<T>(
+        &mut self,
         cx: &mut Context<'_>,
-    ) -> Poll<Option<Self::Item>> {
+        poll: impl FnOnce(&mut Context<'_>) -> Poll<T>,
+    ) -> Poll<T> {
         #[cfg(any(
             datafusion_coop = "tokio",
             not(any(
@@ -154,7 +135,7 @@ where
         ))]
         {
             let coop = std::task::ready!(tokio::task::coop::poll_proceed(cx));
-            let value = self.inner.poll_next_unpin(cx);
+            let value = poll(cx);
             if value.is_ready() {
                 coop.made_progress();
             }
@@ -170,7 +151,7 @@ where
                 return Poll::Pending;
             }
 
-            let value = self.inner.poll_next_unpin(cx);
+            let value = poll(cx);
             if value.is_ready() {
                 // In contrast to `poll_proceed` we are not able to consume
                 // budget before proceeding to do work. Instead, we try to consume budget
@@ -186,21 +167,61 @@ where
 
         #[cfg(datafusion_coop = "per_stream")]
         {
-            if self.budget == 0 {
-                self.budget = YIELD_FREQUENCY;
+            if self.remaining == 0 {
+                self.remaining = YIELD_FREQUENCY;
                 cx.waker().wake_by_ref();
                 return Poll::Pending;
             }
 
-            let value = { self.inner.poll_next_unpin(cx) };
+            let value = poll(cx);
 
             if value.is_ready() {
-                self.budget -= 1;
+                self.remaining -= 1;
             } else {
-                self.budget = YIELD_FREQUENCY;
+                self.remaining = YIELD_FREQUENCY;
             }
             value
         }
+    }
+}
+
+/// A stream that passes record batches through unchanged while cooperating with the Tokio runtime.
+/// It consumes cooperative scheduling budget for each returned [`RecordBatch`],
+/// allowing other tasks to execute when the budget is exhausted.
+///
+/// See the [module level documentation](crate::coop) for an in-depth discussion.
+pub struct CooperativeStream<T>
+where
+    T: RecordBatchStream + Unpin,
+{
+    inner: T,
+    budget: CooperativeBudget,
+}
+
+impl<T> CooperativeStream<T>
+where
+    T: RecordBatchStream + Unpin,
+{
+    /// Creates a new `CooperativeStream` that wraps the provided stream.
+    /// The resulting stream will cooperate with the Tokio scheduler by consuming a unit of
+    /// scheduling budget when the wrapped `Stream` returns a record batch.
+    pub fn new(inner: T) -> Self {
+        Self {
+            inner,
+            budget: CooperativeBudget::new(),
+        }
+    }
+}
+
+impl<T> Stream for CooperativeStream<T>
+where
+    T: RecordBatchStream + Unpin,
+{
+    type Item = Result<RecordBatch>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let Self { inner, budget } = self.get_mut();
+        budget.poll(cx, |cx| inner.poll_next_unpin(cx))
     }
 }
 
@@ -513,5 +534,40 @@ mod tests {
         let out = make_cooperative(inner).collect::<Vec<_>>().await;
         assert_eq!(out.len(), count);
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn cooperative_budget_preserves_pending_polls() {
+        tokio::task::yield_now().await;
+        futures::future::poll_fn(|cx| {
+            let mut budget = CooperativeBudget::new();
+            let mut polls = 0;
+            for _ in 0..TASK_BUDGET * 2 {
+                assert!(
+                    budget
+                        .poll(cx, |_| {
+                            polls += 1;
+                            Poll::<()>::Pending
+                        })
+                        .is_pending()
+                );
+            }
+            assert_eq!(polls, TASK_BUDGET * 2);
+            for _ in 0..TASK_BUDGET {
+                assert!(budget.poll(cx, |_| Poll::Ready(())).is_ready());
+            }
+            let mut polled = false;
+            assert!(
+                budget
+                    .poll(cx, |_| {
+                        polled = true;
+                        Poll::Ready(())
+                    })
+                    .is_pending()
+            );
+            assert!(!polled, "exhaustion must yield before polling more work");
+            Poll::Ready(())
+        })
+        .await;
     }
 }
