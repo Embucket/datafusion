@@ -779,14 +779,24 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             Statement::CreateSchema {
                 schema_name,
                 if_not_exists,
+                or_replace,
+                transient,
+                with_managed_access,
                 ..
-            } => Ok(LogicalPlan::Ddl(DdlStatement::CreateCatalogSchema(
-                CreateCatalogSchema {
-                    schema_name: get_schema_name(&schema_name, self.ident_normalizer),
-                    if_not_exists,
-                    schema: Arc::new(DFSchema::empty()),
-                },
-            ))),
+            } => {
+                if or_replace || transient || with_managed_access {
+                    return not_impl_err!(
+                        "CREATE SCHEMA OR REPLACE, TRANSIENT and WITH MANAGED ACCESS are not supported"
+                    );
+                }
+                Ok(LogicalPlan::Ddl(DdlStatement::CreateCatalogSchema(
+                    CreateCatalogSchema {
+                        schema_name: get_schema_name(&schema_name, self.ident_normalizer),
+                        if_not_exists,
+                        schema: Arc::new(DFSchema::empty()),
+                    },
+                )))
+            }
             Statement::CreateDatabase {
                 db_name,
                 if_not_exists,
