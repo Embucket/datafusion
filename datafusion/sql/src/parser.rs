@@ -2452,4 +2452,74 @@ mod tests {
             "error should describe unknown option: {msg}"
         );
     }
+
+    #[test]
+    fn constraint_reliance_control_without_rely() {
+        let sql = "CREATE TABLE NE (ID INT PRIMARY KEY NOT ENFORCED)";
+        let statements = DFParser::parse_sql_with_dialect(sql, &SnowflakeDialect {})
+            .expect("existing inline primary key syntax");
+        assert_eq!(statements.len(), 1);
+        assert_eq!(statements[0].to_string(), sql);
+    }
+
+    #[test]
+    fn constraint_reliance_preserves_native_snowflake_declaration() {
+        let sql = "CREATE TABLE NE (ID INT PRIMARY KEY NOT ENFORCED RELY)";
+        let statements = DFParser::parse_sql_with_dialect(sql, &SnowflakeDialect {})
+            .expect("native Snowflake constraint reliance syntax");
+        assert_eq!(statements.len(), 1);
+        assert_eq!(statements[0].to_string(), sql);
+    }
+
+    #[test]
+    fn constraint_reliance_exposes_original_typed_characteristics() {
+        use sqlparser::ast::{ColumnOption, ConstraintCharacteristics, Visit, Visitor};
+        use std::ops::ControlFlow;
+
+        struct CharacteristicsVisitor<'a> {
+            expected: &'a ConstraintCharacteristics,
+            visits: usize,
+        }
+
+        impl Visitor for CharacteristicsVisitor<'_> {
+            type Break = ();
+
+            fn pre_visit_constraint_characteristics(
+                &mut self,
+                characteristics: &ConstraintCharacteristics,
+            ) -> ControlFlow<Self::Break> {
+                assert!(std::ptr::eq(characteristics, self.expected));
+                self.visits += 1;
+                ControlFlow::Continue(())
+            }
+        }
+
+        // Syntax and borrowed AST identity only: this grants no optimizer trust.
+        for (keyword, expected_rely) in [("RELY", true), ("NORELY", false)] {
+            let sql =
+                format!("CREATE TABLE NE (ID INT PRIMARY KEY NOT ENFORCED {keyword})");
+            let statements = DFParser::parse_sql_with_dialect(&sql, &SnowflakeDialect {})
+                .expect("native constraint reliance syntax");
+            let Statement::Statement(statement) = &statements[0] else {
+                panic!("expected native statement");
+            };
+            let SQLStatement::CreateTable(create) = statement.as_ref() else {
+                panic!("expected CREATE TABLE");
+            };
+            let ColumnOption::PrimaryKey(key) = &create.columns[0].options[0].option
+            else {
+                panic!("expected inline primary key");
+            };
+            let characteristics = key.characteristics.as_ref().expect("characteristics");
+            assert_eq!(characteristics.enforced, Some(false));
+            assert_eq!(characteristics.rely, Some(expected_rely));
+            let mut visitor = CharacteristicsVisitor {
+                expected: characteristics,
+                visits: 0,
+            };
+            assert_eq!(statement.visit(&mut visitor), ControlFlow::Continue(()));
+            assert_eq!(visitor.visits, 1);
+            assert_eq!(statements[0].to_string(), sql);
+        }
+    }
 }
