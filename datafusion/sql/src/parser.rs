@@ -1341,6 +1341,35 @@ mod tests {
     use sqlparser::dialect::SnowflakeDialect;
     use sqlparser::tokenizer::{Location, Span, Whitespace};
 
+    #[test]
+    fn snowflake_stage_statements_preserve_batch_delimiters() {
+        for sql in [
+            "LIST @STAGE/path",
+            "COPY INTO T FROM @STAGE/path",
+            "COPY INTO @STAGE/path FROM (SELECT 1)",
+            "COPY INTO @STAGE/path FROM (SELECT ';') VALIDATION_MODE=RETURN_ROWS",
+        ] {
+            let mut single = DFParser::parse_sql_with_dialect(sql, &SnowflakeDialect)
+                .expect("standalone stage statement");
+            let batch = format!("{sql}; SELECT 2");
+            let mut statements =
+                DFParser::parse_sql_with_dialect(&batch, &SnowflakeDialect)
+                    .expect("stage statement and SELECT must be separate statements");
+
+            assert_eq!(statements.len(), 2, "{sql}");
+            assert_eq!(statements.pop_front(), single.pop_front(), "{sql}");
+            assert_eq!(statements[0].to_string(), "SELECT 2", "{sql}");
+            assert!(
+                DFParser::parse_sql_with_dialect(
+                    &format!("{sql}; SELECT"),
+                    &SnowflakeDialect
+                )
+                .is_err(),
+                "{sql}: the malformed suffix must still fail"
+            );
+        }
+    }
+
     fn expect_parse_ok(sql: &str, expected: Statement) -> Result<(), DataFusionError> {
         let statements = DFParser::parse_sql(sql)?;
         assert_eq!(
