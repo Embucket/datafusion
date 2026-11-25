@@ -18,6 +18,7 @@
 //! Utilizing exact statistics from sources to avoid scanning data
 use datafusion_common::Result;
 use datafusion_common::config::ConfigOptions;
+use datafusion_common::metadata::FieldMetadata;
 use datafusion_common::scalar::ScalarValue;
 use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion_physical_plan::aggregates::{
@@ -29,7 +30,7 @@ use datafusion_physical_plan::statistics::{StatisticsArgs, StatisticsContext};
 use datafusion_physical_plan::udaf::{
     AggregateFunctionExpr, StatisticsArgs as PlanStatisticsArgs,
 };
-use datafusion_physical_plan::{ExecutionPlan, expressions};
+use datafusion_physical_plan::{ExecutionPlan, PhysicalExpr, expressions};
 use std::sync::Arc;
 
 use crate::PhysicalOptimizerRule;
@@ -60,6 +61,7 @@ impl PhysicalOptimizerRule for AggregateStatistics {
                 .expect("take_optimizable() ensures that this is a AggregateExec");
             let stats = StatisticsContext::new()
                 .compute(partial_agg_exec.input().as_ref(), &StatisticsArgs::new())?;
+            let schema = plan.schema();
             let mut projections = vec![];
             for expr in partial_agg_exec.aggr_expr() {
                 let field = expr.field();
@@ -73,8 +75,20 @@ impl PhysicalOptimizerRule for AggregateStatistics {
                 if let Some((optimizable_statistic, name)) =
                     take_optimizable_value_from_statistics(&statistics_args, expr)
                 {
+                    // Keep metadata on the literal so the result still composes with an outer projection.
+                    let expr: Arc<dyn PhysicalExpr> = if let Some(field) =
+                        schema.fields().get(projections.len())
+                        && !field.metadata().is_empty()
+                    {
+                        Arc::new(expressions::Literal::new_with_metadata(
+                            optimizable_statistic,
+                            Some(FieldMetadata::from(field.as_ref())),
+                        ))
+                    } else {
+                        expressions::lit(optimizable_statistic)
+                    };
                     projections.push(ProjectionExpr {
-                        expr: expressions::lit(optimizable_statistic),
+                        expr,
                         alias: name.to_owned(),
                     });
                 } else {
@@ -88,7 +102,7 @@ impl PhysicalOptimizerRule for AggregateStatistics {
                 // input can be entirely removed
                 Ok(Arc::new(ProjectionExec::try_new(
                     projections,
-                    Arc::new(PlaceholderRowExec::new(plan.schema())),
+                    Arc::new(PlaceholderRowExec::new(schema)),
                 )?))
             } else {
                 plan.map_children(|child| {

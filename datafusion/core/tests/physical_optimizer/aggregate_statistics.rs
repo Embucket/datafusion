@@ -31,16 +31,22 @@ use datafusion::datasource::source::DataSourceExec;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion_common::cast::as_int64_array;
 use datafusion_common::config::ConfigOptions;
+use datafusion_common::metadata::FieldMetadata;
 use datafusion_common::stats::Precision;
-use datafusion_common::{ColumnStatistics, Result, Statistics};
+use datafusion_common::utils::expr::COUNT_STAR_EXPANSION;
+use datafusion_common::{ColumnStatistics, DFSchema, Result, Statistics};
 use datafusion_common::{ScalarValue, assert_batches_eq};
 use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
 use datafusion_execution::TaskContext;
 use datafusion_execution::object_store::ObjectStoreUrl;
-use datafusion_expr::Operator;
+use datafusion_expr::execution_props::ExecutionProps;
+use datafusion_expr::physical_planning_context::PhysicalPlanningContext;
+use datafusion_expr::{Expr, Operator};
 use datafusion_functions_aggregate::count::count_udaf;
 use datafusion_functions_aggregate::sum::sum_udaf;
-use datafusion_physical_expr::aggregate::AggregateExprBuilder;
+use datafusion_physical_expr::aggregate::{
+    AggregateExprBuilder, LoweredAggregateBuilder,
+};
 use datafusion_physical_expr::expressions::{self, cast};
 use datafusion_physical_optimizer::PhysicalOptimizerRule;
 use datafusion_physical_optimizer::aggregate_statistics::AggregateStatistics;
@@ -116,6 +122,66 @@ fn check_batch(batch: RecordBatch, agg: &TestAggregate) {
         as_int64_array(batch.column(0)).unwrap().values(),
         &[agg.expected_count()]
     );
+}
+
+#[tokio::test]
+async fn test_count_from_statistics_preserves_field_metadata() -> Result<()> {
+    for multi_stage in [false, true] {
+        let source: Arc<dyn ExecutionPlan> = mock_data()?;
+        let schema = source.schema();
+        let metadata = FieldMetadata::from(std::collections::HashMap::from([(
+            "test.declaration".to_string(),
+            "test-value".to_string(),
+        )]));
+        let logical = count_udaf()
+            .call(vec![Expr::Literal(COUNT_STAR_EXPANSION, None)])
+            .alias_with_metadata("c", Some(metadata));
+        let expression = LoweredAggregateBuilder::new(
+            &logical,
+            &DFSchema::try_from(schema.as_ref().clone())?,
+            schema.as_ref(),
+            &ExecutionProps::new(),
+            &PhysicalPlanningContext::default(),
+        )
+        .build()?
+        .aggregate;
+        let aggregate = |mode, input| -> Result<Arc<dyn ExecutionPlan>> {
+            Ok(Arc::new(AggregateExec::try_new(
+                mode,
+                PhysicalGroupBy::default(),
+                vec![Arc::clone(&expression)],
+                vec![None],
+                input,
+                Arc::clone(&schema),
+            )?))
+        };
+        let original = if multi_stage {
+            aggregate(
+                AggregateMode::Final,
+                aggregate(AggregateMode::Partial, source)?,
+            )?
+        } else {
+            aggregate(AggregateMode::Single, source)?
+        };
+        let expected = original.schema();
+        assert_eq!(
+            expected.field(0).metadata()["test.declaration"],
+            "test-value"
+        );
+        let optimized =
+            AggregateStatistics::new().optimize(original, &ConfigOptions::new())?;
+        assert!(optimized.is::<ProjectionExec>());
+        assert_eq!(
+            optimized.schema().field(0).metadata(),
+            expected.field(0).metadata()
+        );
+        let batches =
+            common::collect(optimized.execute(0, Arc::new(TaskContext::default()))?)
+                .await?;
+        assert_eq!(batches.len(), 1);
+        assert_eq!(as_int64_array(batches[0].column(0))?.values(), &[3]);
+    }
+    Ok(())
 }
 
 #[tokio::test]
